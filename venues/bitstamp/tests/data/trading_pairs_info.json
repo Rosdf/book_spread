@@ -1,0 +1,46 @@
+[
+  {
+    "name": "BTC/USD",
+    "url_symbol": "btcusd",
+    "base_decimals": 8,
+    "counter_decimals": 0,
+    "instant_order_counter_decimals": 2,
+    "minimum_order": "10 USD",
+    "trading": "Enabled",
+    "instant_and_market_orders": "Enabled",
+    "description": "Bitcoin / U.S. dollar"
+  },
+  {
+    "name": "ETH/USD",
+    "url_symbol": "ethusd",
+    "base_decimals": 8,
+    "counter_decimals": 1,
+    "instant_order_counter_decimals": 2,
+    "minimum_order": "10 USD",
+    "trading": "Enabled",
+    "instant_and_market_orders": "Enabled",
+    "description": "Ether / U.S. dollar"
+  },
+  {
+    "name": "LUNA/USD",
+    "url_symbol": "lunausd",
+    "base_decimals": 8,
+    "counter_decimals": 4,
+    "instant_order_counter_decimals": 4,
+    "minimum_order": "10 USD",
+    "trading": "Disabled",
+    "instant_and_market_orders": "Disabled",
+    "description": "Luna / U.S. dollar"
+  },
+  {
+    "name": "USTC/USD",
+    "url_symbol": "ustcusd",
+    "base_decimals": 8,
+    "counter_decimals": 4,
+    "instant_order_counter_decimals": 4,
+    "minimum_order": "10 USD",
+    "trading": "Disabled",
+    "instant_and_market_orders": "Disabled",
+    "description": "TerraClassicUSD / U.S. dollar"
+  }
+]

@@ -1,0 +1,48 @@
+[package]
+name = "md_server"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+test-util = []
+
+[dependencies]
+core_lib = { path = "../core_lib" }
+md_proto = { path = "../md_proto" }
+md_wire = { path = "../md_wire" }
+binance_spot = { path = "../venues/binance_spot" }
+bitstamp = { path = "../venues/bitstamp" }
+anyhow = "1.0.104"
+bytes = "1.12.1"
+oneshot = { version = "0.2.1", features = ["std", "async"] }
+prost = "0.14.4"
+tokio = { version = "1.53.1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "signal",
+    "time",
+    "net",
+    "io-util",
+] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tikv-jemallocator = "0.7.0"
+heapless = "0.9.3"
+
+[dev-dependencies]
+md_server = { path = ".", features = ["test-util"] }
+# The same crate as the dependency above, with `start_paused` for the sweep tests. Resolver 3
+# keeps this feature out of a plain build.
+tokio = { version = "1.53.1", features = [
+    "macros",
+    "rt",
+    "sync",
+    "test-util",
+    "time",
+] }

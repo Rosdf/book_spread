@@ -1,0 +1,40 @@
+{
+  "timezone": "UTC",
+  "serverTime": 1766000000000,
+  "rateLimits": [],
+  "exchangeFilters": [],
+  "symbols": [
+    {
+      "symbol": "BTCUSDT",
+      "status": "TRADING",
+      "baseAsset": "BTC",
+      "quoteAsset": "USDT",
+      "isSpotTradingAllowed": true,
+      "permissionSets": [["SPOT"]]
+    },
+    {
+      "symbol": "ETHUSDT",
+      "status": "TRADING",
+      "baseAsset": "ETH",
+      "quoteAsset": "USDT",
+      "isSpotTradingAllowed": true,
+      "permissionSets": [["SPOT"]]
+    },
+    {
+      "symbol": "BNBBTC",
+      "status": "HALT",
+      "baseAsset": "BNB",
+      "quoteAsset": "BTC",
+      "isSpotTradingAllowed": true,
+      "permissionSets": [["SPOT"]]
+    },
+    {
+      "symbol": "LUNAUSDT",
+      "status": "BREAK",
+      "baseAsset": "LUNA",
+      "quoteAsset": "USDT",
+      "isSpotTradingAllowed": false,
+      "permissionSets": [["SPOT"]]
+    }
+  ]
+}

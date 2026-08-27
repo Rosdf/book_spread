@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package md.v1;
+
+// Top-of-book fan-out, over a plain TCP connection rather than gRPC. One connection
+// per (venue, symbol): the client sends one SubscribeBookRequest, the server answers
+// with a status header, and then streams BookUpdates until it closes the socket. Every
+// message on the wire is preceded by its length as a little-endian uint32; see
+// `md_server::framing` for the exact framing and status codes.
+//
+// The server encodes each book once and hands the same bytes to every attached client.
+
+message SubscribeBookRequest {
+  // "binance_spot" or "bitstamp", case-insensitive.
+  string venue = 1;
+  // The venue's symbol, case-insensitive: "BTCUSDT" and "btcusdt" name the same
+  // stream. Must be non-empty ASCII alphanumerics.
+  string symbol = 2;
+}
+
+message Level {
+  double price = 1;
+  double size = 2;
+}
+
+// Every field tag here is <= 15, so each key costs a single byte. A scalar field
+// added past tag 15 costs one extra byte on every message that carries it.
+message BookUpdate {
+  string venue = 1;
+  // Lowercased, whatever casing the request used - that is the form every venue
+  // connector keys its subscriptions by.
+  string symbol = 2;
+  // Best first, at most 10 levels each. Both sides empty means the connector has no
+  // book: it has either not bootstrapped yet or it is resyncing. Discard the last
+  // book you held rather than continuing to act on it.
+  repeated Level asks = 3;
+  repeated Level bids = 4;
+}

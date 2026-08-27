@@ -1,0 +1,31 @@
+[package]
+name = "bitstamp"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+core_lib = { path = "../../core_lib" }
+tokio-tungstenite = { version = "0.26.2", default-features = false, features = [
+    "connect",
+    "rustls-tls-webpki-roots",
+] }
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "http2",
+] }
+simd-json = "0.18"
+serde = { version = "1", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+bytes = "1.12.1"
+thiserror = "2"
+tracing.workspace = true
+
+[dev-dependencies]
+anyhow = "1"
+# The same crate as the dependency above, with the in-memory transport doubles
+# turned on - `#[cfg(test)]` items in `core_lib` are not visible from here.
+core_lib = { path = "../../core_lib", features = ["test_util"] }
+
+[lints]
+workspace = true

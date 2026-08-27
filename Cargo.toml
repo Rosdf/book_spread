@@ -1,0 +1,105 @@
+[workspace.package]
+version = "0.1.0"
+publish = false
+edition = "2024"
+rust-version = "1.97.1"
+
+[workspace]
+resolver = "3"
+members = ["core_lib", "md_proto", "md_wire", "md_server", "md_client", "venues/binance_spot", "venues/bitstamp"]
+
+[workspace.dependencies]
+# `release_max_level_debug` compiles every `trace!` callsite out of a release build. Cargo
+# features are additive across the graph, so this is stated once here and inherited by every
+# member: the per-frame `trace!`s in the venue decoders cost nothing in release, while
+# `debug!` and above still work. The price is that `RUST_LOG=trace` does nothing in a release
+# binary - use a debug build for that.
+tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
+
+[workspace.lints.clippy]
+#missing_docs_in_private_items = "warn"
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+inline_always = "allow"
+module_name_repetitions = "allow"
+clone_on_ref_ptr = "warn"
+must_use_candidate = "allow"
+as_underscore = "warn"
+deref_by_slicing = "warn"
+filetype_is_file = "warn"
+get_unwrap = "warn"
+if_then_some_else_none = "warn"
+lossy_float_literal = "warn"
+mem_forget = "warn"
+missing_assert_message = "warn"
+multiple_inherent_impl = "warn"
+mutex_atomic = "warn"
+needless_raw_strings = "warn"
+panic_in_result_fn = "warn"
+pub_without_shorthand = "warn"
+rc_buffer = "warn"
+rc_mutex = "warn"
+semicolon_inside_block = "warn"
+shadow_reuse = "warn"
+undocumented_unsafe_blocks = "warn"
+option_as_ref_cloned = "warn"
+str_split_at_newline = "warn"
+empty_enum_variants_with_brackets = "warn"
+manual_is_variant_and = "warn"
+pub_underscore_fields = "warn"
+iter_filter_is_some = "warn"
+iter_filter_is_ok = "warn"
+result_filter_map = "warn"
+redundant_pub_crate = "allow"
+manual_c_str_literals = "warn"
+ref_as_ptr = "warn"
+cfg_not_test = "warn"
+set_contains_or_insert = "warn"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+too_long_first_doc_paragraph = "warn"
+pathbuf_init_then_push = "warn"
+unused_trait_names = "warn"
+non_zero_suggestions = "warn"
+manual_is_power_of_two = "warn"
+used_underscore_items = "warn"
+map_with_unused_argument_over_ranges = "warn"
+unnecessary_literal_bound = "warn"
+as_pointer_underscore = "warn"
+missing_const_for_fn = "allow"
+non_std_lazy_statics = "warn"
+unnecessary_semicolon = "warn"
+precedence_bits = "warn"
+doc_comment_double_space_linebreaks = "warn"
+unnecessary_debug_formatting = "warn"
+elidable_lifetime_names = "warn"
+single_option_map = "warn"
+ignore_without_reason = "warn"
+redundant_test_prefix = "warn"
+coerce_container_to_any = "warn"
+ip_constant = "warn"
+doc_broken_link = "warn"
+volatile_composites = "warn"
+self_only_used_in_recursion = "warn"
+same_length_and_capacity = "warn"
+manual_ilog2 = "warn"
+needless_type_cast = "warn"
+ptr_offset_by_literal = "warn"
+decimal_bitwise_operands = "warn"
+duration_suboptimal_units = "warn"
+
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+missing_debug_implementations = "warn"
+absolute_paths_not_starting_with_crate = "warn"
+macro_use_extern_crate = "warn"
+meta_variable_misuse = "warn"
+single_use_lifetimes = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_crate_dependencies = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
+variant_size_differences = "warn"
+private_bounds = "deny"
