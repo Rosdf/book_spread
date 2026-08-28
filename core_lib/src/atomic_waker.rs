@@ -117,7 +117,10 @@ impl fmt::Debug for Shared {
             .field("registering", &(state & REGISTERING != 0))
             .field("waking", &(state & NOT_WAKING == 0))
             .field("pending", &(state & NOT_PENDING == 0))
-            .finish()
+            // Non-exhaustive because `waker` is deliberately left out: reading it is
+            // only sound in some of the states above, and `Waker` is not `Debug`
+            // anyway. The state bits are what anyone debugging this wants.
+            .finish_non_exhaustive()
     }
 }
 

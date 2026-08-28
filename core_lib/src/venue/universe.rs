@@ -107,7 +107,7 @@ pub async fn refresh_loop<V, R>(
             }
             Err(err) => {
                 tracing::warn!(%err, "symbol listing refresh failed, retrying");
-                tokio::time::sleep(backoff.next()).await;
+                tokio::time::sleep(backoff.next_delay()).await;
             }
         }
     }

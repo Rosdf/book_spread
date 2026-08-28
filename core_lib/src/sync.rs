@@ -104,6 +104,9 @@ impl<T> ConstPtr<T> {
     /// Same contract as dereferencing the raw pointer this came from: no
     /// exclusive access to the cell may overlap the returned reference.
     pub(crate) unsafe fn deref(&self) -> &T {
+        // SAFETY: the caller carries this function's own contract - the pointer came
+        // from a live cell and no exclusive access to it overlaps the returned
+        // reference - and there is nothing this shim can check on top of it.
         unsafe { &*self.0 }
     }
 }

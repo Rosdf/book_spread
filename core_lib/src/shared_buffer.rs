@@ -1,7 +1,7 @@
 use crate::sync::{AtomicU64, AtomicUsize, ConstPtr, Ordering, UnsafeCell};
 use crossbeam_utils::CachePadded;
 use std::hint::{cold_path, spin_loop};
-use std::ops::{Deref, Not};
+use std::ops::{Deref, Not as _};
 
 const WRITE_FLAG: u64 = 1 << 63;
 
@@ -91,13 +91,9 @@ impl<T> Publisher<T> {
     }
 
     pub fn reader(&mut self) -> Option<Reader<T>> {
-        if TArc::strong_count(&self.inner) + 1 < self.inner.slice.len() {
-            Some(Reader {
-                inner: TArc::clone(&self.inner),
-            })
-        } else {
-            None
-        }
+        (TArc::strong_count(&self.inner) + 1 < self.inner.slice.len()).then(|| Reader {
+            inner: TArc::clone(&self.inner),
+        })
     }
 
     pub fn update(&mut self, value: T) {
@@ -217,6 +213,18 @@ impl<T> Drop for ReaderGuard<'_, T> {
         // Release the borrow before the slot itself: a writer claiming this slot
         // straight after the decrement below is not concurrent with our read,
         // and dropping in the other order would make loom report that it is.
+        //
+        // Only `loom::cell::ConstPtr` has a `Drop` to run here - the plain build's
+        // `ConstPtr` is a bare `*const T` - so clippy, which only ever sees that
+        // build, is right about the type and wrong about the point.
+        #[cfg_attr(
+            not(loom),
+            expect(
+                clippy::drop_non_drop,
+                reason = "under `--cfg loom` this releases the cell borrow, and the order \
+                          relative to the decrement below is what the model checks"
+            )
+        )]
         drop(self.data.take());
         // Release: makes this reader's access to `slot.data` (in `deref`, below)
         // happen-before whichever writer's Acquire operation (the CAS pre-check
@@ -239,28 +247,6 @@ impl<T> Deref for ReaderGuard<'_, T> {
         unsafe { self.data.as_ref().unwrap_unchecked().deref() }
     }
 }
-
-#[cfg(test)]
-mod test {
-    use super::{Publisher, Reader, Slot};
-
-    const fn assert_send<T: Send>() {}
-    const fn assert_sync<T: Sync>() {}
-
-    /// `Slot<T>` gets `Send` from the auto impl (`UnsafeCell<T>: Send where T: Send`) and
-    /// `Sync` from the `unsafe impl` above, and `triomphe::Arc<T>: Send` requires
-    /// `T: Send + Sync` - so both handles cross threads exactly when `T: Send + Sync`.
-    #[test]
-    const fn handles_cross_threads() {
-        assert_send::<Slot<u64>>();
-        assert_sync::<Slot<u64>>();
-        assert_send::<Publisher<u64>>();
-        assert_sync::<Publisher<u64>>();
-        assert_send::<Reader<u64>>();
-        assert_sync::<Reader<u64>>();
-    }
-}
-
 impl<T> Reader<T> {
     pub fn get(&mut self) -> ReaderGuard<'_, T> {
         // Acquire: pairs with the writer's `header.store(idx, Release)`, so
@@ -293,5 +279,26 @@ impl<T> Reader<T> {
             slot,
             data: Some(slot.data.const_ptr()),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{Publisher, Reader, Slot};
+
+    const fn assert_send<T: Send>() {}
+    const fn assert_sync<T: Sync>() {}
+
+    /// `Slot<T>` gets `Send` from the auto impl (`UnsafeCell<T>: Send where T: Send`) and
+    /// `Sync` from the `unsafe impl` above, and `triomphe::Arc<T>: Send` requires
+    /// `T: Send + Sync` - so both handles cross threads exactly when `T: Send + Sync`.
+    #[test]
+    const fn handles_cross_threads() {
+        assert_send::<Slot<u64>>();
+        assert_sync::<Slot<u64>>();
+        assert_send::<Publisher<u64>>();
+        assert_sync::<Publisher<u64>>();
+        assert_send::<Reader<u64>>();
+        assert_sync::<Reader<u64>>();
     }
 }

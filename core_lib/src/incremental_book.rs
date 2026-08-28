@@ -167,20 +167,12 @@ pub enum UpdateResult {
 }
 
 impl UpdateResult {
-    pub fn merge(self, other: UpdateResult) -> UpdateResult {
-        match self {
-            Self::Close => match other {
-                UpdateResult::Close => Self::Close,
-                UpdateResult::Deap => Self::Both,
-                UpdateResult::Both => Self::Both,
-            },
-            Self::Deap => match other {
-                UpdateResult::Close => Self::Both,
-                UpdateResult::Deap => Self::Deap,
-                UpdateResult::Both => Self::Both,
-            },
-            Self::Both => Self::Both,
-        }
+    /// Where two updates together landed: the side they agree on, or [`Self::Both`] when
+    /// they name different ones. [`Self::Both`] absorbs everything, which falls out of the
+    /// same rule - it agrees with nothing but itself.
+    #[must_use]
+    pub fn merge(self, other: Self) -> Self {
+        if self == other { self } else { Self::Both }
     }
 }
 
@@ -265,6 +257,12 @@ where
     }
 }
 
+impl Default for IncrementalBook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IncrementalBook {
     pub const fn new() -> Self {
         Self {
@@ -314,12 +312,16 @@ impl IncrementalBook {
     }
 
     #[inline(always)]
-    fn update_side<T>(side: &mut BookSide<T>, price: PositiveF64, size: PositiveF64) -> UpdateResult
+    fn update_side<T>(
+        target: &mut BookSide<T>,
+        price: PositiveF64,
+        size: PositiveF64,
+    ) -> UpdateResult
     where
         LevelPrice<T>: Ord,
     {
         let sided = LevelPrice::<T>::new(price);
-        side.update(sided, size)
+        target.update(sided, size)
     }
 
     #[inline(always)]

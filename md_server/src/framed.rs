@@ -131,3 +131,79 @@ async fn reject<S: AsyncWrite + Unpin, P: Debug>(
         tracing::debug!(?peer, %err, "could not tell a client why it was refused");
     }
 }
+
+#[cfg(test)]
+mod test {
+    use crate::registry::harness::registry_for;
+    use crate::session::peer::Client;
+    use crate::test_util::FakeSource;
+    use crate::transport::mock::MockListener;
+    use std::sync::Arc;
+
+    /// The accept path end to end, with no socket under it: a connection is accepted, its
+    /// request read, and its socket handed to the broadcaster that answers on it.
+    ///
+    /// Two connections rather than one, because the second only gets served if the loop came
+    /// back round after the first - which is the part a single accept would not show.
+    #[tokio::test]
+    async fn a_connection_is_accepted_handshaken_and_answered() {
+        let source = Arc::new(FakeSource::default());
+        let harness = registry_for(&source);
+        let (listener, connector) = MockListener::new();
+        let (stop_accepting, stopped) = oneshot::channel();
+        let accepting = tokio::spawn(super::accept(harness.registry.clone(), listener, stopped));
+
+        for symbol in ["BTCUSDT", "ETHUSDT"] {
+            let mut client = Client::from_socket(connector.connect());
+            client.request("binance_spot", symbol).await;
+            client
+                .accepted()
+                .await
+                .expect("the fake source accepts every symbol");
+            client.opening_snapshot().await;
+        }
+
+        assert_eq!(
+            source.subscribed(),
+            vec![Box::from("btcusdt"), Box::from("ethusdt")],
+            "each accepted connection reached the registry, under the normalised symbol"
+        );
+
+        let _ = stop_accepting.send(());
+        accepting.await.expect("the accept loop does not panic");
+    }
+
+    /// Shutting the accept loop down closes the connections whose handshake is still in
+    /// flight, rather than holding shutdown up for `HANDSHAKE_TIMEOUT` waiting on a client
+    /// that may never speak.
+    ///
+    /// The silent client connects first, so the loop has taken it by the time the talkative
+    /// one behind it has been answered - which is what makes this deterministic without any
+    /// sleeping or yielding.
+    #[tokio::test]
+    async fn stopping_closes_a_handshake_still_in_flight() {
+        let source = Arc::new(FakeSource::default());
+        let harness = registry_for(&source);
+        let (listener, connector) = MockListener::new();
+        let (stop_accepting, stopped) = oneshot::channel();
+        let accepting = tokio::spawn(super::accept(harness.registry.clone(), listener, stopped));
+
+        let mut silent = Client::from_socket(connector.connect());
+        let mut talkative = Client::from_socket(connector.connect());
+        talkative.request("binance_spot", "BTCUSDT").await;
+        talkative
+            .accepted()
+            .await
+            .expect("the fake source accepts every symbol");
+
+        let _ = stop_accepting.send(());
+        accepting.await.expect("the accept loop does not panic");
+
+        silent.ended().await;
+        assert_eq!(
+            source.subscribed(),
+            vec![Box::from("btcusdt")],
+            "a connection that never sent a request must not reach the registry"
+        );
+    }
+}

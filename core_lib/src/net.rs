@@ -6,6 +6,11 @@ use tokio_tungstenite::tungstenite::Message;
 pub trait Response: Sized + Send + 'static {
     type Error: std::error::Error + Send + 'static;
 
+    /// Turns an HTTP error status into an `Err`, leaving the response otherwise untouched.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the client reports for a non-success status.
     fn error_for_status(self) -> Result<Self, Self::Error>;
     fn bytes(self) -> impl Future<Output = Result<Bytes, Self::Error>> + Send + 'static;
 }

@@ -10,6 +10,12 @@
 //! Both sides run in spawned threads. Doing one side's work on the main thread
 //! makes loom explore a single execution, which passes without proving anything;
 //! `explores_many_interleavings` guards against drifting back into that shape.
+#![expect(
+    unused_crate_dependencies,
+    reason = "`cfg(loom)` below compiles this file to nothing in a normal build, which leaves \
+              every one of core_lib's dependencies unused here. Must sit above that `cfg`: \
+              placed under it, the attribute is stripped along with the rest of the file."
+)]
 #![cfg(loom)]
 
 use core_lib::atomic_waker::pair;
@@ -238,12 +244,7 @@ fn none_is_sticky() {
 }
 
 fn noop_waker() -> std::task::Waker {
-    struct Noop;
-    impl std::task::Wake for Noop {
-        fn wake(self: std::sync::Arc<Self>) {}
-        fn wake_by_ref(self: &std::sync::Arc<Self>) {}
-    }
-    std::task::Waker::from(std::sync::Arc::new(Noop))
+    std::task::Waker::noop().clone()
 }
 
 /// Guards the shape of the models above; see the module comment.

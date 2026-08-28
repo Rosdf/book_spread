@@ -8,6 +8,12 @@
 //! main thread performs one side's work directly, loom explores a single
 //! execution and the assertions below pass without proving anything. The
 //! `explores_many_interleavings` test guards against regressing into that shape.
+#![expect(
+    unused_crate_dependencies,
+    reason = "`cfg(loom)` below compiles this file to nothing in a normal build, which leaves \
+              every one of core_lib's dependencies unused here. Must sit above that `cfg`: \
+              placed under it, the attribute is stripped along with the rest of the file."
+)]
 #![cfg(loom)]
 
 use core_lib::shared_buffer::Publisher;

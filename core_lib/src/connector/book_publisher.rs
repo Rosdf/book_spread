@@ -82,6 +82,13 @@ impl BookReader {
     }
 }
 
+/// The two halves of one symbol's book channel: the publisher a connector writes through,
+/// and the single reader its broadcaster owns.
+///
+/// # Panics
+///
+/// Never in practice. `Publisher::reader` is fallible because a buffer can run out of slots
+/// to hand readers, and this one is built with a slot for exactly the one reader taken here.
 #[must_use]
 pub fn make_book_publisher_pair() -> (BookPublisher, BookReader) {
     let mut publisher = Publisher::new(1);

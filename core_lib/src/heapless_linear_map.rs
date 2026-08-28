@@ -19,7 +19,7 @@ impl<K: Clone, V: Clone, const N: usize> Clone for HeaplessLinearMap<K, V, N> {
     fn clone(&self) -> Self {
         let mut res = Self::new();
 
-        for (k, v) in self.iter() {
+        for (k, v) in self {
             // SAFETY:
             // we're inserting in valid order
             unsafe {
@@ -118,6 +118,10 @@ impl<K, V, const N: usize> HeaplessLinearMap<K, V, N> {
         self.len
     }
 
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub const fn is_full(&self) -> bool {
         self.len == N
     }
@@ -161,6 +165,13 @@ impl<K, V, const N: usize> Drop for HeaplessLinearMap<K, V, N> {
 }
 
 impl<K: Ord, V, const N: usize> HeaplessLinearMap<K, V, N> {
+    /// Inserts `value` under `key`, keeping the keys sorted. `Ok(Some(..))` is the pair this
+    /// replaced.
+    ///
+    /// # Errors
+    ///
+    /// The pair back, when the map is already full and `key` is not in it - there is nowhere
+    /// to put it and no heap to grow into.
     pub fn insert(&mut self, key: K, value: V) -> Result<Option<(K, V)>, (K, V)> {
         // Position of the first existing key that is >= `key` (or `self.len` if
         // every existing key is smaller).
@@ -587,6 +598,7 @@ mod test {
         let cloned = original.clone();
         assert_eq!(cloned.len(), 0);
         assert_eq!(cloned.iter().next(), None);
+        assert_eq!(original.len(), 0, "and the source is left as it was");
     }
 
     #[test]
@@ -645,12 +657,12 @@ mod test {
     fn clone_from_shrinks_and_drops_truncated_entries_when_source_is_shorter() {
         let counter = Rc::new(Cell::new(0));
         let mut target = empty_tracked::<4>();
-        target.insert(1, DropTracker(counter.clone())).unwrap();
-        target.insert(2, DropTracker(counter.clone())).unwrap();
-        target.insert(3, DropTracker(counter.clone())).unwrap();
+        target.insert(1, DropTracker(Rc::clone(&counter))).unwrap();
+        target.insert(2, DropTracker(Rc::clone(&counter))).unwrap();
+        target.insert(3, DropTracker(Rc::clone(&counter))).unwrap();
 
         let mut source = empty_tracked::<4>();
-        source.insert(1, DropTracker(counter.clone())).unwrap();
+        source.insert(1, DropTracker(Rc::clone(&counter))).unwrap();
 
         target.clone_from(&source);
 
@@ -664,9 +676,9 @@ mod test {
     fn clear_drops_all_entries_and_resets_len() {
         let counter = Rc::new(Cell::new(0));
         let mut m = empty_tracked::<4>();
-        m.insert(1, DropTracker(counter.clone())).unwrap();
-        m.insert(2, DropTracker(counter.clone())).unwrap();
-        m.insert(3, DropTracker(counter.clone())).unwrap();
+        m.insert(1, DropTracker(Rc::clone(&counter))).unwrap();
+        m.insert(2, DropTracker(Rc::clone(&counter))).unwrap();
+        m.insert(3, DropTracker(Rc::clone(&counter))).unwrap();
 
         m.clear();
 
@@ -674,7 +686,7 @@ mod test {
         assert_eq!(counter.get(), 3);
 
         // capacity is usable again after clearing
-        m.insert(1, DropTracker(counter.clone())).unwrap();
+        m.insert(1, DropTracker(Rc::clone(&counter))).unwrap();
         assert_eq!(m.len(), 1);
     }
 
@@ -690,9 +702,9 @@ mod test {
         let counter = Rc::new(Cell::new(0));
         {
             let mut m = empty_tracked::<4>();
-            m.insert(1, DropTracker(counter.clone())).unwrap();
-            m.insert(2, DropTracker(counter.clone())).unwrap();
-            m.insert(3, DropTracker(counter.clone())).unwrap();
+            m.insert(1, DropTracker(Rc::clone(&counter))).unwrap();
+            m.insert(2, DropTracker(Rc::clone(&counter))).unwrap();
+            m.insert(3, DropTracker(Rc::clone(&counter))).unwrap();
             assert_eq!(counter.get(), 0);
         }
         assert_eq!(counter.get(), 3);
@@ -712,9 +724,9 @@ mod test {
         let counter = Rc::new(Cell::new(0));
         {
             let mut m = empty_tracked::<4>();
-            m.insert(1, DropTracker(counter.clone())).unwrap();
-            m.insert(2, DropTracker(counter.clone())).unwrap();
-            m.insert(3, DropTracker(counter.clone())).unwrap();
+            m.insert(1, DropTracker(Rc::clone(&counter))).unwrap();
+            m.insert(2, DropTracker(Rc::clone(&counter))).unwrap();
+            m.insert(3, DropTracker(Rc::clone(&counter))).unwrap();
 
             // Removing an entry drops its value right away, when the
             // returned `Option<V>` is discarded.

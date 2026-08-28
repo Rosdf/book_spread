@@ -23,7 +23,11 @@ impl Backoff {
         self.current = Self::BASE;
     }
 
-    pub fn next(&mut self) -> Duration {
+    /// The next wait, jittered, and doubles the base for the one after it.
+    ///
+    /// Not `next`: an inherent method by that name reads as `Iterator::next` at every call
+    /// site, and this yields a delay to sleep for rather than an element of a sequence.
+    pub fn next_delay(&mut self) -> Duration {
         let wait = self.current;
         self.current = (self.current * 2).min(self.max);
         wait + jitter(wait)
@@ -50,18 +54,18 @@ mod test {
         let max = Duration::from_secs(30);
         let mut backoff = Backoff::new(max);
 
-        let first = backoff.next();
+        let first = backoff.next_delay();
         assert!(first >= Backoff::BASE, "{first:?}");
 
         let mut last = first;
         for _ in 0..20 {
-            last = backoff.next();
+            last = backoff.next_delay();
             // Jitter adds at most +50%, so nothing may exceed the cap by more than that.
             assert!(last <= max + max / 2, "{last:?} exceeded the cap");
         }
         assert!(last > first, "backoff must grow: {first:?} -> {last:?}");
 
         backoff.reset();
-        assert!(backoff.next() < Duration::from_secs(1));
+        assert!(backoff.next_delay() < Duration::from_secs(1));
     }
 }

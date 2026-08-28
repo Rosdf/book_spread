@@ -192,7 +192,7 @@ pub async fn run<V, R, W>(
         if started.elapsed() >= HEALTHY_SESSION {
             backoff.reset();
         }
-        if !conn.wait_backoff(&mut subs_rx, backoff.next()).await {
+        if !conn.wait_backoff(&mut subs_rx, backoff.next_delay()).await {
             return;
         }
     }

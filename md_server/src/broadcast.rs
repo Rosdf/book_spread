@@ -425,9 +425,10 @@ mod test {
     use super::SESSION_SWEEP;
     use crate::encode::BufferProvider;
     use crate::registry::Key;
-    use crate::test_util::{
-        Client, FakeSource, book, connected, connected_congested, registry_for,
-    };
+    use crate::registry::harness::{Harness, registry_for};
+    use crate::session::peer::{Client, connected, connected_congested};
+    use crate::test_util::{FakeSource, book};
+    use crate::transport::mock::{MockControl, MockStream};
     use crate::venue::Venue;
     use bytes::BytesMut;
     use md_proto::md::v1 as proto;
@@ -443,24 +444,24 @@ mod test {
 
     /// Subscribes one client, reads its acceptance header and its opening snapshot, leaving it
     /// ready for real books.
-    async fn attach(harness: &crate::test_util::Harness) -> Client {
+    async fn attach(harness: &Harness) -> Client {
         let mut client = attach_over(harness, connected()).await;
         client.opening_snapshot().await;
         client
     }
 
     /// The same, over a connection whose write queue is pinned small enough to back up.
-    async fn attach_congested(harness: &crate::test_util::Harness) -> Client {
+    async fn attach_congested(harness: &Harness) -> Client {
         let mut client = attach_over(harness, connected_congested()).await;
         client.opening_snapshot().await;
         client
     }
 
-    /// The same, but also hands back the [`crate::test_util::MockControl`] so a test can watch
+    /// The same, but also hands back the [`MockControl`] so a test can watch
     /// flushes on this connection.
     async fn attach_congested_watched(
-        harness: &crate::test_util::Harness,
-    ) -> (Client, crate::test_util::MockControl) {
+        harness: &Harness,
+    ) -> (Client, MockControl) {
         let (mut client, server) = connected_congested();
         let control = server.control();
         hand_over(harness, server).await;
@@ -473,8 +474,8 @@ mod test {
     }
 
     async fn attach_over(
-        harness: &crate::test_util::Harness,
-        connection: (Client, crate::test_util::MockStream),
+        harness: &Harness,
+        connection: (Client, MockStream),
     ) -> Client {
         let (mut client, server) = connection;
         hand_over(harness, server).await;
@@ -487,7 +488,7 @@ mod test {
 
     /// Queues a socket on the registry and waits for it to be taken. Every attach in this
     /// module goes through here, so the double `expect` is written once.
-    async fn hand_over(harness: &crate::test_util::Harness, server: crate::test_util::MockStream) {
+    async fn hand_over(harness: &Harness, server: MockStream) {
         harness
             .registry
             .subscribe(key(), server)
@@ -497,7 +498,7 @@ mod test {
     }
 
     /// Whether the symbol still has a broadcaster.
-    async fn is_registered(harness: &crate::test_util::Harness) -> bool {
+    async fn is_registered(harness: &Harness) -> bool {
         harness
             .registry
             .is_registered(key())

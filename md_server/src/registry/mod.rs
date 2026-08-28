@@ -354,7 +354,10 @@ mod test {
     use super::Key;
     use super::events::Claim;
     use crate::broadcast::SESSION_SWEEP;
-    use crate::test_util::{Client, FakeSource, Harness, connected, registry_for};
+    use crate::registry::harness::{Harness, registry_for};
+    use crate::session::peer::{Client, connected};
+    use crate::test_util::FakeSource;
+    use crate::transport::mock::MockStream;
     use crate::venue::Venue;
     use md_wire::framing::RejectCode;
     use std::sync::Arc;
@@ -376,7 +379,7 @@ mod test {
         harness: &Harness,
     ) -> (
         Client,
-        oneshot::Receiver<Result<(), super::Refused<crate::test_util::MockStream>>>,
+        oneshot::Receiver<Result<(), super::Refused<MockStream>>>,
     ) {
         let (client, server) = connected();
         let queued = harness.registry.subscribe(key(), server);
@@ -659,5 +662,42 @@ mod test {
             2,
             "and must still be starting broadcasters"
         );
+    }
+}
+
+/// The registry task a unit test drives, over fake connectors.
+///
+/// Here rather than in [`crate::test_util`] because it wraps this module's own task. The
+/// end-to-end test stands a whole server up through [`crate::server::serve`] instead, so it
+/// needs none of this.
+#[cfg(test)]
+pub(crate) mod harness {
+    use super::RegistryHandle;
+    use super::events::RegistryTx;
+    use crate::test_util::{FakeConnectors, FakeSource};
+    use crate::transport::mock::MockStream;
+    use std::sync::Arc;
+
+    /// A registry task over one Binance-side source, and the way in that a test drives it
+    /// through.
+    ///
+    /// The [`super::RegistryHandle`] is dropped rather than kept: dropping its `JoinHandle` only
+    /// detaches the task, and the `RegistryTx` in the harness is what keeps it running - for
+    /// exactly as long as the test holds the harness. A test that wants the connectors back
+    /// stands its own handle up instead.
+    pub(crate) fn registry_for(source: &Arc<FakeSource>) -> Harness {
+        let connectors = FakeConnectors::new(Arc::clone(source), FakeSource::default());
+        let handle = RegistryHandle::spawn(connectors);
+
+        Harness {
+            registry: handle.tx(),
+        }
+    }
+
+    /// What [`registry_for`] hands back: the registry under test, reached the same way a
+    /// broadcaster reaches it.
+    #[derive(Debug)]
+    pub(crate) struct Harness {
+        pub(crate) registry: RegistryTx<MockStream>,
     }
 }
