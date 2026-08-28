@@ -40,7 +40,11 @@ fn reader_never_observes_a_torn_slot() {
         let mut reader = observer.join().unwrap();
 
         // Both writes have retired, so the newest must now be visible.
-        assert_eq!(*reader.get(), 2, "newest value not visible after the writer finished");
+        assert_eq!(
+            *reader.get(),
+            2,
+            "newest value not visible after the writer finished"
+        );
     });
 }
 
@@ -98,7 +102,10 @@ fn repeated_reads_stay_coherent() {
             assert!(first == 0 || first == 1, "first read observed {first}");
             assert!(second == 0 || second == 1, "second read observed {second}");
             // The buffer is single-slot-newest: once 1 is seen it cannot revert.
-            assert!(!(first == 1 && second == 0), "read went backwards: 1 then 0");
+            assert!(
+                !(first == 1 && second == 0),
+                "read went backwards: 1 then 0"
+            );
         });
 
         writer.join().unwrap();

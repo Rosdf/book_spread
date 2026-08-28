@@ -199,7 +199,9 @@ impl Shared {
     unsafe fn wake_after_register(&self) {
         // SAFETY: the caller guarantees the cell is initialised and that the
         // handoff granted us exclusive access to it.
-        let waker = self.waker.with(|slot| unsafe { (*slot).assume_init_read() });
+        let waker = self
+            .waker
+            .with(|slot| unsafe { (*slot).assume_init_read() });
 
         // Relaxed: the cell we emptied is only rewritten by this same caller, in
         // program order. Sequenced before `wake()` all the same, because that
@@ -278,7 +280,9 @@ impl Shared {
         // `NOT_WAKING`, so no `register` is in the cell and no other `notify` can
         // enter until we restore the bit. `NOT_WAITING` clear means the cell is
         // initialised.
-        let waker = self.waker.with(|slot| unsafe { (*slot).assume_init_read() });
+        let waker = self
+            .waker
+            .with(|slot| unsafe { (*slot).assume_init_read() });
 
         // Release, and before `wake()`, for the same reason as in
         // `wake_after_register`.
@@ -482,12 +486,7 @@ impl Drop for Waiter {
 pub fn pair() -> (Notifier, Waiter) {
     let shared = Box::into_non_null(Box::new(Shared {
         state: AtomicU8::new(
-            NOTIFIER_REF
-                | WAITER_REF
-                | NOTIFIER_ACTIVE
-                | NOT_WAITING
-                | NOT_WAKING
-                | NOT_PENDING,
+            NOTIFIER_REF | WAITER_REF | NOTIFIER_ACTIVE | NOT_WAITING | NOT_WAKING | NOT_PENDING,
         ),
         waker: UnsafeCell::new(MaybeUninit::uninit()),
     }));

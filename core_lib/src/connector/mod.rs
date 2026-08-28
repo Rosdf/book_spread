@@ -1,12 +1,12 @@
-use serde::Deserialize;
 use crate::connector::book_publisher::BookReader;
 use crate::connector::events::{
-    create_event_channel, ConnectorEvent, ConnectorRx, ConnectorTx, Subscribe, Unsubscribe,
+    ConnectorEvent, ConnectorRx, ConnectorTx, Subscribe, Unsubscribe, create_event_channel,
 };
 use crate::venue::ConnectorConfig;
+use serde::Deserialize;
 
-pub mod events;
 pub mod book_publisher;
+pub mod events;
 
 #[derive(Debug)]
 pub struct ConnectorHandle {
@@ -20,7 +20,10 @@ pub trait Connector {
     /// `CoreConfig` alongside them.
     type Config: for<'de> Deserialize<'de> + Send + 'static;
 
-    fn run(rx: ConnectorRx, config: ConnectorConfig<Self::Config>) -> impl Future<Output = ()> + Send + 'static;
+    fn run(
+        rx: ConnectorRx,
+        config: ConnectorConfig<Self::Config>,
+    ) -> impl Future<Output = ()> + Send + 'static;
 }
 
 impl ConnectorHandle {
@@ -35,7 +38,7 @@ impl ConnectorHandle {
             C::run(rx, config).await;
         });
 
-        Self {tx, task}
+        Self { tx, task }
     }
 
     pub fn subscribe(&self, symbol: Box<str>) -> oneshot::Receiver<anyhow::Result<BookReader>> {

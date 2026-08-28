@@ -43,7 +43,10 @@ pub mod universe;
 pub use backoff::{Backoff, jitter};
 pub use config::{ConnectorConfig, CoreConfig, Defaults};
 pub use connection::LaneCommand;
-pub use levels::{BookSink, Decimal, LevelSink, LevelsSeed, MalformedDecimal, Side, apply_level, merge, worth_publishing};
+pub use levels::{
+    BookSink, Decimal, LevelSink, LevelsSeed, MalformedDecimal, Side, apply_level, merge,
+    worth_publishing,
+};
 pub use pending::PendingDiffs;
 pub use router::{Lane, LaneId, Router};
 pub use scratch::Scratch;

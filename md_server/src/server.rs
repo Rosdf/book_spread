@@ -4,15 +4,12 @@
 //! [`crate::framed`], and from then on written to by that broadcaster directly - see
 //! [`crate::session`].
 
-use crate::registry::Registry;
+use crate::registry::RegistryHandle;
 use crate::transport::Listener;
 use crate::venue::{Connectors, LiveConnectors};
-use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
 
 /// Binds `addr` and serves the book feed until ctrl-c.
 ///
@@ -38,17 +35,17 @@ pub async fn run(addr: SocketAddr) -> anyhow::Result<()> {
 /// Three steps, and the order is the whole of it.
 ///
 /// 1. `stop` resolves, and the accept loop is told to stop. It stops accepting and then waits
-///    for every handshake still in flight - each of which holds an `Arc<Registry>` of its own,
+///    for every handshake still in flight - each of which holds a `RegistryTx` of its own,
 ///    and each of which is bounded by the handshake timeout, so this cannot hang.
-/// 2. [`Registry::shut_down`] drops the registry's task token and clears its entries. Clearing
-///    the entries drops the sending half of every broadcaster's join channel, which each
-///    broadcaster's `recv` reports as `None` and takes as "stop". Nothing has to be drained:
-///    a broadcaster drops its sessions on the way out, and dropping a session closes that
-///    client's socket, which is how this protocol ends a stream.
-/// 3. The task-token channel closes once the last broadcaster has released its
-///    `Arc<Registry>`, which is what makes the reclaim below possible. The connectors are
-///    reclaimed rather than dropped because `ConnectorHandle::shutdown` consumes the handle,
-///    so the registry has to be the sole owner by then.
+/// 2. [`RegistryHandle::shutdown`] sends the registry its `ShutDown`, which clears its
+///    entries. Clearing the entries drops the sending half of every broadcaster's join
+///    channel, which each broadcaster's `recv` reports as `None` and takes as "stop". Nothing
+///    has to be drained: a broadcaster drops its sessions on the way out, and dropping a
+///    session closes that client's socket, which is how this protocol ends a stream.
+/// 3. The same call then drops the last `RegistryTx` outside the registry task, so the task's
+///    own `recv` reports `None` the moment the last broadcaster has dropped its copy - and
+///    hands the connectors back on its way out. They are reclaimed rather than dropped
+///    because `ConnectorHandle::shutdown` consumes the handle.
 ///
 /// # Errors
 ///
@@ -59,17 +56,10 @@ pub async fn serve<C: Connectors, L: Listener>(
     connectors: C,
     stop: impl Future<Output = ()> + Send,
 ) -> anyhow::Result<()> {
-    // `Infallible` makes it statically impossible to send anything through this channel: the
-    // only event it carries is its own closure.
-    let (task_token, mut tasks_done) = mpsc::channel::<Infallible>(1);
-    let registry = Arc::new(Registry::new(connectors, task_token));
+    let registry = RegistryHandle::spawn(connectors);
 
     let (stop_accepting, stopped) = oneshot::channel();
-    let accepting = tokio::spawn(crate::framed::accept(
-        Arc::clone(&registry),
-        listener,
-        stopped,
-    ));
+    let accepting = tokio::spawn(crate::framed::accept(registry.tx(), listener, stopped));
 
     stop.await;
     let _ = stop_accepting.send(());
@@ -77,13 +67,10 @@ pub async fn serve<C: Connectors, L: Listener>(
         tracing::error!(%err, "the accept loop panicked");
     }
 
-    registry.shut_down();
-    let _ = tasks_done.recv().await;
-
-    if let Some(reclaimed) = Arc::into_inner(registry) {
-        reclaimed.into_connectors().shutdown().await;
+    if let Some(reclaimed) = registry.shutdown().await {
+        reclaimed.shutdown().await;
     } else {
-        tracing::error!("registry still referenced at shutdown; connectors left running");
+        tracing::error!("the registry task did not finish; connectors left running");
     }
 
     report_depth_stats();

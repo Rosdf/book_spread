@@ -70,9 +70,7 @@ pub enum BootstrapError {
     #[error("decoding snapshot or buffered diff: {0}")]
     Decode(#[from] simd_json::Error),
 
-    #[error(
-        "snapshot microtimestamp {snapshot} does not reach buffered diffs starting at {first}"
-    )]
+    #[error("snapshot microtimestamp {snapshot} does not reach buffered diffs starting at {first}")]
     SnapshotGap { snapshot: u64, first: u64 },
 }
 
@@ -378,10 +376,16 @@ struct ControlFrame {
 enum Frame<'a> {
     /// A diff for a slot with a live book. The stage (owned by the caller, not by this frame)
     /// is ready to apply.
-    Data { slot: &'a mut BitstampSlot, micro: u64 },
+    Data {
+        slot: &'a mut BitstampSlot,
+        micro: u64,
+    },
     /// The slot is bootstrapping, so the caller should copy the staged levels into its arena -
     /// which this seed cannot do itself, since the stage is the caller's, not the frame's.
-    Buffer { slot: &'a mut BitstampSlot, micro: u64 },
+    Buffer {
+        slot: &'a mut BitstampSlot,
+        micro: u64,
+    },
     Control(ControlFrame),
     /// `bts:request_reconnect`: the caller should end the session cleanly and reconnect.
     Reconnect,
@@ -473,8 +477,10 @@ impl<'de, 'a> Visitor<'de> for FrameSeed<'a, '_> {
         }
 
         if event == Some("data") {
-            let data_channel = channel.ok_or_else(|| A::Error::custom(MalformedPayload::MissingChannel))?;
-            let data_micro = micro.ok_or_else(|| A::Error::custom(MalformedPayload::MissingMicrotimestamp))?;
+            let data_channel =
+                channel.ok_or_else(|| A::Error::custom(MalformedPayload::MissingChannel))?;
+            let data_micro =
+                micro.ok_or_else(|| A::Error::custom(MalformedPayload::MissingMicrotimestamp))?;
 
             let resolved =
                 symbol::pair_of_channel(data_channel).and_then(|pair| self.table.get_mut(pair));
@@ -484,9 +490,15 @@ impl<'de, 'a> Visitor<'de> for FrameSeed<'a, '_> {
             };
 
             return Ok(if matches!(slot.state, SlotState::Bootstrapping(_)) {
-                Frame::Buffer { slot, micro: data_micro }
+                Frame::Buffer {
+                    slot,
+                    micro: data_micro,
+                }
             } else {
-                Frame::Data { slot, micro: data_micro }
+                Frame::Data {
+                    slot,
+                    micro: data_micro,
+                }
             });
         }
 
@@ -585,7 +597,10 @@ fn on_control(control: &ControlFrame) -> FrameAction<'static, Ready, Buffered> {
         }
         "bts:error" => {
             tracing::error!(message = ?control.message, "control request rejected by the venue");
-            return FrameAction::ControlRejected { id: None, code: None };
+            return FrameAction::ControlRejected {
+                id: None,
+                code: None,
+            };
         }
         other => tracing::debug!(event = other, "unrecognized control reply"),
     }
@@ -597,7 +612,11 @@ pub(crate) fn on_frame<'t>(
     ctx: FrameCtx<'t, '_, '_, Ready, LevelStage, Buffered>,
     bytes: Bytes,
 ) -> FrameAction<'t, Ready, Buffered> {
-    let FrameCtx { table, dec, generations: _ } = ctx;
+    let FrameCtx {
+        table,
+        dec,
+        generations: _,
+    } = ctx;
     let (scratch, bufs, stage) = dec.parts();
 
     let decoded = scratch.with_owned_bytes(bytes, |data| -> Result<_, _> {
@@ -672,7 +691,10 @@ pub(crate) fn seed_and_replay(
 
     let snapshot_micro = scratch.with_owned_bytes(body, |data| -> Result<_, _> {
         let mut de = simd_json::Deserializer::from_slice_with_buffers(data, bufs)?;
-        SnapshotSeed { book: &mut slot.book }.deserialize(&mut de)
+        SnapshotSeed {
+            book: &mut slot.book,
+        }
+        .deserialize(&mut de)
     })?;
 
     if let Some(first) = first_buffered
@@ -731,7 +753,8 @@ const ENABLED: &str = "Enabled";
 /// [`SymbolsError`] if the body does not decode.
 pub(crate) fn parse_symbols(body: Bytes) -> Result<HashSet<Symbol>, SymbolsError> {
     let mut scratch = Scratch::default();
-    let pairs: Vec<PairInfo> = scratch.with_owned_bytes(body, |data| simd_json::from_slice(data))?;
+    let pairs: Vec<PairInfo> =
+        scratch.with_owned_bytes(body, |data| simd_json::from_slice(data))?;
 
     Ok(pairs
         .into_iter()
@@ -739,7 +762,6 @@ pub(crate) fn parse_symbols(body: Bytes) -> Result<HashSet<Symbol>, SymbolsError
         .filter_map(|pair| Symbol::new(pair.url_symbol).ok())
         .collect())
 }
-
 
 #[cfg(test)]
 mod test {
@@ -865,14 +887,21 @@ mod test {
     fn a_bootstrapping_slot_gets_the_staged_levels_copied_into_its_own_arena() {
         let mut table: SlotTable<Ready, Buffered> = SlotTable::default();
         table
-            .insert(slot("btcusd", SlotState::bootstrapping(Buffered::default())))
+            .insert(slot(
+                "btcusd",
+                SlotState::bootstrapping(Buffered::default()),
+            ))
             .unwrap();
         let mut stage = LevelStage::default();
 
         stage_into_slot(&mut table, &mut stage, DIFF);
 
         let target = table.get_mut("btcusd").unwrap();
-        assert_eq!(target.book.first_bids().len(), 0, "nothing may be applied before the snapshot");
+        assert_eq!(
+            target.book.first_bids().len(),
+            0,
+            "nothing may be applied before the snapshot"
+        );
         let SlotState::Bootstrapping(boot) = &target.state else {
             unreachable!("still bootstrapping")
         };
@@ -889,7 +918,10 @@ mod test {
     fn a_second_staged_diff_does_not_reach_into_the_first_ones_levels() {
         let mut table: SlotTable<Ready, Buffered> = SlotTable::default();
         table
-            .insert(slot("btcusd", SlotState::bootstrapping(Buffered::default())))
+            .insert(slot(
+                "btcusd",
+                SlotState::bootstrapping(Buffered::default()),
+            ))
             .unwrap();
         let mut stage = LevelStage::default();
 
@@ -929,7 +961,10 @@ mod test {
 
         let mut staged_table: SlotTable<Ready, Buffered> = SlotTable::default();
         staged_table
-            .insert(slot("btcusd", SlotState::bootstrapping(Buffered::default())))
+            .insert(slot(
+                "btcusd",
+                SlotState::bootstrapping(Buffered::default()),
+            ))
             .unwrap();
         let mut staged_stage = LevelStage::default();
         stage_into_slot(&mut staged_table, &mut staged_stage, DIFF);
@@ -950,8 +985,12 @@ mod test {
 
         let seen = |book: &IncrementalBook| {
             (
-                book.first_bids().map(|l| (l.price(), l.size())).collect::<Vec<_>>(),
-                book.first_asks().map(|l| (l.price(), l.size())).collect::<Vec<_>>(),
+                book.first_bids()
+                    .map(|l| (l.price(), l.size()))
+                    .collect::<Vec<_>>(),
+                book.first_asks()
+                    .map(|l| (l.price(), l.size()))
+                    .collect::<Vec<_>>(),
             )
         };
         let inline_slot = inline_table.get_mut("btcusd").unwrap();
@@ -1015,7 +1054,10 @@ mod test {
             panic!("expected a control frame");
         };
         assert_eq!(control.channel.as_ref(), "");
-        assert_eq!(control.message.as_deref(), Some("Invalid channel provided."));
+        assert_eq!(
+            control.message.as_deref(),
+            Some("Invalid channel provided.")
+        );
     }
 
     #[test]
@@ -1024,7 +1066,10 @@ mod test {
         let mut stage = LevelStage::default();
         let json = r#"{"event":"bts:request_reconnect","channel":"","data":{}}"#;
 
-        assert!(matches!(frame(&mut table, &mut stage, json).unwrap(), Frame::Reconnect));
+        assert!(matches!(
+            frame(&mut table, &mut stage, json).unwrap(),
+            Frame::Reconnect
+        ));
     }
 
     #[test]
@@ -1040,10 +1085,16 @@ mod test {
         let mut book = IncrementalBook::new();
         let mut buf = bytes(SNAPSHOT);
         let mut de = simd_json::Deserializer::from_slice(&mut buf).unwrap();
-        let micro = SnapshotSeed { book: &mut book }.deserialize(&mut de).unwrap();
+        let micro = SnapshotSeed { book: &mut book }
+            .deserialize(&mut de)
+            .unwrap();
 
         assert_eq!(micro, SNAPSHOT_MICRO);
-        assert_eq!(book.first_bids().len(), 20, "the fixture carries 20 levels per side");
+        assert_eq!(
+            book.first_bids().len(),
+            20,
+            "the fixture carries 20 levels per side"
+        );
         assert!(book.first_asks().len() > 0);
         assert_eq!(book.first_bids().next().unwrap().price(), pos(78_130.25));
     }
@@ -1055,7 +1106,10 @@ mod test {
     fn replay_drops_covered_diffs_and_applies_the_rest() {
         let mut table: SlotTable<Ready, Buffered> = SlotTable::default();
         table
-            .insert(slot("btcusd", SlotState::bootstrapping(Buffered::default())))
+            .insert(slot(
+                "btcusd",
+                SlotState::bootstrapping(Buffered::default()),
+            ))
             .unwrap();
         let mut stage = LevelStage::default();
 
@@ -1087,7 +1141,10 @@ mod test {
         assert_eq!(ready.last_micro, DIFF_MICRO);
         assert!(target.book.first_bids().len() > 0);
         assert!(
-            !target.book.first_bids().any(|level| level.price() == pos(1.00)),
+            !target
+                .book
+                .first_bids()
+                .any(|level| level.price() == pos(1.00)),
             "a diff the snapshot already covers must not be replayed"
         );
     }
@@ -1107,7 +1164,10 @@ mod test {
         )
         .unwrap_err();
 
-        assert!(matches!(err, super::BootstrapError::SnapshotGap { .. }), "{err}");
+        assert!(
+            matches!(err, super::BootstrapError::SnapshotGap { .. }),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1131,7 +1191,11 @@ mod test {
     #[test]
     fn every_failure_retries_against_the_diffs_already_buffered() {
         assert_eq!(
-            super::BootstrapError::SnapshotGap { snapshot: 1, first: 9 }.retry(),
+            super::BootstrapError::SnapshotGap {
+                snapshot: 1,
+                first: 9
+            }
+            .retry(),
             Retry::Refetch
         );
 

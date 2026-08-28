@@ -19,7 +19,9 @@
 
 use bytes::Bytes;
 use core_lib::incremental_book::{IncrementalBook, UpdateResult};
-use core_lib::venue::levels::{BookSink, LevelSink, LevelsSeed, Side, apply_level, worth_publishing};
+use core_lib::venue::levels::{
+    BookSink, LevelSink, LevelsSeed, Side, apply_level, worth_publishing,
+};
 use core_lib::venue::{
     Decoder, FrameAction, FrameCtx, Generations, PendingDiffs, Retry, Scratch, Slot, SlotState,
     Symbol,
@@ -444,7 +446,10 @@ enum DataFrame<'a> {
     },
     /// `slot` is still bootstrapping, so the diff was staged into its arena. `first_id` (`U`)
     /// is the only id `on_buffered` needs, so `u` is not carried out.
-    Buffer { slot: &'a mut BinanceSlot, first_id: u64 },
+    Buffer {
+        slot: &'a mut BinanceSlot,
+        first_id: u64,
+    },
 }
 
 /// A control response: a SUBSCRIBE ack, or a rejection.
@@ -642,7 +647,9 @@ impl<'de> Visitor<'de> for ErrorValueVisitor {
 
     /// A code quoted as a string still yields a number; a prose message does not.
     fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<ErrorValue, E> {
-        Ok(ErrorValue::Rejected { code: v.parse().ok() })
+        Ok(ErrorValue::Rejected {
+            code: v.parse().ok(),
+        })
     }
 }
 
@@ -816,11 +823,7 @@ fn control<'de, A: MapAccess<'de>>(
         match map.next_key::<ControlField>()? {
             Some(next) => field = next,
             None => {
-                return Ok(ControlFrame {
-                    id,
-                    code,
-                    rejected,
-                });
+                return Ok(ControlFrame { id, code, rejected });
             }
         }
     }
@@ -1032,7 +1035,11 @@ pub(crate) fn on_frame<'t>(
     ctx: FrameCtx<'t, '_, '_, Ready, (), Buffered>,
     bytes: Bytes,
 ) -> FrameAction<'t, Ready, Buffered> {
-    let FrameCtx { table, dec, generations } = ctx;
+    let FrameCtx {
+        table,
+        dec,
+        generations,
+    } = ctx;
     let (scratch, bufs, _stage) = dec.parts();
 
     let decoded = decode_frame(bytes, scratch, bufs, table);
@@ -1054,7 +1061,11 @@ pub(crate) fn on_frame<'t>(
             }
             FrameAction::Handled
         }
-        Ok(Frame::Data(DataFrame::Seeded { slot, outcome, last_update_id })) => {
+        Ok(Frame::Data(DataFrame::Seeded {
+            slot,
+            outcome,
+            last_update_id,
+        })) => {
             slot.last_frame = Instant::now();
             on_seeded(slot, &outcome, last_update_id, generations);
             FrameAction::Handled
@@ -1091,7 +1102,10 @@ pub(crate) fn seed_and_replay(
 
     let last_update_id = scratch.with_owned_bytes(body, |data| -> Result<_, _> {
         let mut de = simd_json::Deserializer::from_slice_with_buffers(data, bufs)?;
-        SnapshotSeed { book: &mut slot.book }.deserialize(&mut de)
+        SnapshotSeed {
+            book: &mut slot.book,
+        }
+        .deserialize(&mut de)
     })?;
 
     // The snapshot must reach at least as far as the earliest event we buffered, or there
@@ -1271,13 +1285,19 @@ mod test {
     fn buffer(frames: &[String]) -> Buffered {
         let mut table: SlotTable<Ready, Buffered> = SlotTable::default();
         table
-            .insert(test_slot(BTC, SlotState::bootstrapping(Buffered::default())))
+            .insert(test_slot(
+                BTC,
+                SlotState::bootstrapping(Buffered::default()),
+            ))
             .unwrap();
 
         for json in frames {
             let mut buf = bytes(json);
             let (result, _) = mux(&mut buf, &mut table);
-            assert!(matches!(result, Ok(Frame::Data(super::DataFrame::Buffer { .. }))));
+            assert!(matches!(
+                result,
+                Ok(Frame::Data(super::DataFrame::Buffer { .. }))
+            ));
         }
 
         let slot = table.get_mut(BTC).unwrap();
@@ -1290,7 +1310,13 @@ mod test {
     fn replay(pending: &Buffered, first_buffered: Option<u64>) -> Result<Ready, BootstrapError> {
         let mut slot = test_slot("BTCUSDT", SlotState::bootstrapping(Buffered::default()));
         let mut dec: Decoder<()> = Decoder::default();
-        seed_and_replay(&mut slot, pending, first_buffered, SNAPSHOT.into(), &mut dec)
+        seed_and_replay(
+            &mut slot,
+            pending,
+            first_buffered,
+            SNAPSHOT.into(),
+            &mut dec,
+        )
     }
 
     fn pos(v: f64) -> PositiveF64 {
@@ -1356,7 +1382,13 @@ mod test {
     fn buffer_seed_reads_the_ids_and_stages_both_sides() {
         let mut pending = Buffered::default();
         let mut buf = bytes(DIFF);
-        let first_id = run(&mut buf, BufferSeed { pending: &mut pending }).unwrap();
+        let first_id = run(
+            &mut buf,
+            BufferSeed {
+                pending: &mut pending,
+            },
+        )
+        .unwrap();
 
         assert_eq!(first_id, 157);
         assert_eq!(pending.buffered(), 1);
@@ -1371,10 +1403,7 @@ mod test {
     /// from bleeding into each other.
     #[test]
     fn a_second_staged_diff_does_not_reach_into_the_first_ones_levels() {
-        let mut pending = buffer(&[
-            frame(1, 2, "100.00000000"),
-            frame(3, 4, "200.00000000"),
-        ]);
+        let mut pending = buffer(&[frame(1, 2, "100.00000000"), frame(3, 4, "200.00000000")]);
 
         let staged: Vec<_> = pending
             .diffs()
@@ -1408,7 +1437,13 @@ mod test {
         let mut staged = IncrementalBook::new();
         let mut pending = Buffered::default();
         let mut ids = bytes(DIFF);
-        run(&mut ids, BufferSeed { pending: &mut pending }).unwrap();
+        run(
+            &mut ids,
+            BufferSeed {
+                pending: &mut pending,
+            },
+        )
+        .unwrap();
         for diff in pending.diffs() {
             for &(price, qty) in diff.bids {
                 apply_level(&mut staged, Side::Bid, price, qty);
@@ -1420,8 +1455,12 @@ mod test {
 
         let seen = |book: &IncrementalBook| {
             (
-                book.first_bids().map(|l| (l.price(), l.size())).collect::<Vec<_>>(),
-                book.first_asks().map(|l| (l.price(), l.size())).collect::<Vec<_>>(),
+                book.first_bids()
+                    .map(|l| (l.price(), l.size()))
+                    .collect::<Vec<_>>(),
+                book.first_asks()
+                    .map(|l| (l.price(), l.size()))
+                    .collect::<Vec<_>>(),
             )
         };
         assert_eq!(seen(&staged), seen(&inline));
@@ -1435,10 +1474,16 @@ mod test {
     fn mux_routes_a_live_stream_to_its_slot() {
         let mut table: SlotTable<Ready, Buffered> = SlotTable::default();
         table
-            .insert(test_slot(ETH, SlotState::bootstrapping(Buffered::default())))
+            .insert(test_slot(
+                ETH,
+                SlotState::bootstrapping(Buffered::default()),
+            ))
             .unwrap();
         table
-            .insert(test_slot(BTC, SlotState::Ready(Ready::Live { prev_u: 156 })))
+            .insert(test_slot(
+                BTC,
+                SlotState::Ready(Ready::Live { prev_u: 156 }),
+            ))
             .unwrap();
 
         let mut buf = bytes(&envelope("btcusdt@depth@100ms", DIFF));
@@ -1455,7 +1500,10 @@ mod test {
     fn mux_stages_into_a_bootstrapping_slot_and_reads_its_first_id() {
         let mut table: SlotTable<Ready, Buffered> = SlotTable::default();
         table
-            .insert(test_slot(BTC, SlotState::bootstrapping(Buffered::default())))
+            .insert(test_slot(
+                BTC,
+                SlotState::bootstrapping(Buffered::default()),
+            ))
             .unwrap();
 
         let mut buf = bytes(&envelope("btcusdt@depth@100ms", DIFF));
@@ -1465,12 +1513,20 @@ mod test {
             panic!("expected a buffered frame");
         };
         assert_eq!(first_id, 157);
-        assert_eq!(slot.book.first_bids().len(), 0, "nothing may be applied before the snapshot");
+        assert_eq!(
+            slot.book.first_bids().len(),
+            0,
+            "nothing may be applied before the snapshot"
+        );
 
         let SlotState::Bootstrapping(boot) = &slot.state else {
             unreachable!("still bootstrapping")
         };
-        assert_eq!(boot.pending.buffered(), 1, "the diff must be staged in the slot's own arena");
+        assert_eq!(
+            boot.pending.buffered(),
+            1,
+            "the diff must be staged in the slot's own arena"
+        );
     }
 
     #[test]
@@ -1480,7 +1536,10 @@ mod test {
             .insert(test_slot(ETH, SlotState::Ready(Ready::Live { prev_u: 0 })))
             .unwrap();
         table
-            .insert(test_slot(BTC, SlotState::Ready(Ready::Live { prev_u: 156 })))
+            .insert(test_slot(
+                BTC,
+                SlotState::Ready(Ready::Live { prev_u: 156 }),
+            ))
             .unwrap();
 
         let broken = r#"{"U":157,"u":160,"b":[["100.0","1.0"],["oops","1.0"]],"a":[]}"#;
@@ -1500,7 +1559,10 @@ mod test {
     fn a_stream_this_connection_does_not_carry_is_ignored_rather_than_failed() {
         let mut table: SlotTable<Ready, Buffered> = SlotTable::default();
         table
-            .insert(test_slot(BTC, SlotState::Ready(Ready::Live { prev_u: 156 })))
+            .insert(test_slot(
+                BTC,
+                SlotState::Ready(Ready::Live { prev_u: 156 }),
+            ))
             .unwrap();
 
         let mut buf = bytes(&envelope("dogeusdt@depth@100ms", DIFF));
@@ -1595,7 +1657,10 @@ mod test {
             (r#"{"error":[1,2],"id":3}"#, None),
             (r#"{"error":true,"id":3}"#, None),
             // A whole extra layer of envelope around it.
-            (r#"{"status":400,"error":{"code":-1121,"msg":"x"},"id":3}"#, Some(-1121)),
+            (
+                r#"{"status":400,"error":{"code":-1121,"msg":"x"},"id":3}"#,
+                Some(-1121),
+            ),
         ] {
             assert_eq!(
                 control(json),
@@ -1639,7 +1704,10 @@ mod test {
         ]);
 
         let state = replay(&pending, Some(LAST - 5)).unwrap();
-        assert!(matches!(state, Ready::Live { prev_u } if prev_u == LAST + 4), "{state:?}");
+        assert!(
+            matches!(state, Ready::Live { prev_u } if prev_u == LAST + 4),
+            "{state:?}"
+        );
     }
 
     #[test]
@@ -1705,14 +1773,24 @@ mod test {
 
     #[test]
     fn on_seeded_drops_an_event_the_snapshot_already_covers() {
-        let mut slot = test_slot(BTC, SlotState::Ready(Ready::Seeded { last_update_id: 500 }));
+        let mut slot = test_slot(
+            BTC,
+            SlotState::Ready(Ready::Seeded {
+                last_update_id: 500,
+            }),
+        );
         let mut generations = Generations::default();
 
         let outcome = super::DiffOutcome::for_test(400, 450, false);
         on_seeded(&mut slot, &outcome, 500, &mut generations);
 
         assert!(
-            matches!(slot.state, SlotState::Ready(Ready::Seeded { last_update_id: 500 })),
+            matches!(
+                slot.state,
+                SlotState::Ready(Ready::Seeded {
+                    last_update_id: 500
+                })
+            ),
             "an event the snapshot already covers must not change the slot's state"
         );
         assert_eq!(slot.book.first_bids().len(), 0);
@@ -1720,7 +1798,12 @@ mod test {
 
     #[test]
     fn on_seeded_promotes_on_the_straddling_event() {
-        let mut slot = test_slot(BTC, SlotState::Ready(Ready::Seeded { last_update_id: 500 }));
+        let mut slot = test_slot(
+            BTC,
+            SlotState::Ready(Ready::Seeded {
+                last_update_id: 500,
+            }),
+        );
         slot.book.update_bid(pos(100.0), pos(1.0));
         let mut generations = Generations::default();
 
@@ -1735,7 +1818,12 @@ mod test {
 
     #[test]
     fn on_seeded_resyncs_when_nothing_straddles_the_boundary() {
-        let mut slot = test_slot(BTC, SlotState::Ready(Ready::Seeded { last_update_id: 500 }));
+        let mut slot = test_slot(
+            BTC,
+            SlotState::Ready(Ready::Seeded {
+                last_update_id: 500,
+            }),
+        );
         slot.book.update_bid(pos(100.0), pos(1.0));
         let mut generations = Generations::default();
 
@@ -1781,11 +1869,19 @@ mod test {
     #[test]
     fn only_a_sequence_hole_throws_the_buffered_diffs_away() {
         assert_eq!(
-            BootstrapError::SnapshotGap { snapshot: 1, first: 9 }.retry(),
+            BootstrapError::SnapshotGap {
+                snapshot: 1,
+                first: 9
+            }
+            .retry(),
             Retry::Refetch
         );
         assert_eq!(
-            BootstrapError::Gap { expected: 1, got: 9 }.retry(),
+            BootstrapError::Gap {
+                expected: 1,
+                got: 9
+            }
+            .retry(),
             Retry::Resync
         );
 

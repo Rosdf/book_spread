@@ -36,6 +36,7 @@
 use crate::connector::book_publisher::{BookReader, make_book_publisher_pair};
 use crate::incremental_book::IncrementalBook;
 use crate::net::{RestClient, WsConnector};
+use crate::panic::panic_message;
 use crate::venue::backoff::Backoff;
 use crate::venue::pending::PendingDiffs as _;
 use crate::venue::session::{SessionEnd, SessionError, SessionErrorImpl, close, ws_err};
@@ -48,7 +49,6 @@ use crate::venue::table::{Slot, SlotState, SlotTable};
 use crate::venue::{ConnectorConfig, rest};
 use bytes::Bytes;
 use futures_util::{FutureExt as _, StreamExt as _};
-use std::any::Any;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -737,18 +737,6 @@ where
     }
 }
 
-/// The message out of a caught panic's payload, for a log field.
-///
-/// `panic!` produces a `&'static str` for a literal and a `String` for a formatted message;
-/// anything else is a hand-rolled `panic_any`, which nothing here does.
-fn panic_message(payload: &(dyn Any + Send)) -> &str {
-    payload
-        .downcast_ref::<&'static str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("<non-string panic payload>")
-}
-
 /// Waits until `deadline`, or forever when there is nothing queued - so a pacer with an empty
 /// queue never wakes the session loop.
 async fn pacer_wait(deadline: Option<Instant>) {
@@ -763,6 +751,7 @@ mod test {
     use super::{Connection, Handler, LaneCommand, run};
     use crate::connector::book_publisher::{BookReader, make_book_publisher_pair};
     use crate::incremental_book::IncrementalBook;
+    use crate::venue::ConnectorConfig;
     use crate::venue::config::CoreConfig;
     use crate::venue::spec::{Decoder, Generations, Method, SnapshotResult};
     use crate::venue::symbol::Symbol;
@@ -774,7 +763,6 @@ mod test {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::sync::{Semaphore, mpsc};
-    use crate::venue::ConnectorConfig;
 
     type TestConn = Connection<TestVenue, StubRest, ScriptedWs>;
 

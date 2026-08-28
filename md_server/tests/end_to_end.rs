@@ -11,10 +11,10 @@
     reason = "an integration test target is checked against the whole manifest's dependencies, most of which only the library target itself uses"
 )]
 
+use md_proto::md::v1 as proto;
 use md_server::server::serve;
 use md_server::test_util::{FakeConnectors, FakeSource, book};
 use md_wire::framing::{self, RejectCode};
-use md_proto::md::v1 as proto;
 use prost::Message as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -213,10 +213,7 @@ async fn two_symbols_are_two_connections() {
     source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[]));
     source.publish("ethusdt", &book(&[(3.5, 2.0)], &[]));
 
-    assert_eq!(
-        next_book(&mut btc, &mut btc_buf).await.asks[0].price,
-        100.5
-    );
+    assert_eq!(next_book(&mut btc, &mut btc_buf).await.asks[0].price, 100.5);
     assert_eq!(next_book(&mut eth, &mut eth_buf).await.asks[0].price, 3.5);
 
     drop(btc);

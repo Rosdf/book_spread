@@ -5,12 +5,10 @@
 //! task, and no code between the encoder and the kernel. A handshake task lives for one
 //! request, one lookup and one hand-off, and then ends.
 
-use md_wire::framing;
-use crate::registry::Registry;
+use crate::registry::events::RegistryTx;
 use crate::transport::{self, Listener};
-use crate::venue::Connectors;
+use md_wire::framing;
 use std::fmt::Debug;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinSet;
@@ -25,10 +23,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Accepts connections until `stop` resolves, then tears down every handshake still in flight.
 ///
 /// Reaching the end of this function matters for more than tidiness: each handshake task holds
-/// an `Arc<Registry>`, and [`crate::server::serve`] can only reclaim the connectors once every
-/// one of them is gone.
-pub(crate) async fn accept<C: Connectors, L: Listener>(
-    registry: Arc<Registry<C, L::Stream>>,
+/// a `RegistryTx`, and the registry task only stops - and only then hands the connectors back
+/// to [`crate::server::serve`] - once every one of them is gone.
+pub(crate) async fn accept<L: Listener>(
+    registry: RegistryTx<L::Stream>,
     listener: L,
     stop: oneshot::Receiver<()>,
 ) {
@@ -43,7 +41,7 @@ pub(crate) async fn accept<C: Connectors, L: Listener>(
         tokio::select! {
             accepted = transport::accept(&listener) => match accepted {
                 Ok((sock, peer)) => {
-                    handshakes.spawn(handshake(Arc::clone(&registry), sock, peer));
+                    handshakes.spawn(handshake(registry.clone(), sock, peer));
                 }
                 Err(err) => tracing::warn!(%err, "accept failed"),
             },
@@ -59,11 +57,11 @@ pub(crate) async fn accept<C: Connectors, L: Listener>(
     drop(listener);
     // Aborted rather than awaited: a handshake is waiting on a client to say something, and
     // `HANDSHAKE_TIMEOUT` is far too long to make shutdown wait for one that never will.
-    // Aborting cannot tear anything: the hand-off to a broadcaster is a synchronous
-    // `Registry::subscribe`, so a socket has either been queued or not, and a connection
-    // dropped mid-handshake is a connection the client must handle being closed anyway.
-    // `shutdown` also waits for the aborts to land, which is what releases the last
-    // `Arc<Registry>`.
+    // Aborting cannot tear anything: the hand-off is a synchronous send onto the registry's
+    // queue, so a socket has either been queued or not, and a connection dropped
+    // mid-handshake is a connection the client must handle being closed anyway. `shutdown`
+    // also waits for the aborts to land, which is what releases the last of these
+    // `RegistryTx` clones.
     handshakes.shutdown().await;
 }
 
@@ -71,8 +69,8 @@ pub(crate) async fn accept<C: Connectors, L: Listener>(
 ///
 /// The socket leaves this function in one of three ways: attached to a broadcaster, refused
 /// with a reason, or simply dropped because the client never said anything usable.
-async fn handshake<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static, P: Debug>(
-    registry: Arc<Registry<C, S>>,
+async fn handshake<S: AsyncRead + AsyncWrite + Unpin + Send + 'static, P: Debug>(
+    registry: RegistryTx<S>,
     mut sock: S,
     peer: P,
 ) {
@@ -106,15 +104,18 @@ async fn handshake<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     // From here the broadcaster owns the answer: it writes the acceptance header itself, as
     // the first thing in flight on the session, or refuses with the venue's own reason. The
     // only case that comes back is the registry declining to take the socket at all.
-    if let Err(refused) = registry.subscribe(key, sock) {
-        let (mut declined, why) = refused.into_parts();
-        reject(
-            &mut declined,
-            peer,
-            framing::RejectCode::Unavailable,
-            why,
-        )
-        .await;
+    //
+    // A reply that never arrives is the registry having gone away - or an event handler
+    // having panicked - with this socket in hand. There is nothing to write on it, because
+    // there is nothing left to write it *to*; it went with the reply, and dropping it is what
+    // closes it.
+    match registry.subscribe(key, sock).await {
+        Ok(Ok(())) => {}
+        Ok(Err(refused)) => {
+            let (mut declined, why) = refused.into_parts();
+            reject(&mut declined, peer, framing::RejectCode::Unavailable, why).await;
+        }
+        Err(_) => tracing::debug!(?peer, "the registry could not answer for a connection"),
     }
 }
 

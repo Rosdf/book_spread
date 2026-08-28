@@ -158,8 +158,8 @@ mod test {
 
     #[test]
     fn an_empty_pair_list_is_rejected() {
-        let rejection = key_of(&SubscribeBookRequest { pairs: Vec::new() })
-            .expect_err("no pairs to serve");
+        let rejection =
+            key_of(&SubscribeBookRequest { pairs: Vec::new() }).expect_err("no pairs to serve");
         assert_eq!(rejection.code(), RejectCode::InvalidArgument);
     }
 
@@ -176,7 +176,10 @@ mod test {
     #[test]
     fn a_duplicate_pair_rejects_the_whole_request() {
         let request = SubscribeBookRequest {
-            pairs: vec![pair("binance_spot", "btcusdt"), pair("binance_spot", "btcusdt")],
+            pairs: vec![
+                pair("binance_spot", "btcusdt"),
+                pair("binance_spot", "btcusdt"),
+            ],
         };
         let rejection = key_of(&request).expect_err("a duplicate pair");
         assert_eq!(rejection.code(), RejectCode::InvalidArgument);
@@ -187,7 +190,10 @@ mod test {
     #[test]
     fn a_duplicate_pair_is_caught_after_case_normalisation() {
         let request = SubscribeBookRequest {
-            pairs: vec![pair("BINANCE_SPOT", "BTCUSDT"), pair("binance_spot", "btcusdt")],
+            pairs: vec![
+                pair("BINANCE_SPOT", "BTCUSDT"),
+                pair("binance_spot", "btcusdt"),
+            ],
         };
         let rejection = key_of(&request).expect_err("a case-insensitive duplicate");
         assert_eq!(rejection.code(), RejectCode::InvalidArgument);

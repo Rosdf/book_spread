@@ -12,13 +12,13 @@
 //! take every symbol down with it.
 
 use crate::net::{RequestBuilder, Response as _, RestClient};
+use crate::venue::ConnectorConfig;
 use crate::venue::backoff::Backoff;
 use crate::venue::spec::Venue;
 use crate::venue::symbol::Symbol;
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use crate::venue::ConnectorConfig;
 
 /// Why one listing refresh failed.
 ///
@@ -85,8 +85,11 @@ where
     reason = "the supervisor on the other end of this channel owns the concrete set; a hasher \
               parameter here would only propagate through every caller for nothing"
 )]
-pub async fn refresh_loop<V, R>(cfg: ConnectorConfig<V::Config>, client: R, tx: mpsc::Sender<HashSet<Symbol>>)
-where
+pub async fn refresh_loop<V, R>(
+    cfg: ConnectorConfig<V::Config>,
+    client: R,
+    tx: mpsc::Sender<HashSet<Symbol>>,
+) where
     V: Venue,
     R: RestClient,
 {
@@ -131,7 +134,10 @@ mod test {
     #[test]
     fn the_next_refresh_is_always_within_the_hour_and_never_immediate() {
         let wait = until_next_hour();
-        assert!(wait > Duration::ZERO, "a zero wait would hot-spin the refresh loop");
+        assert!(
+            wait > Duration::ZERO,
+            "a zero wait would hot-spin the refresh loop"
+        );
         assert!(wait <= Duration::from_secs(3600), "{wait:?}");
     }
 }

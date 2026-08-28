@@ -257,7 +257,10 @@ pub async fn read_response<R: AsyncRead + Unpin>(
         return Err(ReadResponseError::Truncated);
     }
 
-    Ok(Err(Rejected::new(code, String::from_utf8(reason.to_vec())?.into_boxed_str())))
+    Ok(Err(Rejected::new(
+        code,
+        String::from_utf8(reason.to_vec())?.into_boxed_str(),
+    )))
 }
 
 #[cfg(test)]
@@ -308,9 +311,13 @@ mod test {
         let (mut client, mut server) = tokio::io::duplex(64);
         let mut buf = Vec::new();
 
-        write_reject(&mut server, RejectCode::InvalidArgument, "unknown venue \"kraken\"")
-            .await
-            .expect("the pipe accepts the header");
+        write_reject(
+            &mut server,
+            RejectCode::InvalidArgument,
+            "unknown venue \"kraken\"",
+        )
+        .await
+        .expect("the pipe accepts the header");
 
         let rejected = read_response(&mut client, &mut buf)
             .await

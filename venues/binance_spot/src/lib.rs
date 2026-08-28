@@ -79,7 +79,10 @@ pub struct BinanceSpot;
 impl Connector for BinanceSpot {
     type Config = Config;
 
-    fn run(rx: ConnectorRx, config: ConnectorConfig<Self::Config>) -> impl Future<Output = ()> + Send + 'static {
+    fn run(
+        rx: ConnectorRx,
+        config: ConnectorConfig<Self::Config>,
+    ) -> impl Future<Output = ()> + Send + 'static {
         core_lib::venue::supervisor::run::<Self, reqwest::Client, core_lib::net::TungsteniteConnector>(
             rx,
             config,

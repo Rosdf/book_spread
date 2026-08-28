@@ -58,7 +58,10 @@ impl ControlPacer for QueuePacer {
         (!self.queue.is_empty()).then_some(self.next_ready)
     }
 
-    async fn on_deadline<W: WsConnector>(&mut self, stream: &mut W::Stream) -> Result<(), SessionError<W>> {
+    async fn on_deadline<W: WsConnector>(
+        &mut self,
+        stream: &mut W::Stream,
+    ) -> Result<(), SessionError<W>> {
         // The session only calls this once `next_deadline` has actually elapsed and the queue
         // was non-empty at that point; nothing else drains the queue in between.
         let Some((method, channel)) = self.queue.pop_front() else {

@@ -134,7 +134,10 @@ pub enum FrameAction<'t, Ready, P> {
     /// No book yet for this slot: the diff has already been staged into the slot's own pending
     /// arena, and the core starts the snapshot fetch if it is the first one buffered for this
     /// bootstrap attempt.
-    Buffer { slot: &'t mut Slot<Ready, P>, cursor: u64 },
+    Buffer {
+        slot: &'t mut Slot<Ready, P>,
+        cursor: u64,
+    },
     /// The venue itself asked for a reconnect (e.g. Bitstamp's `bts:request_reconnect`).
     Reconnect,
     /// A well-formed frame naming a stream or channel this connection does not carry.
@@ -307,8 +310,10 @@ pub enum SnapshotFetchErrorImpl<T, U> {
     ShuttingDown,
 }
 
-pub type SnapshotFetchError<R> =
-    SnapshotFetchErrorImpl<<R as RequestBuilder>::Error, <<R as RequestBuilder>::Response as crate::net::Response>::Error>;
+pub type SnapshotFetchError<R> = SnapshotFetchErrorImpl<
+    <R as RequestBuilder>::Error,
+    <<R as RequestBuilder>::Response as crate::net::Response>::Error,
+>;
 
 /// A completed snapshot fetch, routed back to the connection that asked for it. Generic over
 /// the leaf error types for the same reason as [`SnapshotFetchErrorImpl`].
@@ -328,7 +333,11 @@ pub type SnapshotResult<R> = SnapshotResultImpl<
 >;
 
 impl<E1, E2> SnapshotResultImpl<E1, E2> {
-    pub const fn new(symbol: Symbol, body: Result<Bytes, SnapshotFetchErrorImpl<E1, E2>>, generation: u64) -> Self {
+    pub const fn new(
+        symbol: Symbol,
+        body: Result<Bytes, SnapshotFetchErrorImpl<E1, E2>>,
+        generation: u64,
+    ) -> Self {
         Self {
             symbol,
             body,

@@ -3,6 +3,7 @@
 pub mod atomic_waker;
 pub mod heapless_linear_map;
 pub mod incremental_book;
+pub mod panic;
 pub mod positive_f64;
 pub mod shared_buffer;
 pub mod small_book;

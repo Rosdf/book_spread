@@ -11,17 +11,17 @@
 //! `md_server`'s own `tests/` integration target and any future consumer both need this without
 //! being part of the crate itself.
 
-use md_wire::framing::{self, ReadFrameError, Rejected};
-use crate::registry::Registry;
+use crate::registry::RegistryHandle;
+use crate::registry::events::RegistryTx;
 use crate::transport::Listener;
 use crate::venue::{BookSource, Connectors, Venue};
 use core_lib::connector::book_publisher::{BookPublisher, BookReader, make_book_publisher_pair};
 use core_lib::incremental_book::IncrementalBook;
 use core_lib::positive_f64::PositiveF64;
 use md_proto::md::v1 as proto;
+use md_wire::framing::{self, ReadFrameError, Rejected};
 use prost::Message as _;
 use std::collections::{HashMap, VecDeque};
-use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -30,7 +30,6 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadBuf};
-use tokio::sync::mpsc;
 
 #[derive(Debug, Default)]
 struct SourceState {
@@ -40,6 +39,8 @@ struct SourceState {
     unsubscribed: Vec<Box<str>>,
     /// When set, every subscribe is answered with this rejection instead of a reader.
     reject: Option<String>,
+    /// When set, `unsubscribe` panics rather than releasing the symbol.
+    panic_on_unsubscribe: bool,
 }
 
 /// One venue's connector with the venue taken out of it.
@@ -55,6 +56,18 @@ impl FakeSource {
         Self {
             state: Mutex::new(SourceState {
                 reject: Some(why.to_owned()),
+                ..SourceState::default()
+            }),
+        }
+    }
+
+    /// A source whose teardown blows up, so a test can watch what a panicking event handler
+    /// does to the registry task around it. Nothing a venue does, and that is the point: it
+    /// stands in for a bug anywhere inside a critical section.
+    pub fn panicking_unsubscribe() -> Self {
+        Self {
+            state: Mutex::new(SourceState {
+                panic_on_unsubscribe: true,
                 ..SourceState::default()
             }),
         }
@@ -124,6 +137,10 @@ impl BookSource for FakeSource {
 
     fn unsubscribe(&self, symbol: Box<str>) {
         let mut state = self.lock();
+        assert!(
+            !state.panic_on_unsubscribe,
+            "scripted panic while releasing {symbol}"
+        );
         // A real unsubscribe drops the symbol's publisher, which is what ends the reader's
         // stream. The fake does the same so teardown looks identical from above.
         state.live.remove(&symbol);
@@ -162,25 +179,27 @@ impl Connectors for FakeConnectors {
     async fn shutdown(self) {}
 }
 
-/// A registry over one Binance-side source, plus the channel end the server normally holds.
-pub fn registry_for(source: &Arc<FakeSource>) -> Harness {
+/// A registry task over one Binance-side source, and the way in that a test drives it
+/// through.
+///
+/// The [`RegistryHandle`] is dropped rather than kept: dropping its `JoinHandle` only
+/// detaches the task, and the `RegistryTx` in the harness is what keeps it running - for
+/// exactly as long as the test holds the harness. A test that wants the connectors back
+/// stands its own handle up instead.
+pub(crate) fn registry_for(source: &Arc<FakeSource>) -> Harness {
     let connectors = FakeConnectors::new(Arc::clone(source), FakeSource::default());
-    let (task_token, tasks_done) = mpsc::channel::<Infallible>(1);
+    let handle = RegistryHandle::spawn(connectors);
+
     Harness {
-        registry: Arc::new(Registry::new(connectors, task_token)),
-        tasks_done,
+        registry: handle.tx(),
     }
 }
 
-/// What [`registry_for`] hands back: the registry under test and the channel end
-/// [`crate::server::serve`] would otherwise own.
+/// What [`registry_for`] hands back: the registry under test, reached the same way a
+/// broadcaster reaches it.
 #[derive(Debug)]
-pub struct Harness {
-    pub registry: Arc<Registry<FakeConnectors, MockStream>>,
-    /// The server's half of the task-token channel, held so the token a broadcaster carries
-    /// stays meaningful. `pub` rather than dead code now that this module is public: nothing
-    /// in this crate reads it, but a consumer of `test-util` is free to.
-    pub tasks_done: mpsc::Receiver<Infallible>,
+pub(crate) struct Harness {
+    pub(crate) registry: RegistryTx<MockStream>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -557,7 +576,11 @@ impl Listener for MockListener {
     type Peer = MockPeer;
 
     fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<(MockStream, MockPeer)>> {
-        let mut incoming = self.0.incoming.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut incoming = self
+            .0
+            .incoming
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let popped = incoming.pop_front();
         drop(incoming);
         if let Some(connection) = popped {

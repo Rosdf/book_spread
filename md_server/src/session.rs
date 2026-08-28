@@ -112,7 +112,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
     ///
     /// Whatever was queued and unsent is dropped: a client that has not kept up wants the
     /// current book, not the one before it.
-    pub(crate) fn deliver(&mut self, new_epoch: u64, cx: &mut Context<'_>, session_ctx: &mut impl SessionCtx) {
+    pub(crate) fn deliver(
+        &mut self,
+        new_epoch: u64,
+        cx: &mut Context<'_>,
+        session_ctx: &mut impl SessionCtx,
+    ) {
         self.epoch = new_epoch;
         self.pump(cx, session_ctx);
     }
@@ -129,13 +134,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             }
 
             let frame = match self.inflight.as_ref() {
-                None => {
-                    match session_ctx.payload_for_epoch(self.epoch) {
-                        None => break,
-                        Some(frame) => frame
-                    }
-                }
-                Some(inflight) => &inflight.frame[inflight.written..]
+                None => match session_ctx.payload_for_epoch(self.epoch) {
+                    None => break,
+                    Some(frame) => frame,
+                },
+                Some(inflight) => &inflight.frame[inflight.written..],
             };
 
             match Pin::new(&mut self.sock).poll_write(async_cx, frame) {
@@ -174,7 +177,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             }
         }
 
-        if self.state == State::NeedsFlush && Pin::new(&mut self.sock).poll_flush(async_cx).is_ready() {
+        if self.state == State::NeedsFlush
+            && Pin::new(&mut self.sock).poll_flush(async_cx).is_ready()
+        {
             self.state = State::Running;
         }
     }
@@ -191,7 +196,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
     /// reads too strictly is a client that shuts down its write half while still reading -
     /// nothing in this protocol asks it to, and treating that as "gone" is better than never
     /// noticing a real disconnect.
-    pub(crate) fn poll_progress(&mut self, cx: &mut Context<'_>, session_ctx: &mut impl SessionCtx) -> State {
+    pub(crate) fn poll_progress(
+        &mut self,
+        cx: &mut Context<'_>,
+        session_ctx: &mut impl SessionCtx,
+    ) -> State {
         if self.state.is_ended() {
             return State::Ended;
         }

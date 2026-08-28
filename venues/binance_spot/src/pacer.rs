@@ -73,7 +73,10 @@ impl ControlPacer for BatchPacer {
     /// stopped sending, dark until the next reconnect. Alternating methods cost one frame
     /// each, [`MIN_CONTROL_GAP`] apart, which only happens for an interleaved burst; the
     /// common case is one run and so still one frame.
-    async fn on_admitted<W: WsConnector>(&mut self, stream: &mut W::Stream) -> Result<(), SessionError<W>> {
+    async fn on_admitted<W: WsConnector>(
+        &mut self,
+        stream: &mut W::Stream,
+    ) -> Result<(), SessionError<W>> {
         if self.queue.is_empty() {
             return Ok(());
         }

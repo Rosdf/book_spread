@@ -80,7 +80,10 @@ pub struct Bitstamp;
 impl Connector for Bitstamp {
     type Config = Config;
 
-    fn run(rx: ConnectorRx, config: ConnectorConfig<Self::Config>) -> impl Future<Output = ()> + Send + 'static {
+    fn run(
+        rx: ConnectorRx,
+        config: ConnectorConfig<Self::Config>,
+    ) -> impl Future<Output = ()> + Send + 'static {
         core_lib::venue::supervisor::run::<Self, reqwest::Client, core_lib::net::TungsteniteConnector>(
             rx,
             config,
@@ -112,7 +115,11 @@ impl core_lib::venue::Venue for Bitstamp {
     }
 
     fn snapshot_url(cfg: &Self::Config, symbol: &mut Symbol) -> String {
-        format!("{}/api/v2/order_book/{}/", cfg.rest_endpoint(), symbol.as_str())
+        format!(
+            "{}/api/v2/order_book/{}/",
+            cfg.rest_endpoint(),
+            symbol.as_str()
+        )
     }
 
     fn wire_name(_cfg: &Self::Config, symbol: &Symbol) -> Box<str> {

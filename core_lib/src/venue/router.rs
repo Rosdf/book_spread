@@ -266,7 +266,10 @@ mod test {
 
         router.reap_idle();
 
-        assert!(router.lanes.contains_key(&oldest), "the oldest must survive");
+        assert!(
+            router.lanes.contains_key(&oldest),
+            "the oldest must survive"
+        );
         assert!(!router.lanes.contains_key(&second));
         assert!(!router.lanes.contains_key(&third));
         assert_eq!(router.lanes.len(), 1);
@@ -308,7 +311,10 @@ mod test {
         assert_eq!(orphaned, vec!["btcusdt".to_owned(), "ethusdt".to_owned()]);
         assert!(!router.lanes.contains_key(&dead));
         assert!(router.lanes.contains_key(&alive));
-        assert!(router.contains(&symbol("solusdt")), "the live lane's symbol must survive");
+        assert!(
+            router.contains(&symbol("solusdt")),
+            "the live lane's symbol must survive"
+        );
     }
 
     #[test]
@@ -329,7 +335,10 @@ mod test {
         // again - and handed the next `take` an id no lane answers to.
         assert!(!router.contains(&symbol("btcusdt")));
         assert!(!router.contains(&symbol("ethusdt")));
-        assert!(router.contains(&symbol("solusdt")), "an untouched lane keeps its symbols");
+        assert!(
+            router.contains(&symbol("solusdt")),
+            "an untouched lane keeps its symbols"
+        );
         assert!(router.take(&symbol("btcusdt")).is_none());
     }
 
@@ -340,7 +349,10 @@ mod test {
         assert!(router.tx(lane).is_some());
 
         assert!(router.drop_lane(lane).is_empty(), "nothing was bound to it");
-        assert!(router.tx(lane).is_none(), "a stale id must report, not panic");
+        assert!(
+            router.tx(lane).is_none(),
+            "a stale id must report, not panic"
+        );
     }
 
     #[test]

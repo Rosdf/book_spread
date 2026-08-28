@@ -185,7 +185,10 @@ impl WsConnector for ScriptedWs {
         let stream = {
             let mut state = self.state.lock().expect("test mutex poisoned");
             state.connects += 1;
-            let script = state.sessions.pop_front().unwrap_or_else(|| state.fallback.clone());
+            let script = state
+                .sessions
+                .pop_front()
+                .unwrap_or_else(|| state.fallback.clone());
             MockStream {
                 incoming: script.into(),
                 sent: Arc::clone(&state.sent),
@@ -244,7 +247,11 @@ struct RestState {
 impl RestState {
     /// The body for `url`: the first matching route, or the next scripted body.
     fn answer(&mut self, url: &str) -> Result<Bytes, Box<str>> {
-        if let Some(hit) = self.routes.iter().position(|(pattern, _)| url.contains(&**pattern)) {
+        if let Some(hit) = self
+            .routes
+            .iter()
+            .position(|(pattern, _)| url.contains(&**pattern))
+        {
             let still_needed = self
                 .routes
                 .iter()
@@ -257,7 +264,9 @@ impl RestState {
                 self.routes.remove(hit).1
             };
         }
-        self.bodies.pop_front().unwrap_or_else(|| self.fallback.clone())
+        self.bodies
+            .pop_front()
+            .unwrap_or_else(|| self.fallback.clone())
     }
 }
 
@@ -334,7 +343,9 @@ impl RestClient for StubRest {
     fn get(&self, url: impl IntoUrl) -> StubRequest {
         let scripted = {
             let mut state = self.state.lock().expect("test mutex poisoned");
-            let requested = url.into_url().map_or_else(|err| err.to_string(), String::from);
+            let requested = url
+                .into_url()
+                .map_or_else(|err| err.to_string(), String::from);
             let answer = state.answer(&requested);
             state.urls.push(requested);
             answer

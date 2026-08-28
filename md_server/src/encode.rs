@@ -34,9 +34,9 @@
 //! [`BookUpdate`]: md_proto::md::v1::BookUpdate
 //! [`PositiveF64`]: core_lib::positive_f64::PositiveF64
 
-use md_wire::framing::LENGTH_PREFIX;
 use bytes::{BufMut as _, Bytes, BytesMut};
 use core_lib::incremental_book::Level;
+use md_wire::framing::LENGTH_PREFIX;
 
 /// Levels a side, matching `SmallBook`'s depth. Bounds the size of the reusable buffer, and
 /// checked against in [`BookEncoder::encode`] - that bound is what the `expect` there relies
@@ -109,8 +109,16 @@ impl BookEncoder {
     /// `NaN` spread - which is exactly what prost produces for a `BookUpdate` with two empty
     /// `repeated` fields and `spread` computed the same way, so the signal survives as "no
     /// levels" rather than as a short read.
-    pub(crate) fn encode(&self, asks: &[Level], bids: &[Level], buffers: &mut impl BufferProvider) -> Bytes {
-        debug_assert!(asks.len() <= MAX_DEPTH && bids.len() <= MAX_DEPTH, "a book is at most MAX_DEPTH levels a side");
+    pub(crate) fn encode(
+        &self,
+        asks: &[Level],
+        bids: &[Level],
+        buffers: &mut impl BufferProvider,
+    ) -> Bytes {
+        debug_assert!(
+            asks.len() <= MAX_DEPTH && bids.len() <= MAX_DEPTH,
+            "a book is at most MAX_DEPTH levels a side"
+        );
 
         // An upper bound, not the exact length: only a level with a zero price or size, or a
         // locked book's elided spread, comes out shorter, and asking for a few bytes too many
@@ -195,12 +203,12 @@ fn put_string(out: &mut Vec<u8>, field: u32, value: &str) {
 
 #[cfg(test)]
 mod test {
-    use bytes::BytesMut;
     use super::{BookEncoder, BufferProvider};
-    use md_wire::framing::LENGTH_PREFIX;
+    use bytes::BytesMut;
     use core_lib::incremental_book::Level;
     use core_lib::positive_f64::PositiveF64;
     use md_proto::md::v1 as proto;
+    use md_wire::framing::LENGTH_PREFIX;
     use prost::Message as _;
 
     struct TestBufferProvider;
@@ -247,7 +255,11 @@ mod test {
             ("binance_spot", Vec::new(), Vec::new()),
             // One side only: the other side's absence also makes the spread NaN.
             ("binance_spot", vec![level(100.5, 1.25)], Vec::new()),
-            ("bitstamp", Vec::new(), vec![level(99.5, 2.0), level(99.0, 4.0)]),
+            (
+                "bitstamp",
+                Vec::new(),
+                vec![level(99.5, 2.0), level(99.0, 4.0)],
+            ),
             // Full depth both sides: the largest frame.
             ("bitstamp", deep.clone(), deep),
             // `PositiveF64` permits `+0.0`, so prost's default elision is reachable.
@@ -257,9 +269,17 @@ mod test {
                 vec![level(f64::MIN_POSITIVE, f64::MAX)],
             ),
             // A locked book: best ask equals best bid, so the spread is 0.0 and prost elides it.
-            ("binance_spot", vec![level(100.0, 1.0)], vec![level(100.0, 1.0)]),
+            (
+                "binance_spot",
+                vec![level(100.0, 1.0)],
+                vec![level(100.0, 1.0)],
+            ),
             // A crossed book: a negative spread, which is never elided.
-            ("binance_spot", vec![level(99.0, 1.0)], vec![level(100.0, 1.0)]),
+            (
+                "binance_spot",
+                vec![level(99.0, 1.0)],
+                vec![level(100.0, 1.0)],
+            ),
         ];
 
         for (venue, asks, bids) in cases {

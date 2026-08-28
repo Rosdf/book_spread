@@ -144,7 +144,10 @@ mod test {
     #[test]
     fn rejects_empty_and_non_alphanumeric() {
         for bad in ["", "BTC-USDT", "BTC USDT", "BTC/USDT"] {
-            assert!(Symbol::new(bad.into()).is_err(), "{bad:?} should be rejected");
+            assert!(
+                Symbol::new(bad.into()).is_err(),
+                "{bad:?} should be rejected"
+            );
         }
     }
 

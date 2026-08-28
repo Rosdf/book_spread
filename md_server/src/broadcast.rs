@@ -7,13 +7,12 @@
 //! [`crate::session`] for the write state machine and what backpressure does to it.
 
 use crate::encode::{BookEncoder, BufferProvider};
-use crate::registry::{Key, Registry};
+use crate::registry::Key;
+use crate::registry::events::{Claim, RegistryTx};
 use crate::session::{Session, SessionCtx};
-use crate::venue::{BookSource as _, Connectors};
 use bytes::{Bytes, BytesMut};
 use core_lib::connector::book_publisher::BookReader;
 use md_wire::framing::{self, RejectCode};
-use std::convert::Infallible;
 use std::future::poll_fn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -180,55 +179,41 @@ enum Wake<S> {
 
 /// Owns one symbol's [`BookReader`] and every client socket attached to it.
 #[derive(Debug)]
-pub struct Broadcaster<C: Connectors, S> {
+pub struct Broadcaster<S> {
     key: Key,
     reader: BookReader,
     /// One entry per attached client, written to in order on every update.
     sessions: Vec<Session<S>>,
     joins: mpsc::UnboundedReceiver<Join<S>>,
-    /// Joins the registry has queued but this task has not taken yet. See
-    /// [`Registry::retire_if_idle`].
+    /// Joins the registry has queued but this task has not taken yet. Also this
+    /// broadcaster's identity to the registry - see [`Claim`].
     pending_joins: Arc<AtomicUsize>,
     /// Holds this symbol's encoded identity and the buffer every frame is cut from, so a
     /// book costs neither an allocation nor a re-encode of `venue`/`symbol`.
     encoder: BookEncoder,
     ctx: Ctx,
-    registry: Arc<Registry<C, S>>,
+    registry: RegistryTx<S>,
 }
 
-impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcaster<C, S> {
-    /// Runs one broadcaster to completion, then releases `token`.
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcaster<S> {
+    /// Waits for the connector's answer to the subscribe the registry has already sent for
+    /// this key, then runs the fan-out loop.
     ///
-    /// The token goes last on purpose: [`crate::server::serve`] treats the paired receiver
-    /// closing as "every broadcaster has released its `Arc<Registry>`", and this task holds
-    /// one until `serve` below returns.
+    /// The wait happens here rather than on the registry task, which is what turns an
+    /// unlisted symbol into a prompt refusal on the client's connection rather than a stream
+    /// that never produces anything - and what keeps the registry free to serve other keys
+    /// while a venue thinks about this one.
+    ///
+    /// This task's `RegistryTx` is also what keeps the registry task alive: it stops once the
+    /// last of them is dropped, which is on the way out of this function.
     pub(crate) async fn start(
-        registry: Arc<Registry<C, S>>,
-        key: Key,
-        joins: mpsc::UnboundedReceiver<Join<S>>,
-        pending_joins: Arc<AtomicUsize>,
-        token: mpsc::Sender<Infallible>,
-    ) {
-        Self::serve(registry, key, joins, pending_joins).await;
-        drop(token);
-    }
-
-    /// Subscribes the symbol on its connector, then runs the fan-out loop.
-    ///
-    /// The subscribe is awaited here, outside every lock, which is what turns an unlisted
-    /// symbol into a prompt refusal on the client's connection rather than a stream that
-    /// never produces anything.
-    async fn serve(
-        registry: Arc<Registry<C, S>>,
+        registry: RegistryTx<S>,
         key: Key,
         mut joins: mpsc::UnboundedReceiver<Join<S>>,
         pending_joins: Arc<AtomicUsize>,
+        subscribed: oneshot::Receiver<anyhow::Result<BookReader>>,
     ) {
-        let mut reader = match registry
-            .source(key.venue())
-            .subscribe(key.symbol().into())
-            .await
-        {
+        let mut reader = match subscribed.await {
             Ok(Ok(reader)) => reader,
             Ok(Err(err)) => {
                 tracing::warn!(
@@ -237,15 +222,16 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcas
                     %err,
                     "subscribe rejected"
                 );
-                // Removed first: no further join can be queued once the entry is gone, so
-                // the drain below answers every one of them. Nothing to unsubscribe - this
-                // broadcaster never held a subscription.
-                registry.abandon(&key, &pending_joins);
+                // Queued before the drain: once the registry has taken the entry out, no
+                // further join can be sent here, so the drain below answers every one there
+                // will ever be. Nothing to unsubscribe - this broadcaster never held a
+                // subscription.
+                registry.abandon(Claim::new(key, pending_joins));
                 drain_joins(&mut joins, &err.to_string()).await;
                 return;
             }
             Err(_) => {
-                registry.abandon(&key, &pending_joins);
+                registry.abandon(Claim::new(key, pending_joins));
                 drain_joins(&mut joins, "connector stopped before it could subscribe").await;
                 return;
             }
@@ -309,8 +295,14 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcas
             if prune {
                 self.sessions.retain(|session| !session.ended());
             }
+            // A reply that never comes says the same thing `true` does: there is no registry
+            // left to serve clients through, so there is nothing to stay alive for.
             if self.sessions.is_empty()
-                && self.registry.retire_if_idle(&self.key, &self.pending_joins)
+                && self
+                    .registry
+                    .retire_if_idle(self.claim())
+                    .await
+                    .unwrap_or(true)
             {
                 break;
             }
@@ -318,7 +310,7 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcas
 
         // A no-op when the loop exited through `retire_if_idle`, which already removed the
         // entry and issued the connector unsubscribe.
-        self.registry.retire(&self.key, &self.pending_joins);
+        self.registry.retire(self.claim());
         drain_joins(&mut self.joins, "stream ended").await;
         // `sessions` drops with `self`, and dropping a session closes its socket - which is
         // exactly how this protocol says a stream is over. There is nothing to drain.
@@ -361,9 +353,10 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcas
     /// resyncing" look identical, which is correct - both mean the same thing to a client:
     /// there is no book right now.
     fn attach(&mut self, join: Join<S>, cx: &mut Context<'_>) {
-        // Balances the increment `Registry::subscribe` made under its lock before queuing
-        // this join. `Relaxed` is enough: every increment and the decisive load happen under
-        // that mutex, and this decrement is on the same task as the load.
+        // Balances the increment the registry made before queuing this join. `Relaxed` is
+        // enough: every increment and the decisive load happen on the registry task, in that
+        // task's own program order, and this decrement can only make the load *smaller* -
+        // which it may only do once this join can no longer be lost, that is, now.
         self.pending_joins.fetch_sub(1, Ordering::Relaxed);
 
         let mut session = join.into_session();
@@ -372,6 +365,12 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcas
         if !session.ended() {
             self.sessions.push(session);
         }
+    }
+
+    /// Names this broadcaster to the registry. The `Key` clone is one allocation on a path
+    /// taken only when this task is stopping or thinks it might be.
+    fn claim(&self) -> Claim {
+        Claim::new(self.key.clone(), Arc::clone(&self.pending_joins))
     }
 }
 
@@ -464,10 +463,7 @@ mod test {
     ) -> (Client, crate::test_util::MockControl) {
         let (mut client, server) = connected_congested();
         let control = server.control();
-        harness
-            .registry
-            .subscribe(key(), server)
-            .expect("the registry is still spawning");
+        hand_over(harness, server).await;
         client
             .accepted()
             .await
@@ -481,15 +477,32 @@ mod test {
         connection: (Client, crate::test_util::MockStream),
     ) -> Client {
         let (mut client, server) = connection;
-        harness
-            .registry
-            .subscribe(key(), server)
-            .expect("the registry is still spawning");
+        hand_over(harness, server).await;
         client
             .accepted()
             .await
             .expect("the fake source accepts every symbol");
         client
+    }
+
+    /// Queues a socket on the registry and waits for it to be taken. Every attach in this
+    /// module goes through here, so the double `expect` is written once.
+    async fn hand_over(harness: &crate::test_util::Harness, server: crate::test_util::MockStream) {
+        harness
+            .registry
+            .subscribe(key(), server)
+            .await
+            .expect("the registry task is alive")
+            .expect("the registry is still spawning");
+    }
+
+    /// Whether the symbol still has a broadcaster.
+    async fn is_registered(harness: &crate::test_util::Harness) -> bool {
+        harness
+            .registry
+            .is_registered(key())
+            .await
+            .expect("the registry task is alive")
     }
 
     struct TestBufferProvider;
@@ -770,7 +783,7 @@ mod test {
         client.ended().await;
 
         assert!(
-            !harness.registry.is_registered(&key()),
+            !is_registered(&harness).await,
             "the entry goes with the broadcaster, so the next client retries the subscribe"
         );
     }
@@ -792,7 +805,7 @@ mod test {
         })
         .await;
         assert!(released.is_ok(), "an end-of-stream must retire the symbol");
-        assert!(!harness.registry.is_registered(&key()));
+        assert!(!is_registered(&harness).await);
     }
 
     /// A client sending anything after its request is violating the protocol, and is dropped
@@ -830,7 +843,7 @@ mod test {
             vec![Box::from(SYMBOL)],
             "the last client leaving releases the connector subscription"
         );
-        assert!(!harness.registry.is_registered(&key()));
+        assert!(!is_registered(&harness).await);
     }
 
     /// A buffer that has been filled, frozen and returned comes back cleared and on the same

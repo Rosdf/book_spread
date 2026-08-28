@@ -18,7 +18,7 @@ use crate::venue::connection::{self, LaneCommand};
 use crate::venue::router::{LaneId, Router};
 use crate::venue::spec::{SnapshotFetchError, Venue};
 use crate::venue::symbol::Symbol;
-use crate::venue::{universe, ConnectorConfig};
+use crate::venue::{ConnectorConfig, universe};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -372,11 +372,11 @@ mod test {
     use crate::venue::router::Router;
     use crate::venue::symbol::Symbol;
     use crate::venue::test_util::{Incoming, ScriptedWs, StubRest, TestConfig, TestVenue};
+    use crate::venue::{ConnectorConfig, CoreConfig};
     use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{Semaphore, mpsc};
-    use crate::venue::{ConnectorConfig, CoreConfig};
 
     fn symbol(name: &str) -> Symbol {
         Symbol::new(name.into()).unwrap()
@@ -404,7 +404,11 @@ mod test {
 
         handle_subscribe(sub, universe, &mut router, &mut tasks, &ctx()).await;
 
-        assert_eq!(router.lane_count(), 0, "a rejected subscribe must not open a connection");
+        assert_eq!(
+            router.lane_count(),
+            0,
+            "a rejected subscribe must not open a connection"
+        );
         reply
             .await
             .expect("every path answers the reply channel")
@@ -445,10 +449,16 @@ mod test {
 
         retire_unlisted(&listing(&["btcusd"]), &mut router).await;
 
-        assert!(router.contains(&symbol("btcusd")), "a still-listed symbol stays");
+        assert!(
+            router.contains(&symbol("btcusd")),
+            "a still-listed symbol stays"
+        );
         assert!(!router.contains(&symbol("lunausd")));
 
-        let sent = lane_rx.recv().await.expect("the lane must be told to drop it");
+        let sent = lane_rx
+            .recv()
+            .await
+            .expect("the lane must be told to drop it");
         let LaneCommand::Unsubscribe { symbol: dropped } = sent else {
             panic!("expected an unsubscribe, got {sent:?}");
         };
