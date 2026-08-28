@@ -13,7 +13,7 @@ use std::future::Future;
 /// The names live here rather than in `core_lib`: `core_lib`'s `Venue::wire_name` names a
 /// *symbol* on a venue, and nothing upstream names the venue itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Venue {
+pub(crate) enum Venue {
     BinanceSpot,
     Bitstamp,
 }
@@ -44,7 +44,7 @@ impl Venue {
 /// A trait so the broadcaster and the registry can be exercised against
 /// `make_book_publisher_pair()` with no socket involved; [`ConnectorHandle`] is the only
 /// implementation that talks to a venue.
-pub trait BookSource: Debug + Send + Sync + 'static {
+pub(crate) trait BookSource: Debug + Send + Sync + 'static {
     /// Asks for `symbol`'s book stream. The reply carries the venue's own rejection when the
     /// symbol is not tradable there, or when it is already subscribed.
     fn subscribe(&self, symbol: Box<str>) -> oneshot::Receiver<anyhow::Result<BookReader>>;
@@ -73,7 +73,7 @@ impl BookSource for ConnectorHandle {
 /// Every type that carries this trait reaches its callers by generic parameter rather than
 /// behind a trait object - there is exactly one implementation in a running server, and one
 /// more in the tests, so nothing is gained by erasing which.
-pub trait Connectors: Debug + Send + Sync + 'static {
+pub(crate) trait Connectors: Debug + Send + Sync + 'static {
     /// What every one of this set's connectors is. A single type, not a per-venue one: the
     /// venues differ in their configuration, not in the shape of their handle.
     type Source: BookSource;

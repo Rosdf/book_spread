@@ -51,7 +51,7 @@ pub async fn run(addr: SocketAddr) -> anyhow::Result<()> {
 ///
 /// Never actually returns `Err` today; the `Result` is `anyhow`'s so a future transport error
 /// has somewhere to go without another signature change.
-pub async fn serve<C: Connectors, L: Listener>(
+pub(crate) async fn serve<C: Connectors, L: Listener>(
     listener: L,
     connectors: C,
     stop: impl Future<Output = ()> + Send,

@@ -38,5 +38,5 @@ pub mod server;
 pub(crate) mod session;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
-pub mod transport;
-pub mod venue;
+pub(crate) mod transport;
+pub(crate) mod venue;

@@ -15,6 +15,7 @@ use core_lib::incremental_book::IncrementalBook;
 use core_lib::positive_f64::PositiveF64;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use tokio::net::TcpListener;
 
 #[derive(Debug, Default)]
 struct SourceState {
@@ -178,4 +179,35 @@ pub fn book(asks: &[(f64, f64)], bids: &[(f64, f64)]) -> IncrementalBook {
 
 fn positive(value: f64) -> PositiveF64 {
     PositiveF64::new(value).expect("test prices and sizes are positive")
+}
+
+/// Serves the book feed on `listener` until `stop` resolves, then stops the connectors.
+///
+/// # Shutdown ordering
+///
+/// Three steps, and the order is the whole of it.
+///
+/// 1. `stop` resolves, and the accept loop is told to stop. It stops accepting and then waits
+///    for every handshake still in flight - each of which holds a `RegistryTx` of its own,
+///    and each of which is bounded by the handshake timeout, so this cannot hang.
+/// 2. [`RegistryHandle::shutdown`] sends the registry its `ShutDown`, which clears its
+///    entries. Clearing the entries drops the sending half of every broadcaster's join
+///    channel, which each broadcaster's `recv` reports as `None` and takes as "stop". Nothing
+///    has to be drained: a broadcaster drops its sessions on the way out, and dropping a
+///    session closes that client's socket, which is how this protocol ends a stream.
+/// 3. The same call then drops the last `RegistryTx` outside the registry task, so the task's
+///    own `recv` reports `None` the moment the last broadcaster has dropped its copy - and
+///    hands the connectors back on its way out. They are reclaimed rather than dropped
+///    because `ConnectorHandle::shutdown` consumes the handle.
+///
+/// # Errors
+///
+/// Never actually returns `Err` today; the `Result` is `anyhow`'s so a future transport error
+/// has somewhere to go without another signature change.
+pub async fn serve(
+    listener: TcpListener,
+    connectors: FakeConnectors,
+    stop: impl Future<Output = ()> + Send,
+) -> anyhow::Result<()> {
+    crate::server::serve(listener, connectors, stop).await
 }

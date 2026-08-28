@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 
 /// Something that accepts connections, each yielding a byte stream and a peer identity to log.
-pub trait Listener: Send + Sync + 'static {
+pub(crate) trait Listener: Send + Sync + 'static {
     /// One accepted connection's byte stream.
     type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
     /// What identifies the peer on the other end, for logging.

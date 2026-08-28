@@ -12,7 +12,7 @@
 )]
 
 use md_proto::md::v1 as proto;
-use md_server::server::serve;
+use md_server::test_util::serve;
 use md_server::test_util::{FakeConnectors, FakeSource, book};
 use md_wire::framing::{self, RejectCode};
 use prost::Message as _;
