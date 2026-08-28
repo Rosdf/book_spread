@@ -23,10 +23,10 @@ use crate::connector::book_publisher::BookPublisher;
 use crate::incremental_book::IncrementalBook;
 use crate::venue::pending::PendingDiffs;
 use crate::venue::symbol::Symbol;
-use rustc_hash::FxBuildHasher;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::time::Instant;
+use crate::map::InternalHashMap;
 
 /// State held while a symbol waits for its REST snapshot.
 ///
@@ -145,7 +145,7 @@ impl<Ready, P: PendingDiffs> Slot<Ready, P> {
 /// come from clients.
 #[derive(Debug)]
 pub struct SlotTable<Ready, P> {
-    by_symbol: HashMap<Symbol, Slot<Ready, P>, FxBuildHasher>,
+    by_symbol: InternalHashMap<Symbol, Slot<Ready, P>>,
 }
 
 impl<Ready, P> Default for SlotTable<Ready, P> {

@@ -6,12 +6,12 @@ use crate::registry::events::{
 };
 use crate::venue::{BookSource as _, Connectors, Venue};
 use core_lib::panic::panic_message;
-use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
+use core_lib::map::{new_internal_map, InternalHashMap};
 
 pub(crate) mod events;
 
@@ -95,7 +95,7 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
     pub(crate) fn spawn(connectors: C) -> Self {
         let (rx, tx) = create_event_channel();
         let registry = Registry {
-            entries: HashMap::new(),
+            entries: new_internal_map(),
             connectors,
             shutting_down: false,
             tx: tx.downgrade(),
@@ -152,7 +152,7 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
 /// play.
 #[derive(Debug)]
 struct Registry<C, S> {
-    entries: HashMap<Key, Entry<S>>,
+    entries: InternalHashMap<Key, Entry<S>>,
     connectors: C,
     /// Set by [`RegistryEvent::ShutDown`]. "Do not start anything new" - an entry that is
     /// still being torn down is still served.

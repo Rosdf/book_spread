@@ -13,14 +13,14 @@ use crate::venue::{BookSource, Connectors, Venue};
 use core_lib::connector::book_publisher::{BookPublisher, BookReader, make_book_publisher_pair};
 use core_lib::incremental_book::IncrementalBook;
 use core_lib::positive_f64::PositiveF64;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::net::TcpListener;
+use core_lib::map::InternalHashMap;
 
 #[derive(Debug, Default)]
 struct SourceState {
     /// The publisher half of every live subscription.
-    live: HashMap<Box<str>, BookPublisher>,
+    live: InternalHashMap<Box<str>, BookPublisher>,
     subscribed: Vec<Box<str>>,
     unsubscribed: Vec<Box<str>>,
     /// When set, every subscribe is answered with this rejection instead of a reader.

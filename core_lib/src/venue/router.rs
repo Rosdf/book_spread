@@ -5,9 +5,9 @@
 //! `mpsc::Sender<C>`. Every method here is synchronous and a test can stand a lane up from a
 //! bare `mpsc::channel`, with no runtime, socket, or spawned task involved.
 
-use std::collections::HashMap;
 use std::hash::Hash;
 use tokio::sync::mpsc;
+use crate::map::{new_internal_map, InternalHashMap};
 
 /// Names one connection for the life of a supervisor. A counter rather than a position: lanes
 /// are removed when they empty or die, and an index would re-point at whatever took the freed
@@ -24,8 +24,8 @@ pub struct Lane<C> {
 
 #[derive(Debug)]
 pub struct Router<S, C> {
-    lanes: HashMap<LaneId, Lane<C>>,
-    by_symbol: HashMap<S, LaneId>,
+    lanes: InternalHashMap<LaneId, Lane<C>>,
+    by_symbol: InternalHashMap<S, LaneId>,
     next_id: u64,
     capacity: usize,
 }
@@ -36,8 +36,8 @@ where
 {
     pub fn new(capacity: usize) -> Self {
         Self {
-            lanes: HashMap::new(),
-            by_symbol: HashMap::new(),
+            lanes: new_internal_map(),
+            by_symbol: new_internal_map(),
             next_id: 0,
             capacity,
         }

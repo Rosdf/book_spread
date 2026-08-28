@@ -18,3 +18,4 @@ pub mod connector;
 pub mod net;
 #[cfg(not(loom))]
 pub mod venue;
+pub mod map;
