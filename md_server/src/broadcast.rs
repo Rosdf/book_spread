@@ -252,7 +252,7 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcas
         };
 
         let mut pool = BufferPool::new();
-        let encoder = BookEncoder::new(key.venue().as_str(), key.symbol());
+        let encoder = BookEncoder::new(key.venue().as_str());
         let latest = {
             let book = reader.get_last();
             encoder.encode(book.asks(), book.bids(), &mut pool)
@@ -525,7 +525,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn the_book_carries_the_identity_its_key_holds() {
+    async fn every_level_carries_the_venue_its_key_holds_and_the_spread_is_derived() {
         let source = Arc::new(FakeSource::default());
         let harness = registry_for(&source);
         let mut client = attach(&harness).await;
@@ -533,13 +533,12 @@ mod test {
         source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[(99.5, 2.0), (99.0, 4.0)]));
         let update = client.next_book().await;
 
-        assert_eq!(update.venue, "binance_spot");
-        assert_eq!(update.symbol, SYMBOL);
         assert_eq!(
             update.asks,
             vec![proto::Level {
                 price: 100.5,
-                size: 1.25
+                size: 1.25,
+                venue: "binance_spot".to_owned(),
             }],
             "asks travel best first"
         );
@@ -548,15 +547,18 @@ mod test {
             vec![
                 proto::Level {
                     price: 99.5,
-                    size: 2.0
+                    size: 2.0,
+                    venue: "binance_spot".to_owned(),
                 },
                 proto::Level {
                     price: 99.0,
-                    size: 4.0
+                    size: 4.0,
+                    venue: "binance_spot".to_owned(),
                 },
             ],
             "bids travel best first"
         );
+        assert_eq!(update.spread, 1.0, "asks[0].price - bids[0].price");
     }
 
     /// The resync signal: `SmallBook::is_empty` on the way in, both sides empty on the wire.
@@ -669,7 +671,7 @@ mod test {
                 "a spliced frame would not decode whole"
             );
             assert_eq!(update.bids.len(), 10);
-            assert_eq!(update.symbol, SYMBOL);
+            assert_eq!(update.asks[0].venue, "binance_spot");
         }
     }
 
@@ -733,7 +735,7 @@ mod test {
         source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[]));
         let body = client.next_frame().await;
 
-        let encoder = crate::encode::BookEncoder::new("binance_spot", SYMBOL);
+        let encoder = crate::encode::BookEncoder::new("binance_spot");
         let expected = encoder.encode(
             &[core_lib::incremental_book::Level::new(
                 core_lib::positive_f64::PositiveF64::new(100.5).expect("positive"),

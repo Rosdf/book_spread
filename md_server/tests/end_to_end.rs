@@ -53,16 +53,27 @@ async fn stop(server: Running) {
         .expect("the server stops cleanly");
 }
 
-/// Opens a connection and sends the request, leaving the response header unread.
+/// Opens a connection and sends a one-pair request, leaving the response header unread.
 async fn subscribe(addr: SocketAddr, venue: &str, symbol: &str) -> TcpStream {
+    subscribe_pairs(addr, &[(venue, symbol)]).await
+}
+
+/// Opens a connection and sends a request naming every one of `pairs`, leaving the response
+/// header unread.
+async fn subscribe_pairs(addr: SocketAddr, pairs: &[(&str, &str)]) -> TcpStream {
     let mut sock = TcpStream::connect(addr)
         .await
         .expect("the listener is accepting");
     framing::write_request(
         &mut sock,
         &proto::SubscribeBookRequest {
-            venue: venue.to_owned(),
-            symbol: symbol.to_owned(),
+            pairs: pairs
+                .iter()
+                .map(|&(venue, symbol)| proto::Pair {
+                    venue: venue.to_owned(),
+                    symbol: symbol.to_owned(),
+                })
+                .collect(),
         },
     )
     .await
@@ -107,11 +118,42 @@ async fn a_client_streams_a_book_over_the_wire() {
     source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[(99.5, 2.0)]));
 
     let body = next_book(&mut sock, &mut buf).await;
-    assert_eq!(body.venue, "binance_spot");
-    assert_eq!(body.symbol, SYMBOL);
     assert_eq!(body.asks.len(), 1);
     assert_eq!(body.asks[0].price, 100.5);
+    assert_eq!(body.asks[0].venue, "binance_spot");
     assert_eq!(body.bids[0].size, 2.0);
+    assert_eq!(body.spread, 1.0);
+
+    drop(sock);
+    stop(server).await;
+}
+
+/// A request naming more than one pair streams the first pair's book - merging the rest into
+/// one book is the next stage, but every pair is still validated up front.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_multi_pair_request_streams_the_first_pairs_book() {
+    let source = Arc::new(FakeSource::default());
+    let server = start(&source).await;
+
+    let mut sock = subscribe_pairs(
+        server.addr,
+        &[("binance_spot", "BTCUSDT"), ("bitstamp", "btcusd")],
+    )
+    .await;
+    let mut buf = Vec::new();
+    framing::read_response(&mut sock, &mut buf)
+        .await
+        .expect("the header is well formed")
+        .expect("the fake source accepts every symbol");
+    opening_snapshot(&mut sock, &mut buf).await;
+
+    source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[(99.5, 2.0)]));
+
+    let body = next_book(&mut sock, &mut buf).await;
+    assert_eq!(
+        body.asks[0].venue, "binance_spot",
+        "only the first pair - binance_spot/BTCUSDT - is served today"
+    );
 
     drop(sock);
     stop(server).await;
@@ -171,8 +213,11 @@ async fn two_symbols_are_two_connections() {
     source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[]));
     source.publish("ethusdt", &book(&[(3.5, 2.0)], &[]));
 
-    assert_eq!(next_book(&mut btc, &mut btc_buf).await.symbol, SYMBOL);
-    assert_eq!(next_book(&mut eth, &mut eth_buf).await.symbol, "ethusdt");
+    assert_eq!(
+        next_book(&mut btc, &mut btc_buf).await.asks[0].price,
+        100.5
+    );
+    assert_eq!(next_book(&mut eth, &mut eth_buf).await.asks[0].price, 3.5);
 
     drop(btc);
     drop(eth);

@@ -18,19 +18,45 @@ const MAX_SYMBOL_LEN: usize = 32;
 
 /// Validates and normalises `request` into the key its broadcaster is filed under.
 ///
+/// Every pair in `request.pairs` is validated, but only the first is served today - merging
+/// the rest into one book is the next stage.
+///
 /// # Errors
 ///
-/// [`RejectCode::InvalidArgument`] for an unknown venue or a symbol no connector would
-/// accept. Nothing here can fail any other way: whether the venue *lists* the symbol is the
-/// connector's answer, not this function's.
+/// [`RejectCode::InvalidArgument`] for an empty pair list, an unknown venue, a symbol no
+/// connector would accept, or a pair that duplicates one earlier in the list (after
+/// normalisation). Nothing here can fail any other way: whether the venue *lists* the symbol
+/// is the connector's answer, not this function's.
 pub fn key_of(request: &SubscribeBookRequest) -> Result<Key, Rejected> {
-    let Some(venue) = Venue::parse(&request.venue) else {
+    if request.pairs.is_empty() {
         return Err(Rejected::new(
             RejectCode::InvalidArgument,
-            format!("unknown venue {:?}", request.venue).into_boxed_str(),
+            Box::from("at least one pair is required"),
         ));
-    };
-    Ok(Key::new(venue, normalise_symbol(&request.symbol)?))
+    }
+
+    let mut seen: Vec<Key> = Vec::with_capacity(request.pairs.len());
+    for pair in &request.pairs {
+        let Some(venue) = Venue::parse(&pair.venue) else {
+            return Err(Rejected::new(
+                RejectCode::InvalidArgument,
+                format!("unknown venue {:?}", pair.venue).into_boxed_str(),
+            ));
+        };
+        let key = Key::new(venue, normalise_symbol(&pair.symbol)?);
+        if seen.contains(&key) {
+            return Err(Rejected::new(
+                RejectCode::InvalidArgument,
+                format!("duplicate pair {}/{}", key.venue().as_str(), key.symbol())
+                    .into_boxed_str(),
+            ));
+        }
+        seen.push(key);
+    }
+
+    // The rest are validated above and dropped here; merging them into one book is the next
+    // stage.
+    Ok(seen.into_iter().next().expect("checked non-empty above"))
 }
 
 /// Lowercases `raw` after checking it is something a connector would accept.
@@ -57,13 +83,19 @@ fn normalise_symbol(raw: &str) -> Result<Box<str>, Rejected> {
 mod test {
     use super::{MAX_SYMBOL_LEN, key_of, normalise_symbol};
     use crate::venue::Venue;
-    use md_proto::md::v1::SubscribeBookRequest;
+    use md_proto::md::v1::{Pair, SubscribeBookRequest};
     use md_wire::framing::RejectCode;
+
+    fn pair(venue: &str, symbol: &str) -> Pair {
+        Pair {
+            venue: venue.to_owned(),
+            symbol: symbol.to_owned(),
+        }
+    }
 
     fn asking(venue: &str, symbol: &str) -> SubscribeBookRequest {
         SubscribeBookRequest {
-            venue: venue.to_owned(),
-            symbol: symbol.to_owned(),
+            pairs: vec![pair(venue, symbol)],
         }
     }
 
@@ -116,6 +148,57 @@ mod test {
         assert_eq!(key.symbol(), "btcusdt");
 
         let rejection = key_of(&asking("kraken", "btcusdt")).expect_err("an unknown venue");
+        assert_eq!(rejection.code(), RejectCode::InvalidArgument);
+        assert!(
+            rejection.reason().contains("kraken"),
+            "the reason names the venue that was asked for, got {:?}",
+            rejection.reason()
+        );
+    }
+
+    #[test]
+    fn an_empty_pair_list_is_rejected() {
+        let rejection = key_of(&SubscribeBookRequest { pairs: Vec::new() })
+            .expect_err("no pairs to serve");
+        assert_eq!(rejection.code(), RejectCode::InvalidArgument);
+    }
+
+    #[test]
+    fn a_request_names_the_first_pairs_key() {
+        let request = SubscribeBookRequest {
+            pairs: vec![pair("binance_spot", "BTCUSDT"), pair("bitstamp", "btcusd")],
+        };
+        let key = key_of(&request).expect("a valid request");
+        assert_eq!(key.venue(), Venue::BinanceSpot);
+        assert_eq!(key.symbol(), "btcusdt");
+    }
+
+    #[test]
+    fn a_duplicate_pair_rejects_the_whole_request() {
+        let request = SubscribeBookRequest {
+            pairs: vec![pair("binance_spot", "btcusdt"), pair("binance_spot", "btcusdt")],
+        };
+        let rejection = key_of(&request).expect_err("a duplicate pair");
+        assert_eq!(rejection.code(), RejectCode::InvalidArgument);
+    }
+
+    /// Two pairs that differ only in case still normalise to one key, and are still a
+    /// duplicate.
+    #[test]
+    fn a_duplicate_pair_is_caught_after_case_normalisation() {
+        let request = SubscribeBookRequest {
+            pairs: vec![pair("BINANCE_SPOT", "BTCUSDT"), pair("binance_spot", "btcusdt")],
+        };
+        let rejection = key_of(&request).expect_err("a case-insensitive duplicate");
+        assert_eq!(rejection.code(), RejectCode::InvalidArgument);
+    }
+
+    #[test]
+    fn an_invalid_second_pair_rejects_the_whole_request() {
+        let request = SubscribeBookRequest {
+            pairs: vec![pair("binance_spot", "btcusdt"), pair("kraken", "btcusd")],
+        };
+        let rejection = key_of(&request).expect_err("the second pair is unusable");
         assert_eq!(rejection.code(), RejectCode::InvalidArgument);
         assert!(
             rejection.reason().contains("kraken"),

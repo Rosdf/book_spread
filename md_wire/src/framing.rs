@@ -10,12 +10,13 @@
 //!   already means "the connector is resyncing" (see `SmallBook::is_empty`), so a close is
 //!   unambiguously the stream being over rather than a book with nothing in it.
 //!
-//! # One connection per subscription
+//! # One book per connection
 //!
-//! A client that wants three symbols opens three connections. That is what lets a
-//! broadcaster own the write half of each socket outright, with no mutex, no interleaving
-//! between symbols and no head-of-line blocking between them - which is the point of the
-//! whole exercise. It is also ordinary for a market-data feed.
+//! A request names its pairs, and today only the first is served; a client that wants three
+//! symbols still opens three connections. That is what lets a broadcaster own the write half
+//! of each socket outright, with no mutex, no interleaving between symbols and no
+//! head-of-line blocking between them - which is the point of the whole exercise. It is also
+//! ordinary for a market-data feed.
 //!
 //! [`SubscribeBookRequest`]: md_proto::md::v1::SubscribeBookRequest
 
@@ -265,12 +266,14 @@ mod test {
         MAX_FRAME_LEN, ReadFrameError, RejectCode, read_frame, read_request, read_response,
         write_accept, write_reject, write_request,
     };
-    use md_proto::md::v1::SubscribeBookRequest;
+    use md_proto::md::v1::{Pair, SubscribeBookRequest};
 
     fn request() -> SubscribeBookRequest {
         SubscribeBookRequest {
-            venue: "binance_spot".to_owned(),
-            symbol: "BTCUSDT".to_owned(),
+            pairs: vec![Pair {
+                venue: "binance_spot".to_owned(),
+                symbol: "BTCUSDT".to_owned(),
+            }],
         }
     }
 

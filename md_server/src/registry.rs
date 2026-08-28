@@ -11,9 +11,9 @@ use tokio::sync::mpsc;
 
 /// Identifies one book stream.
 ///
-/// Also where a `BookUpdate`'s `venue` and `symbol` come from: `SmallBook` carries no
-/// identity of its own, so the only thing that knows what a book is *of* is the key of the
-/// broadcaster holding its reader.
+/// Also where a `BookUpdate`'s levels get their `venue` from: `SmallBook` carries no identity
+/// of its own, so the only thing that knows what a book is *of* is the key of the broadcaster
+/// holding its reader. The symbol itself is no longer on the wire at all.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Key {
     venue: Venue,
