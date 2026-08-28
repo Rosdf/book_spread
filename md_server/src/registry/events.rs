@@ -19,21 +19,21 @@ use tokio::sync::mpsc;
 /// It is the same `Arc` the broadcaster counts its unclaimed joins on, so nothing extra is
 /// allocated to name a generation.
 #[derive(Debug)]
-pub struct Claim {
+pub(crate) struct Claim {
     key: Key,
     pending_joins: Arc<AtomicUsize>,
 }
 
 impl Claim {
-    pub fn new(key: Key, pending_joins: Arc<AtomicUsize>) -> Self {
+    pub(crate) fn new(key: Key, pending_joins: Arc<AtomicUsize>) -> Self {
         Self { key, pending_joins }
     }
 
-    pub fn key(&self) -> &Key {
+    pub(crate) fn key(&self) -> &Key {
         &self.key
     }
 
-    pub fn pending_joins(&self) -> &Arc<AtomicUsize> {
+    pub(crate) fn pending_joins(&self) -> &Arc<AtomicUsize> {
         &self.pending_joins
     }
 }
@@ -43,7 +43,7 @@ impl Claim {
 /// The reply is only ever the socket coming back: everything else - the acceptance header,
 /// or the venue's own refusal - is written by the broadcaster on the socket itself.
 #[derive(Debug)]
-pub struct Subscribe<S> {
+pub(super) struct Subscribe<S> {
     key: Key,
     sock: S,
     reply: oneshot::Sender<Result<(), Refused<S>>>,
@@ -62,7 +62,7 @@ impl<S> Subscribe<S> {
 
 /// A broadcaster whose session list has just emptied, asking whether it may stop.
 #[derive(Debug)]
-pub struct RetireIfIdle {
+pub(super) struct RetireIfIdle {
     claim: Claim,
     reply: oneshot::Sender<bool>,
 }
@@ -205,7 +205,7 @@ impl<S> RegistryTx<S> {
 /// held by the task itself would mean that never happens. `upgrade` returning `None` says the
 /// last of them has gone, which is a refusal to start anything new rather than an error.
 #[derive(Debug)]
-pub struct RegistryWeakTx<S> {
+pub(super) struct RegistryWeakTx<S> {
     tx: mpsc::WeakUnboundedSender<RegistryEvent<S>>,
 }
 

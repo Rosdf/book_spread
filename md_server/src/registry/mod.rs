@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
-pub mod events;
+pub(crate) mod events;
 
 /// Identifies one book stream.
 ///
@@ -31,7 +31,7 @@ impl Key {
     /// request's symbol is validated and normalised. Every connector keys its subscriptions
     /// by the lowercase form, so two keys differing only in case would race for one
     /// subscription and the loser would be rejected as already subscribed.
-    pub fn new(venue: Venue, symbol: Box<str>) -> Self {
+    pub(crate) fn new(venue: Venue, symbol: Box<str>) -> Self {
         debug_assert!(
             symbol.bytes().all(|b| !b.is_ascii_uppercase()),
             "keys must hold the lowercase symbol the connector uses"
@@ -39,11 +39,11 @@ impl Key {
         Self { venue, symbol }
     }
 
-    pub fn venue(&self) -> Venue {
+    pub(crate) fn venue(&self) -> Venue {
         self.venue
     }
 
-    pub fn symbol(&self) -> &str {
+    pub(crate) fn symbol(&self) -> &str {
         &self.symbol
     }
 }
@@ -67,13 +67,13 @@ struct Entry<S> {
 /// Returned rather than refused in place so the refusal is written by the caller, which is
 /// already in the async context the handshake runs in.
 #[derive(Debug)]
-pub struct Refused<S> {
+pub(crate) struct Refused<S> {
     sock: S,
     why: &'static str,
 }
 
 impl<S> Refused<S> {
-    pub fn into_parts(self) -> (S, &'static str) {
+    pub(crate) fn into_parts(self) -> (S, &'static str) {
         (self.sock, self.why)
     }
 }
@@ -85,14 +85,14 @@ impl<S> Refused<S> {
 /// each broadcaster - holds a `RegistryTx` instead, which is what makes this the only place
 /// that can shut the registry down.
 #[derive(Debug)]
-pub struct RegistryHandle<C, S> {
+pub(crate) struct RegistryHandle<C, S> {
     tx: RegistryTx<S>,
     task: tokio::task::JoinHandle<C>,
 }
 
 impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RegistryHandle<C, S> {
     /// Spawns the registry task and gives it `connectors` to own.
-    pub fn spawn(connectors: C) -> Self {
+    pub(crate) fn spawn(connectors: C) -> Self {
         let (rx, tx) = create_event_channel();
         let registry = Registry {
             entries: HashMap::new(),
@@ -108,7 +108,7 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
     }
 
     /// A handle for something that will talk to the registry but must not be able to end it.
-    pub fn tx(&self) -> RegistryTx<S> {
+    pub(crate) fn tx(&self) -> RegistryTx<S> {
         self.tx.clone()
     }
 
@@ -123,7 +123,7 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
     ///
     /// `None` when the task did not finish - it panicked outside an event handler, or was
     /// aborted - in which case the connectors cannot be reclaimed and are left running.
-    pub async fn shutdown(self) -> Option<C> {
+    pub(crate) async fn shutdown(self) -> Option<C> {
         let Self { tx, task } = self;
         tx.shut_down();
         drop(tx);

@@ -290,7 +290,7 @@ pub(crate) mod peer {
         /// # Errors
         ///
         /// The server's own reason, when the subscription was turned down.
-        pub async fn accepted(&mut self) -> Result<(), Rejected> {
+        pub(crate) async fn accepted(&mut self) -> Result<(), Rejected> {
             deadline(framing::read_response(&mut self.sock, &mut self.buf))
                 .await
                 .expect("a response header arrives promptly")
@@ -298,14 +298,14 @@ pub(crate) mod peer {
         }
 
         /// The next book off the wire.
-        pub async fn next_book(&mut self) -> proto::BookUpdate {
+        pub(crate) async fn next_book(&mut self) -> proto::BookUpdate {
             self.next_frame().await;
             proto::BookUpdate::decode(self.buf.as_slice()).expect("the frame is a BookUpdate")
         }
 
         /// Reads the frame right after the acceptance header and asserts it is the empty book -
         /// the snapshot every session opens with. See [`crate::session`]'s module doc.
-        pub async fn opening_snapshot(&mut self) {
+        pub(crate) async fn opening_snapshot(&mut self) {
             let snapshot = self.next_book().await;
             assert!(
                 snapshot.asks.is_empty() && snapshot.bids.is_empty(),
@@ -318,7 +318,7 @@ pub(crate) mod peer {
         ///
         /// Meant for a `#[tokio::test(start_paused = true)]` test: the sleep this races against
         /// never elapses in real time, so this is instant rather than a real wait.
-        pub async fn assert_quiet(&mut self) {
+        pub(crate) async fn assert_quiet(&mut self) {
             let raced = tokio::time::timeout(
                 Duration::from_millis(50),
                 framing::read_frame(&mut self.sock, &mut self.buf),
@@ -331,7 +331,7 @@ pub(crate) mod peer {
         }
 
         /// The next frame's body, left in this client's buffer and also returned.
-        pub async fn next_frame(&mut self) -> Vec<u8> {
+        pub(crate) async fn next_frame(&mut self) -> Vec<u8> {
             deadline(framing::read_frame(&mut self.sock, &mut self.buf))
                 .await
                 .expect("a frame arrives promptly")
@@ -340,7 +340,7 @@ pub(crate) mod peer {
         }
 
         /// Waits for the server to close the connection, and fails if it sends anything more.
-        pub async fn ended(&mut self) {
+        pub(crate) async fn ended(&mut self) {
             let outcome = deadline(framing::read_frame(&mut self.sock, &mut self.buf))
                 .await
                 .expect("the stream ends promptly");
@@ -351,7 +351,7 @@ pub(crate) mod peer {
         }
 
         /// Sends bytes the protocol does not allow, which is one of the two ways a session ends.
-        pub async fn misbehave(&mut self) {
+        pub(crate) async fn misbehave(&mut self) {
             self.sock
                 .write_all(b"unexpected")
                 .await

@@ -20,11 +20,11 @@ pub enum Venue {
 
 impl Venue {
     /// Every venue, in the order a listing should present them.
-    pub const ALL: [Self; 2] = [Self::BinanceSpot, Self::Bitstamp];
+    pub(crate) const ALL: [Self; 2] = [Self::BinanceSpot, Self::Bitstamp];
 
     /// The name a client puts in `SubscribeBookRequest::venue`, and the one echoed back on
     /// every `BookUpdate`.
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::BinanceSpot => "binance_spot",
             Self::Bitstamp => "bitstamp",
@@ -32,7 +32,7 @@ impl Venue {
     }
 
     /// Case-insensitive. `None` for a venue this server does not carry.
-    pub fn parse(raw: &str) -> Option<Self> {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
             .find(|venue| venue.as_str().eq_ignore_ascii_case(raw))
@@ -89,7 +89,7 @@ pub trait Connectors: Debug + Send + Sync + 'static {
 
 /// The real connectors, one spawned task per venue.
 #[derive(Debug)]
-pub struct LiveConnectors {
+pub(crate) struct LiveConnectors {
     binance_spot: ConnectorHandle,
     bitstamp: ConnectorHandle,
 }
@@ -99,7 +99,7 @@ impl LiveConnectors {
     ///
     /// Neither is subscribed to anything yet: symbols are subscribed on demand, by the first
     /// client that asks for one.
-    pub fn spawn() -> Self {
+    pub(crate) fn spawn() -> Self {
         Self {
             binance_spot: ConnectorHandle::new::<BinanceSpot>(ConnectorConfig::default()),
             bitstamp: ConnectorHandle::new::<Bitstamp>(ConnectorConfig::default()),

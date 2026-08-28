@@ -127,7 +127,7 @@ impl Ctx {
 
 /// A client whose socket is waiting to be attached to a running broadcaster.
 #[derive(Debug)]
-pub struct Join<S> {
+pub(crate) struct Join<S> {
     sock: S,
 }
 
@@ -179,7 +179,7 @@ enum Wake<S> {
 
 /// Owns one symbol's [`BookReader`] and every client socket attached to it.
 #[derive(Debug)]
-pub struct Broadcaster<S> {
+pub(crate) struct Broadcaster<S> {
     key: Key,
     reader: BookReader,
     /// One entry per attached client, written to in order on every update.

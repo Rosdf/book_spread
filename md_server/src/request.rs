@@ -27,7 +27,7 @@ const MAX_SYMBOL_LEN: usize = 32;
 /// connector would accept, or a pair that duplicates one earlier in the list (after
 /// normalisation). Nothing here can fail any other way: whether the venue *lists* the symbol
 /// is the connector's answer, not this function's.
-pub fn key_of(request: &SubscribeBookRequest) -> Result<Key, Rejected> {
+pub(crate) fn key_of(request: &SubscribeBookRequest) -> Result<Key, Rejected> {
     if request.pairs.is_empty() {
         return Err(Rejected::new(
             RejectCode::InvalidArgument,

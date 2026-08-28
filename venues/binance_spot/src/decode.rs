@@ -588,8 +588,29 @@ impl<'de> Visitor<'de> for ErrorValueVisitor {
         f.write_str("any JSON value")
     }
 
-    fn visit_unit<E: serde::de::Error>(self) -> Result<ErrorValue, E> {
-        Ok(ErrorValue::Absent)
+    fn visit_bool<E: serde::de::Error>(self, _v: bool) -> Result<ErrorValue, E> {
+        Ok(ErrorValue::Rejected { code: None })
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<ErrorValue, E> {
+        Ok(ErrorValue::Rejected { code: Some(v) })
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<ErrorValue, E> {
+        Ok(ErrorValue::Rejected {
+            code: i64::try_from(v).ok(),
+        })
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _v: f64) -> Result<ErrorValue, E> {
+        Ok(ErrorValue::Rejected { code: None })
+    }
+
+    /// A code quoted as a string still yields a number; a prose message does not.
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<ErrorValue, E> {
+        Ok(ErrorValue::Rejected {
+            code: v.parse().ok(),
+        })
     }
 
     fn visit_none<E: serde::de::Error>(self) -> Result<ErrorValue, E> {
@@ -598,6 +619,15 @@ impl<'de> Visitor<'de> for ErrorValueVisitor {
 
     fn visit_some<D: Deserializer<'de>>(self, de: D) -> Result<ErrorValue, D::Error> {
         de.deserialize_any(self)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<ErrorValue, E> {
+        Ok(ErrorValue::Absent)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<ErrorValue, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(ErrorValue::Rejected { code: None })
     }
 
     /// `{"code":..,"msg":..}` - the shape this is written for. The value of `code` recurses
@@ -620,36 +650,6 @@ impl<'de> Visitor<'de> for ErrorValueVisitor {
         }
 
         Ok(ErrorValue::Rejected { code })
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<ErrorValue, A::Error> {
-        while seq.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(ErrorValue::Rejected { code: None })
-    }
-
-    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<ErrorValue, E> {
-        Ok(ErrorValue::Rejected { code: Some(v) })
-    }
-
-    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<ErrorValue, E> {
-        Ok(ErrorValue::Rejected {
-            code: i64::try_from(v).ok(),
-        })
-    }
-
-    fn visit_f64<E: serde::de::Error>(self, _v: f64) -> Result<ErrorValue, E> {
-        Ok(ErrorValue::Rejected { code: None })
-    }
-
-    fn visit_bool<E: serde::de::Error>(self, _v: bool) -> Result<ErrorValue, E> {
-        Ok(ErrorValue::Rejected { code: None })
-    }
-
-    /// A code quoted as a string still yields a number; a prose message does not.
-    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<ErrorValue, E> {
-        Ok(ErrorValue::Rejected {
-            code: v.parse().ok(),
-        })
     }
 }
 
