@@ -1,7 +1,7 @@
-//! One WebSocket connection serving many symbols of one [`Venue`].
+//! One WebSocket connection serving many symbols of one [`VenueSpec`].
 //!
-//! Generic over `V: Venue` (wire shapes and sequencing), `R: RestClient` (the bootstrap
-//! snapshot fetch) and `W: WsConnector` (the socket) - the transport generics [`Venue`] itself
+//! Generic over `V: VenueSpec` (wire shapes and sequencing), `R: RestClient` (the bootstrap
+//! snapshot fetch) and `W: WsConnector` (the socket) - the transport generics [`VenueSpec`] itself
 //! deliberately stays free of. Symbols are added to and dropped from a live socket with
 //! control frames paced by `V::Pacer`; each carries its own book and its own bootstrap state,
 //! stamped with a `generation` (see [`Slot::generation`]) so a fetch spawned for one bootstrap
@@ -35,16 +35,17 @@
 
 use crate::connector::book_publisher::{BookReader, make_book_publisher_pair};
 use crate::incremental_book::IncrementalBook;
+use crate::instrument::{Instrument, InstrumentId};
 use crate::net::{RestClient, WsConnector};
 use crate::panic::panic_message;
+use crate::shared_string::SharedString;
 use crate::venue::backoff::Backoff;
 use crate::venue::pending::PendingDiffs as _;
 use crate::venue::session::{SessionEnd, SessionError, SessionErrorImpl, close, ws_err};
 use crate::venue::spec::{
     BootstrapRetry as _, ControlPacer as _, Decoder, FrameAction, FrameCtx, Generations, Method,
-    Retry, SnapshotFetchError, SnapshotResult, Venue,
+    Retry, SnapshotFetchError, SnapshotResult, VenueSpec,
 };
-use crate::venue::symbol::Symbol;
 use crate::venue::table::{Slot, SlotState, SlotTable};
 use crate::venue::{ConnectorConfig, rest};
 use bytes::Bytes;
@@ -83,29 +84,28 @@ const SNAPSHOT_REFETCH_DELAY: Duration = Duration::from_millis(250);
 const SNAPSHOT_REFETCH_LIMIT: u32 = 8;
 
 /// One instruction to a connection.
-///
-/// `Subscribe` carries an already-validated [`Symbol`] because the supervisor has to parse it
-/// anyway to key its routing map, and doing it twice would let the two disagree.
 pub enum LaneCommand {
     Subscribe {
-        symbol: Symbol,
+        instrument_id: InstrumentId,
         reply: oneshot::Sender<anyhow::Result<BookReader>>,
     },
     Unsubscribe {
-        symbol: Symbol,
+        instrument_id: InstrumentId,
     },
 }
 
 impl std::fmt::Debug for LaneCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Subscribe { symbol, .. } => f
+            Self::Subscribe { instrument_id, .. } => f
                 .debug_struct("Subscribe")
-                .field("symbol", symbol)
+                .field("instrument_id", instrument_id)
                 .finish_non_exhaustive(),
-            Self::Unsubscribe { symbol } => f
+            Self::Unsubscribe {
+                instrument_id: instrument,
+            } => f
                 .debug_struct("Unsubscribe")
-                .field("symbol", symbol)
+                .field("instrument", instrument)
                 .finish(),
         }
     }
@@ -119,7 +119,7 @@ pub async fn run<V, R, W>(
     ws: W,
     permits: Arc<Semaphore>,
 ) where
-    V: Venue,
+    V: VenueSpec,
     R: RestClient,
     W: WsConnector,
     V::ReplayError: From<SnapshotFetchError<R::Builder>>,
@@ -205,7 +205,7 @@ pub async fn run<V, R, W>(
 /// the snapshot channel. A flat struct could not express that: any method call on `self` while
 /// a field of `self` was borrowed would conflict. Two fields, borrowed independently, can
 /// coexist.
-struct Connection<V: Venue, R: RestClient, W> {
+struct Connection<V: VenueSpec, R: RestClient, W> {
     table: SlotTable<V::Ready, V::Pending>,
     handler: Handler<V, R, W>,
 }
@@ -217,7 +217,7 @@ struct Connection<V: Venue, R: RestClient, W> {
 /// unbounded here: this struct needs several of `V`'s associated types at once (`Config`,
 /// `Stage`, `Pacer`) plus `R`'s, which is exactly the case - see those modules' docs - where
 /// naming the whole trait as a bound is the right call rather than fighting it.
-struct Handler<V: Venue, R: RestClient, W> {
+struct Handler<V: VenueSpec, R: RestClient, W> {
     cfg: ConnectorConfig<V::Config>,
     client: R,
     ws: W,
@@ -235,7 +235,7 @@ struct Handler<V: Venue, R: RestClient, W> {
 
 impl<V, R, W> Connection<V, R, W>
 where
-    V: Venue,
+    V: VenueSpec,
     R: RestClient,
     W: WsConnector,
     V::ReplayError: From<SnapshotFetchError<R::Builder>>,
@@ -264,7 +264,7 @@ where
 
         // Re-establish every symbol this connection was already carrying, through the same
         // paced queue a fresh subscribe goes through.
-        let existing: Vec<Box<str>> = self.table.wire_names().map(Box::from).collect();
+        let existing = self.table.wire_names().cloned();
         for name in existing {
             self.handler.pacer.enqueue(Method::Subscribe, name);
         }
@@ -386,14 +386,7 @@ where
 
                 received = subs_rx.recv() => {
                     let Some(cmd) = received else { return false };
-                    match cmd {
-                        LaneCommand::Subscribe { symbol, reply } => {
-                            self.insert_slot(symbol, reply);
-                        }
-                        LaneCommand::Unsubscribe { symbol } => {
-                            self.remove_slot(&symbol);
-                        }
-                    }
+                    self.apply(cmd);
                 }
             }
         }
@@ -403,20 +396,23 @@ where
     /// Pacing and actually sending is the pacer's job.
     fn apply(&mut self, cmd: LaneCommand) {
         match cmd {
-            LaneCommand::Subscribe { symbol, reply } => {
-                if let Some(wire_name) = self.insert_slot(symbol, reply) {
+            LaneCommand::Subscribe {
+                instrument_id,
+                reply,
+            } => {
+                if let Some(wire_name) = self.insert_slot(Instrument::by_id(instrument_id), reply) {
                     self.handler.pacer.enqueue(Method::Subscribe, wire_name);
                 }
             }
-            LaneCommand::Unsubscribe { symbol } => {
-                if let Some(wire_name) = self.remove_slot(&symbol) {
+            LaneCommand::Unsubscribe { instrument_id } => {
+                if let Some(wire_name) = self.remove_slot(Instrument::by_id(instrument_id)) {
                     self.handler.pacer.enqueue(Method::Unsubscribe, wire_name);
                 }
             }
         }
     }
 
-    /// Gives a symbol a slot on this connection and queues its subscribe frame.
+    /// Gives an instrument a slot on this connection and queues its subscribe frame.
     ///
     /// The snapshot is deliberately *not* requested here: a venue's bootstrap procedure needs
     /// the first buffered frame's cursor to validate the snapshot against, so the fetch is
@@ -432,10 +428,10 @@ where
     /// [`Self::wait_backoff`].
     fn insert_slot(
         &mut self,
-        symbol: Symbol,
+        instrument: Instrument,
         reply: oneshot::Sender<anyhow::Result<BookReader>>,
-    ) -> Option<Box<str>> {
-        let wire_name = V::wire_name(self.handler.cfg.inner(), &symbol);
+    ) -> Option<SharedString> {
+        let wire_name = V::wire_name(self.handler.cfg.inner(), instrument);
 
         let (mut publisher, reader) = make_book_publisher_pair();
         // Seeds the slot readers see before the first snapshot lands, so the reader they are
@@ -443,7 +439,7 @@ where
         publisher.publish_empty();
 
         let slot = Slot {
-            symbol,
+            instrument,
             wire_name: wire_name.clone(),
             book: IncrementalBook::new(),
             publisher,
@@ -466,17 +462,21 @@ where
         Some(wire_name)
     }
 
-    /// Tears down `symbol`'s slot, if this connection carries it, returning the wire name to
-    /// unsubscribe. Dropping the slot drops its `BookPublisher`, which is what tells the reader
-    /// the stream is gone. As [`Self::insert_slot`], the control frame is the caller's to queue.
-    fn remove_slot(&mut self, symbol: &Symbol) -> Option<Box<str>> {
-        let mut slot = self.table.remove(symbol)?;
+    /// Tears down `instrument`'s slot, if this connection carries it, returning the wire name
+    /// to unsubscribe. Dropping the slot drops its `BookPublisher`, which is what tells the
+    /// reader the stream is gone. As [`Self::insert_slot`], the control frame is the caller's
+    /// to queue.
+    fn remove_slot(&mut self, instrument: Instrument) -> Option<SharedString> {
+        // The wire name is what the table is keyed by; a connection has to derive it the same
+        // way it did when subscribing.
+        let wire_name = V::wire_name(self.handler.cfg.inner(), instrument);
+        let mut slot = self.table.remove(&wire_name)?;
         slot.abort_fetch();
         tracing::info!(wire_name = %slot.wire_name, "unsubscribing");
         Some(slot.wire_name)
     }
 
-    /// Decodes one frame via [`Venue::on_frame`] and acts on the result. Returns `Some` only
+    /// Decodes one frame via [`VenueSpec::on_frame`] and acts on the result. Returns `Some` only
     /// when the session must end; every other outcome is handled in place.
     fn on_frame(&mut self, bytes: Bytes) -> Option<SessionEnd> {
         let ctx = FrameCtx {
@@ -506,7 +506,7 @@ where
             }
             FrameAction::Undecodable { slot: blamed, err } => {
                 if let Some(culprit) = blamed {
-                    tracing::warn!(symbol = %culprit.symbol, %err, "decode failed, resyncing symbol");
+                    tracing::warn!(instrument = %culprit.instrument, %err, "decode failed, resyncing symbol");
                     culprit.reset(self.handler.generations.take());
                 } else {
                     // Unattributable: a malformed control response, or a failure before any
@@ -533,7 +533,7 @@ where
                 continue;
             }
             if slot.last_frame.elapsed() > idle_timeout {
-                tracing::warn!(symbol = %slot.symbol, "no frame within idle_symbol_timeout, resyncing");
+                tracing::warn!(instrument = %slot.instrument, "no frame within idle_symbol_timeout, resyncing");
                 slot.reset(generations.take());
             }
         }
@@ -541,18 +541,20 @@ where
 
     /// Routes a completed REST fetch back to the slot it was requested for.
     ///
-    /// Looked up by symbol, matching how [`SlotTable`] is keyed. A miss means the slot was
-    /// dropped or never existed - nothing to apply the snapshot into, so it is discarded. A hit
-    /// whose generation does not match is a result from a superseded attempt and is discarded
-    /// too, before `body` is even looked at, so a stale failed fetch cannot reset a slot that
-    /// has since moved on.
+    /// Looked up by the wire name the instrument maps to - matching how [`SlotTable`] is keyed,
+    /// the same derivation [`Self::remove_slot`] uses. A miss means the slot was dropped or
+    /// never existed - nothing to apply the snapshot into, so it is discarded. A hit whose
+    /// generation does not match is a result from a superseded attempt and is discarded too,
+    /// before `body` is even looked at, so a stale failed fetch cannot reset a slot that has
+    /// since moved on.
     fn on_snapshot(&mut self, snap: SnapshotResult<R::Builder>) {
-        let Some(slot) = self.table.get_mut(snap.symbol.as_str()) else {
+        let wire_name = V::wire_name(self.handler.cfg.inner(), snap.instrument);
+        let Some(slot) = self.table.get_mut(&wire_name) else {
             return;
         };
 
         if snap.generation != slot.generation {
-            tracing::debug!(symbol = %slot.symbol, "snapshot for a superseded attempt, discarded");
+            tracing::debug!(instrument = %slot.instrument, "snapshot for a superseded attempt, discarded");
             return;
         }
 
@@ -571,12 +573,12 @@ where
 
 impl<V, R, W> Handler<V, R, W>
 where
-    V: Venue,
+    V: VenueSpec,
     R: RestClient,
     W: WsConnector,
     V::ReplayError: From<SnapshotFetchError<R::Builder>>,
 {
-    /// A diff arrived for a symbol that has no book yet. `Venue::on_frame` has already staged
+    /// A diff arrived for a symbol that has no book yet. `VenueSpec::on_frame` has already staged
     /// it into `slot`'s own arena; this starts the snapshot fetch if it was the first one, and
     /// gives up on a bootstrap that has buffered more than it is allowed to.
     fn on_buffered(&mut self, slot: &mut Slot<V::Ready, V::Pending>, cursor: u64) {
@@ -602,7 +604,7 @@ where
 
         if overflowed > 0 {
             tracing::warn!(
-                symbol = %slot.symbol,
+                instrument = %slot.instrument,
                 buffered = overflowed,
                 "snapshot never arrived, restarting bootstrap"
             );
@@ -634,7 +636,7 @@ where
         slot: &Slot<V::Ready, V::Pending>,
         delay: Duration,
     ) -> tokio::task::AbortHandle {
-        let mut symbol = slot.symbol.clone();
+        let instrument = slot.instrument;
         let client = self.client.clone();
         let cfg = self.cfg.clone();
         let permits = Arc::clone(&self.permits);
@@ -646,10 +648,10 @@ where
                 tokio::time::sleep(delay).await;
             }
             let body =
-                rest::fetch_snapshot::<V, R>(&client, cfg.inner(), &mut symbol, &permits).await;
+                rest::fetch_snapshot::<V, R>(&client, cfg.inner(), instrument, &permits).await;
             let _ = tx
                 .send(crate::venue::spec::SnapshotResultImpl::new(
-                    symbol, body, generation,
+                    instrument, body, generation,
                 ))
                 .await;
         });
@@ -678,7 +680,7 @@ where
 
         if refetch {
             tracing::debug!(
-                symbol = %slot.symbol,
+                instrument = %slot.instrument,
                 %err,
                 "snapshot did not reach the buffered diffs, fetching another"
             );
@@ -686,14 +688,14 @@ where
             return;
         }
 
-        tracing::warn!(symbol = %slot.symbol, %err, "bootstrap failed, restarting");
+        tracing::warn!(instrument = %slot.instrument, %err, "bootstrap failed, restarting");
         // Back to buffering from nothing, under a generation the failed attempt's fetch
         // cannot match. The next diff to arrive starts a fresh fetch.
         slot.reset(self.generations.take());
     }
 
     /// Seeds `slot`'s book from a fetched snapshot and replays its buffered diffs onto it, via
-    /// [`Venue::seed_and_replay`]. On failure the arena is put back, so
+    /// [`VenueSpec::seed_and_replay`]. On failure the arena is put back, so
     /// [`Self::recover_bootstrap`] still has the option of retrying against it.
     fn apply_snapshot(
         &mut self,
@@ -718,7 +720,7 @@ where
                 // The book only just came into existence, so publish it unconditionally
                 // rather than waiting for the next frame that happens to move the top.
                 slot.publisher.publish(&slot.book);
-                tracing::info!(symbol = %slot.symbol, "book bootstrapped");
+                tracing::info!(instrument = %slot.instrument, "book bootstrapped");
                 Ok(())
             }
             Err(err) => {
@@ -754,11 +756,12 @@ mod test {
     use crate::venue::ConnectorConfig;
     use crate::venue::config::CoreConfig;
     use crate::venue::spec::{Decoder, Generations, Method, SnapshotResult};
-    use crate::venue::symbol::Symbol;
     use crate::venue::table::{Slot, SlotState, SlotTable};
     use crate::venue::test_util::{
         Incoming, ScriptedWs, StubRequest, StubRest, TestConfig, TestPending, TestReady, TestVenue,
+        test_instrument_for,
     };
+    use all_venues::Venue;
     use bytes::Bytes;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -795,14 +798,14 @@ mod test {
     }
 
     fn slot(name: &str, state: SlotState<TestReady, TestPending>) -> Slot<TestReady, TestPending> {
-        let symbol = Symbol::new(name.into()).unwrap();
+        let instrument = test_instrument_for(Venue::BinanceSpot, name);
         let (publisher, reader) = make_book_publisher_pair();
         // Leaked rather than dropped: a live reader is what a real slot has, and dropping it
         // would change what `publish` does.
         Box::leak(Box::new(reader));
         Slot {
-            wire_name: symbol.as_str().into(),
-            symbol,
+            wire_name: instrument.name().into(),
+            instrument,
             book: IncrementalBook::new(),
             publisher,
             state,
@@ -816,11 +819,11 @@ mod test {
         }
     }
 
-    fn subscribe(symbol: &str) -> (LaneCommand, oneshot::Receiver<anyhow::Result<BookReader>>) {
+    fn subscribe(name: &str) -> (LaneCommand, oneshot::Receiver<anyhow::Result<BookReader>>) {
         let (reply, rx) = oneshot::channel();
         (
             LaneCommand::Subscribe {
-                symbol: Symbol::new(symbol.into()).unwrap(),
+                instrument_id: test_instrument_for(Venue::BinanceSpot, name).id(),
                 reply,
             },
             rx,
@@ -1147,7 +1150,7 @@ mod test {
     fn an_unsubscribe_for_a_symbol_this_connection_never_had_is_a_no_op() {
         let (mut conn, _snap_rx) = connection(CoreConfig::default());
         conn.apply(LaneCommand::Unsubscribe {
-            symbol: Symbol::new("btcusd".into()).unwrap(),
+            instrument_id: test_instrument_for(Venue::BinanceSpot, "btcusd").id(),
         });
         assert_eq!(conn.handler.pacer.queued(), []);
     }
@@ -1159,7 +1162,7 @@ mod test {
         let (cmd, _reply) = subscribe("btcusd");
         conn.apply(cmd);
         conn.apply(LaneCommand::Unsubscribe {
-            symbol: Symbol::new("btcusd".into()).unwrap(),
+            instrument_id: test_instrument_for(Venue::BinanceSpot, "btcusd").id(),
         });
 
         let queued: Vec<_> = conn

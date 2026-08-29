@@ -138,6 +138,8 @@ mod test {
     use crate::session::peer::Client;
     use crate::test_util::FakeSource;
     use crate::transport::mock::MockListener;
+    use crate::venue::Venue;
+    use core_lib::venue::test_util::test_instrument_for;
     use std::sync::Arc;
 
     /// The accept path end to end, with no socket under it: a connection is accepted, its
@@ -153,20 +155,22 @@ mod test {
         let (stop_accepting, stopped) = oneshot::channel();
         let accepting = tokio::spawn(super::accept(harness.registry.clone(), listener, stopped));
 
-        for symbol in ["BTCUSDT", "ETHUSDT"] {
+        for symbol in ["FRAMEDBTCUSDT", "FRAMEDETHUSDT"] {
+            let _ = test_instrument_for(Venue::BinanceSpot, symbol);
             let mut client = Client::from_socket(connector.connect());
             client.request("binance_spot", symbol).await;
             client
                 .accepted()
                 .await
-                .expect("the fake source accepts every symbol");
+                .expect("the instrument is listed and the fake source accepts every symbol");
             client.opening_snapshot().await;
         }
 
         assert_eq!(
             source.subscribed(),
-            vec![Box::from("btcusdt"), Box::from("ethusdt")],
-            "each accepted connection reached the registry, under the normalised symbol"
+            vec!["FRAMEDBTCUSDT", "FRAMEDETHUSDT"],
+            "each accepted connection reached the registry, under the wire's own casing - the \
+             contract is case-sensitive now, so nothing normalises it"
         );
 
         let _ = stop_accepting.send(());
@@ -188,13 +192,16 @@ mod test {
         let (stop_accepting, stopped) = oneshot::channel();
         let accepting = tokio::spawn(super::accept(harness.registry.clone(), listener, stopped));
 
+        let _ = test_instrument_for(Venue::BinanceSpot, "STILLINFLIGHTBTCUSDT");
         let mut silent = Client::from_socket(connector.connect());
         let mut talkative = Client::from_socket(connector.connect());
-        talkative.request("binance_spot", "BTCUSDT").await;
+        talkative
+            .request("binance_spot", "STILLINFLIGHTBTCUSDT")
+            .await;
         talkative
             .accepted()
             .await
-            .expect("the fake source accepts every symbol");
+            .expect("the instrument is listed and the fake source accepts every symbol");
 
         let _ = stop_accepting.send(());
         accepting.await.expect("the accept loop does not panic");
@@ -202,7 +209,7 @@ mod test {
         silent.ended().await;
         assert_eq!(
             source.subscribed(),
-            vec![Box::from("btcusdt")],
+            vec!["STILLINFLIGHTBTCUSDT"],
             "a connection that never sent a request must not reach the registry"
         );
     }

@@ -1,16 +1,16 @@
 //! Fetching a bootstrap snapshot over REST.
 //!
 //! Only the raw bytes come back: decoding happens on the connection task via
-//! [`Venue::seed_and_replay`], so every mutation of every book stays on one thread and the
+//! [`VenueSpec::seed_and_replay`], so every mutation of every book stays on one thread and the
 //! snapshot can be seeded directly into the book the slot already owns.
 
+use crate::instrument::Instrument;
 use crate::net::{RequestBuilder as _, Response as _, RestClient};
-use crate::venue::spec::{SnapshotFetchError, Venue};
-use crate::venue::symbol::Symbol;
+use crate::venue::spec::{SnapshotFetchError, VenueSpec};
 use bytes::Bytes;
 use tokio::sync::Semaphore;
 
-/// Fetches `symbol`'s bootstrap snapshot and returns the raw body.
+/// Fetches `instrument`'s bootstrap snapshot and returns the raw body.
 ///
 /// # Errors
 /// [`SnapshotFetchError`] if the concurrency permit cannot be acquired (only on shutdown), the
@@ -18,11 +18,11 @@ use tokio::sync::Semaphore;
 pub async fn fetch_snapshot<V, R>(
     client: &R,
     cfg: &V::Config,
-    symbol: &mut Symbol,
+    instrument: Instrument,
     permits: &Semaphore,
 ) -> Result<Bytes, SnapshotFetchError<R::Builder>>
 where
-    V: Venue,
+    V: VenueSpec,
     R: RestClient,
 {
     // Bounds the burst when a whole connection rebootstraps at once.
@@ -31,7 +31,7 @@ where
         .await
         .map_err(|_| SnapshotFetchError::<R::Builder>::ShuttingDown)?;
 
-    let url = V::snapshot_url(cfg, symbol);
+    let url = V::snapshot_url(cfg, instrument);
 
     let body = client
         .get(url)

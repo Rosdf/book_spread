@@ -364,17 +364,26 @@ impl RestClient for StubRest {
 // A venue with no wire format worth the name
 // ---------------------------------------------------------------------------------------
 
+use crate::connector::{InstrumentRegistrar, VenueGuard};
+use crate::instrument::{Instrument, InstrumentId};
+use crate::map::{InternalHashSet, new_internal_set};
+use crate::shared_string::SharedString;
 use crate::venue::pending::PendingDiffs;
 use crate::venue::spec::{
     BootstrapRetry, ControlPacer, Decoder, FrameAction, FrameCtx, Method, Retry,
-    SnapshotFetchError, Venue,
+    SnapshotFetchError, VenueSpec,
 };
-use crate::venue::symbol::Symbol;
 use crate::venue::table::{Slot, SlotState};
-use std::collections::HashSet;
+use all_venues::Venue;
 use std::time::Instant;
 
-/// A [`Venue`] whose only job is to exercise the generic connection and supervisor machinery.
+/// As [`test_instrument`], under `venue` rather than always [`Venue::BinanceSpot`].
+#[must_use]
+pub fn test_instrument_for(venue: Venue, name: &str) -> Instrument {
+    VenueGuard::new(venue).register(name)
+}
+
+/// A [`VenueSpec`] whose only job is to exercise the generic connection and supervisor machinery.
 ///
 /// Its "wire format" is deliberately not JSON: a data frame is `<symbol>:<cursor>`, a snapshot
 /// body is a bare cursor, and a listing is a comma-separated list of symbols. Everything the
@@ -447,20 +456,20 @@ pub struct TestSymbolsError;
 /// and remembers the names for [`ControlPacer::names_for`].
 #[derive(Debug, Default)]
 pub struct TestPacer {
-    queue: Vec<(Method, Box<str>)>,
-    last_names: Vec<Box<str>>,
+    queue: Vec<(Method, SharedString)>,
+    last_names: Vec<SharedString>,
 }
 
 impl TestPacer {
     /// What is queued but not yet sent, so a test can prove no control frame was enqueued.
     #[must_use]
-    pub fn queued(&self) -> &[(Method, Box<str>)] {
+    pub fn queued(&self) -> &[(Method, SharedString)] {
         &self.queue
     }
 }
 
 impl ControlPacer for TestPacer {
-    fn enqueue(&mut self, method: Method, name: Box<str>) {
+    fn enqueue(&mut self, method: Method, name: SharedString) {
         self.queue.push((method, name));
     }
 
@@ -496,12 +505,12 @@ impl ControlPacer for TestPacer {
         std::future::ready(Ok(()))
     }
 
-    fn names_for(&self, _id: Option<u64>) -> &[Box<str>] {
+    fn names_for(&self, _id: Option<u64>) -> &[SharedString] {
         &self.last_names
     }
 }
 
-impl Venue for TestVenue {
+impl VenueSpec for TestVenue {
     type Config = TestConfig;
     type Ready = TestReady;
     type Stage = ();
@@ -518,21 +527,24 @@ impl Venue for TestVenue {
         "test://listing".to_owned()
     }
 
-    fn parse_symbols(body: Bytes) -> Result<HashSet<Symbol>, TestSymbolsError> {
+    fn parse_symbols<R: InstrumentRegistrar>(
+        body: Bytes,
+        reg: &R,
+    ) -> Result<InternalHashSet<InstrumentId>, TestSymbolsError> {
         let listed = std::str::from_utf8(&body).map_err(|_| TestSymbolsError)?;
-        listed
-            .split(',')
-            .filter(|name| !name.is_empty())
-            .map(|name| Symbol::new(name.into()).map_err(|_| TestSymbolsError))
-            .collect()
+        let mut instruments = new_internal_set();
+        for name in listed.split(',').filter(|name| !name.is_empty()) {
+            instruments.insert(reg.register(name).id());
+        }
+        Ok(instruments)
     }
 
-    fn snapshot_url(_cfg: &Self::Config, symbol: &mut Symbol) -> String {
-        format!("test://snapshot/{symbol}")
+    fn snapshot_url(_cfg: &Self::Config, instrument: Instrument) -> String {
+        format!("test://snapshot/{instrument}")
     }
 
-    fn wire_name(_cfg: &Self::Config, symbol: &Symbol) -> Box<str> {
-        symbol.as_str().into()
+    fn wire_name(_cfg: &Self::Config, instrument: Instrument) -> SharedString {
+        instrument.name().into()
     }
 
     fn on_frame<'t>(

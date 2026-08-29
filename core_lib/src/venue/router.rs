@@ -5,9 +5,10 @@
 //! `mpsc::Sender<C>`. Every method here is synchronous and a test can stand a lane up from a
 //! bare `mpsc::channel`, with no runtime, socket, or spawned task involved.
 
+use crate::instrument::InstrumentId;
+use crate::map::{InternalHashMap, new_internal_map};
 use std::hash::Hash;
 use tokio::sync::mpsc;
-use crate::map::{new_internal_map, InternalHashMap};
 
 /// Names one connection for the life of a supervisor. A counter rather than a position: lanes
 /// are removed when they empty or die, and an index would re-point at whatever took the freed
@@ -23,17 +24,14 @@ pub struct Lane<C> {
 }
 
 #[derive(Debug)]
-pub struct Router<S, C> {
+pub struct Router<C> {
     lanes: InternalHashMap<LaneId, Lane<C>>,
-    by_symbol: InternalHashMap<S, LaneId>,
+    by_symbol: InternalHashMap<InstrumentId, LaneId>,
     next_id: u64,
     capacity: usize,
 }
 
-impl<S, C> Router<S, C>
-where
-    S: Eq + Hash + Clone,
-{
+impl<C> Router<C> {
     pub fn new(capacity: usize) -> Self {
         Self {
             lanes: new_internal_map(),
@@ -43,8 +41,8 @@ where
         }
     }
 
-    pub fn contains(&self, symbol: &S) -> bool {
-        self.by_symbol.contains_key(symbol)
+    pub fn contains(&self, instrument_id: InstrumentId) -> bool {
+        self.by_symbol.contains_key(&instrument_id)
     }
 
     /// How many lanes are currently open, for a supervisor's own logging.
@@ -77,15 +75,15 @@ where
         self.lanes.get(&id).map(|lane| &lane.tx)
     }
 
-    pub fn bind(&mut self, symbol: S, id: LaneId) {
-        self.by_symbol.insert(symbol, id);
+    pub fn bind(&mut self, instrument_id: InstrumentId, id: LaneId) {
+        self.by_symbol.insert(instrument_id, id);
         if let Some(lane) = self.lanes.get_mut(&id) {
             lane.load += 1;
         }
     }
 
-    pub fn take(&mut self, symbol: &S) -> Option<LaneId> {
-        let id = self.by_symbol.remove(symbol)?;
+    pub fn take(&mut self, instrument_id: InstrumentId) -> Option<LaneId> {
+        let id = self.by_symbol.remove(&instrument_id)?;
         if let Some(lane) = self.lanes.get_mut(&id) {
             lane.load = lane.load.saturating_sub(1);
         }
@@ -93,8 +91,8 @@ where
     }
 
     /// Every symbol currently routed somewhere, in no particular order.
-    pub fn symbols(&self) -> impl ExactSizeIterator<Item = &S> {
-        self.by_symbol.keys()
+    pub fn symbols(&self) -> impl ExactSizeIterator<Item = InstrumentId> {
+        self.by_symbol.keys().copied()
     }
 
     /// Removes a lane outright - used when its sender turned out to be dead - and returns the
@@ -104,7 +102,7 @@ where
     /// router still holds, so a binding left pointing at an id already removed here would
     /// never be seen again - the symbol would read `contains() == true` forever, blocking any
     /// re-subscribe, and the next `take` of it would hand a caller an id no lane answers to.
-    pub fn drop_lane(&mut self, id: LaneId) -> Vec<S> {
+    pub fn drop_lane(&mut self, id: LaneId) -> Vec<InstrumentId> {
         self.lanes.remove(&id);
 
         let mut orphaned = Vec::new();
@@ -141,7 +139,7 @@ where
 
     /// Removes every lane whose sender has closed, returning the symbols that were bound to
     /// them - orphaned because the connection is gone and nothing will answer for them.
-    pub fn purge_closed(&mut self) -> Vec<S> {
+    pub fn purge_closed(&mut self) -> Vec<InstrumentId> {
         let dead: Vec<LaneId> = self
             .lanes
             .iter()
@@ -168,16 +166,19 @@ where
 #[cfg(test)]
 mod test {
     use super::Router;
+    use crate::connector::{InstrumentRegistrar, VenueGuard};
+    use crate::instrument::InstrumentId;
+    use all_venues::Venue;
     use tokio::sync::mpsc;
 
     /// Stand-in lane command: the router never inspects it.
     #[derive(Debug)]
     struct Cmd;
 
-    type TestRouter = Router<String, Cmd>;
+    type TestRouter = Router<Cmd>;
 
-    fn symbol(raw: &str) -> String {
-        raw.to_owned()
+    fn symbol(raw: &str) -> InstrumentId {
+        VenueGuard::new(Venue::Bitstamp).register(raw).id()
     }
 
     /// A sender with no live receiver on the other end, standing in for a dead lane's `tx`
@@ -206,10 +207,10 @@ mod test {
         router.bind(symbol("ethusdt"), lane);
         assert_eq!(router.lanes[&lane].load, 2);
 
-        let taken = router.take(&symbol("btcusdt")).unwrap();
+        let taken = router.take(symbol("btcusdt")).unwrap();
         assert_eq!(taken, lane);
         assert_eq!(router.lanes[&lane].load, 1);
-        assert!(router.take(&symbol("btcusdt")).is_none(), "already taken");
+        assert!(router.take(symbol("btcusdt")).is_none(), "already taken");
     }
 
     #[test]
@@ -221,7 +222,7 @@ mod test {
         router.bind(symbol("btcusdt"), lane_a);
 
         assert!(
-            router.contains(&symbol("btcusdt")),
+            router.contains(symbol("btcusdt")),
             "a symbol bound on one lane must be visible connector-wide"
         );
         // Nothing stops a caller from binding the same symbol to a second lane directly, but
@@ -308,11 +309,11 @@ mod test {
         let mut orphaned = router.purge_closed();
         orphaned.sort_unstable();
 
-        assert_eq!(orphaned, vec!["btcusdt".to_owned(), "ethusdt".to_owned()]);
+        assert_eq!(orphaned, vec![symbol("btcusdt"), symbol("ethusdt")]);
         assert!(!router.lanes.contains_key(&dead));
         assert!(router.lanes.contains_key(&alive));
         assert!(
-            router.contains(&symbol("solusdt")),
+            router.contains(symbol("solusdt")),
             "the live lane's symbol must survive"
         );
     }
@@ -329,17 +330,17 @@ mod test {
         let mut orphaned = router.drop_lane(doomed);
         orphaned.sort_unstable();
 
-        assert_eq!(orphaned, vec!["btcusdt".to_owned(), "ethusdt".to_owned()]);
+        assert_eq!(orphaned, vec![symbol("btcusdt"), symbol("ethusdt")]);
         // The bug this covers: leaving the bindings behind made these symbols permanently
         // unsubscribable - `purge_closed` only scans lanes, so it could never see this id
         // again - and handed the next `take` an id no lane answers to.
-        assert!(!router.contains(&symbol("btcusdt")));
-        assert!(!router.contains(&symbol("ethusdt")));
+        assert!(!router.contains(symbol("btcusdt")));
+        assert!(!router.contains(symbol("ethusdt")));
         assert!(
-            router.contains(&symbol("solusdt")),
+            router.contains(symbol("solusdt")),
             "an untouched lane keeps its symbols"
         );
-        assert!(router.take(&symbol("btcusdt")).is_none());
+        assert!(router.take(symbol("btcusdt")).is_none());
     }
 
     #[test]
@@ -361,7 +362,7 @@ mod test {
         let lane = router.insert_lane(live_tx());
         router.bind(symbol("btcusdt"), lane);
 
-        assert_eq!(router.purge_closed(), Vec::<String>::new());
+        assert_eq!(router.purge_closed(), Vec::<_>::new());
         assert!(router.lanes.contains_key(&lane));
     }
 }

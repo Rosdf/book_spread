@@ -12,6 +12,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "all_venues"
+version = "0.1.0"
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -214,10 +218,12 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 name = "core_lib"
 version = "0.1.0"
 dependencies = [
+ "all_venues",
  "anyhow",
  "bytes",
  "crossbeam-utils",
  "futures-util",
+ "hashbrown 0.17.1",
  "heapless",
  "loom",
  "oneshot",
@@ -557,6 +563,11 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "heapless"

@@ -1,25 +1,26 @@
 //! Routes subscribe/unsubscribe requests to connections, spawning a new one when the current
 //! lanes are full.
 //!
-//! Generic over `V: Venue`; thin glue over [`Router`] that is identical for every venue once
+//! Generic over `V: VenueSpec`; thin glue over [`Router`] that is identical for every venue once
 //! the connection task itself is generic.
 //!
 //! Every subscribe is checked against the venue's own symbol listing first - see
-//! [`crate::venue::universe`] - so an unknown or halted symbol is refused before a lane is
+//! [`crate::venue::universe`] - so an instrument no longer tradable is refused before a lane is
 //! chosen, rather than discovered from a control-frame rejection that leaves a slot
-//! bootstrapping forever. The listing is *fail closed*: nothing is routed until one has been
-//! fetched. Requests that arrive before that first listing are held rather than refused, since
-//! refusing them would answer "not tradable" for symbols that in fact are - the connector has
-//! simply not looked yet.
+//! bootstrapping forever. An instrument that has never been listed at all cannot reach here in
+//! the first place: it can only exist as an [`Instrument`] because some past listing registered
+//! it, so there is no "the listing has not arrived yet" state for a subscribe to be held in -
+//! unlike a raw, unvalidated symbol string, which is why this no longer needs a wait queue.
 
+use crate::connector::InstrumentRegistrar;
 use crate::connector::events::{ConnectorEvent, ConnectorRx, Subscribe, Unsubscribe};
+use crate::instrument::{Instrument, InstrumentId};
+use crate::map::{InternalHashSet, new_internal_set};
 use crate::net::{RestClient, WsConnector};
 use crate::venue::connection::{self, LaneCommand};
 use crate::venue::router::{LaneId, Router};
-use crate::venue::spec::{SnapshotFetchError, Venue};
-use crate::venue::symbol::Symbol;
+use crate::venue::spec::{SnapshotFetchError, VenueSpec};
 use crate::venue::{ConnectorConfig, universe};
-use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Semaphore, mpsc};
@@ -46,9 +47,14 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 ///
 /// Symbol identity is connector-wide: [`Router`] rejects a second subscribe of a symbol already
 /// live on some lane, so one symbol can never end up with two independent books.
-pub async fn run<V, R, W>(mut rx: ConnectorRx, cfg: ConnectorConfig<V::Config>, client: R, ws: W)
-where
-    V: Venue,
+pub async fn run<V, R, W>(
+    mut rx: ConnectorRx,
+    cfg: ConnectorConfig<V::Config>,
+    client: R,
+    ws: W,
+    registrar: impl InstrumentRegistrar + 'static,
+) where
+    V: VenueSpec,
     R: RestClient,
     W: WsConnector,
     V::ReplayError: From<SnapshotFetchError<R::Builder>>,
@@ -62,35 +68,28 @@ where
         cfg,
     };
 
-    let mut router: Router<Symbol, LaneCommand> = Router::new(capacity);
+    let mut router = Router::new(capacity);
     let mut tasks: JoinSet<()> = JoinSet::new();
 
     let (universe_tx, mut universe_rx) = mpsc::channel(UNIVERSE_CHANNEL);
     let refresher = tokio::spawn(universe::refresh_loop::<V, R>(
         ctx.cfg.clone(),
         ctx.client.clone(),
+        registrar,
         universe_tx,
     ));
 
-    // The venue's listing, `None` until the first refresh lands.
-    let mut universe: Option<HashSet<Symbol>> = None;
-    // Subscribes that arrived before the first listing did, answered in arrival order the
-    // moment one is in hand. Bounded only by how many a caller sends in that window.
-    let mut waiting: VecDeque<Subscribe> = VecDeque::new();
+    // The venue's listing. Empty until the first refresh lands, which is the same fail-closed
+    // answer a `None` gave: nothing is routed until something has actually been listed.
+    let mut listed = new_internal_set();
 
     loop {
         tokio::select! {
             // `Some(..)`, so a refresh task that has gone away simply disables this arm
             // rather than completing instantly forever.
-            Some(listed) = universe_rx.recv() => {
-                let first = universe.is_none();
-                retire_unlisted(&listed, &mut router).await;
-                universe = Some(listed);
-                if first {
-                    while let Some(sub) = waiting.pop_front() {
-                        handle_subscribe(sub, universe.as_ref(), &mut router, &mut tasks, &ctx).await;
-                    }
-                }
+            Some(fresh) = universe_rx.recv() => {
+                retire_unlisted(&fresh, &mut router).await;
+                listed = fresh;
             }
 
             received = rx.recv() => {
@@ -105,12 +104,8 @@ where
                 };
 
                 match event {
-                    // Held rather than routed while the listing is still on its way: see the
-                    // module doc. Dropping these on shutdown answers each caller's reply
-                    // channel with `Err`, which is what a dropped `oneshot::Sender` means.
-                    ConnectorEvent::Subscribe(sub) if universe.is_none() => waiting.push_back(sub),
                     ConnectorEvent::Subscribe(sub) => {
-                        handle_subscribe(sub, universe.as_ref(), &mut router, &mut tasks, &ctx).await;
+                        handle_subscribe(sub, &listed, &mut router, &mut tasks, &ctx).await;
                     }
                     ConnectorEvent::Unsubscribe(unsub) => {
                         handle_unsubscribe(unsub, &mut router).await;
@@ -141,25 +136,25 @@ where
     }
 }
 
-/// Tears down every subscribed symbol the venue no longer lists as tradable.
+/// Tears down every subscribed instrument the venue no longer lists as tradable.
 ///
 /// Dropping the slot on the connection drops its `BookPublisher`, which is what tells the
 /// reader the stream has ended - the same signal an explicit unsubscribe gives, since from a
 /// reader's point of view it is the same thing.
-async fn retire_unlisted(listed: &HashSet<Symbol>, router: &mut Router<Symbol, LaneCommand>) {
-    let gone: Vec<Symbol> = router
+async fn retire_unlisted(listed: &InternalHashSet<InstrumentId>, router: &mut Router<LaneCommand>) {
+    let gone: Box<[_]> = router
         .symbols()
-        .filter(|symbol| !listed.contains(*symbol))
-        .cloned()
+        .filter(|instrument_id| !listed.contains(instrument_id))
         .collect();
 
-    for symbol in gone {
-        let Some(lane_id) = router.take(&symbol) else {
+    for instrument_id in gone {
+        let Some(lane_id) = router.take(instrument_id) else {
             continue;
         };
-        tracing::warn!(%symbol, "no longer listed as tradable, dropping subscription");
+        let instrument = Instrument::by_id(instrument_id);
+        tracing::warn!(%instrument, "no longer listed as tradable, dropping subscription");
         if let Some(tx) = router.tx(lane_id) {
-            let _ = tx.send(LaneCommand::Unsubscribe { symbol }).await;
+            let _ = tx.send(LaneCommand::Unsubscribe { instrument_id }).await;
         }
     }
 }
@@ -169,9 +164,9 @@ async fn retire_unlisted(listed: &HashSet<Symbol>, router: &mut Router<Symbol, L
 ///
 /// `R`/`W` are unbounded here - `client` and `ws` are plain fields, never projected - unlike
 /// `V`, whose `cfg: ConnectorConfig<V::Config>` reaches through a projection and so needs
-/// `V: Venue` stated right on this declaration; every function below that actually calls into
+/// `V: VenueSpec` stated right on this declaration; every function below that actually calls into
 /// `R`/`W`'s traits states its own bound instead.
-struct ConnCtx<V: Venue, R, W> {
+struct ConnCtx<V: VenueSpec, R, W> {
     cfg: ConnectorConfig<V::Config>,
     client: R,
     ws: W,
@@ -180,41 +175,34 @@ struct ConnCtx<V: Venue, R, W> {
 
 async fn handle_subscribe<V, R, W>(
     sub: Subscribe,
-    universe: Option<&HashSet<Symbol>>,
-    router: &mut Router<Symbol, LaneCommand>,
+    listed: &InternalHashSet<InstrumentId>,
+    router: &mut Router<LaneCommand>,
     tasks: &mut JoinSet<()>,
     ctx: &ConnCtx<V, R, W>,
 ) where
-    V: Venue,
+    V: VenueSpec,
     R: RestClient,
     W: WsConnector,
     V::ReplayError: From<SnapshotFetchError<R::Builder>>,
 {
-    let (requested, reply) = sub.into_parts();
+    let (instrument_id, reply) = sub.into_parts();
 
-    let symbol = match Symbol::new(requested) {
-        Ok(symbol) => symbol,
-        Err(err) => {
-            tracing::error!(symbol = err.as_str(), %err, "rejecting subscription");
-            let _ = reply.send(Err(err.into()));
-            return;
-        }
-    };
-
-    // Fail closed on both counts: no listing at all, or a listing that does not name this
-    // symbol as tradable. The caller of a held request cannot reach here with `None` (see
-    // `run`), so this is the backstop rather than the usual path.
-    if !universe.is_some_and(|listed| listed.contains(&symbol)) {
-        tracing::error!(%symbol, "not listed as tradable on this venue, rejecting subscription");
+    // Fail closed: a listing that does not name this instrument as currently tradable is
+    // refused, even though the instrument itself is known - it may simply have been delisted
+    // since the listing that first registered it.
+    if !listed.contains(&instrument_id) {
+        let instrument = Instrument::by_id(instrument_id);
+        tracing::error!(%instrument, "not listed as tradable on this venue, rejecting subscription");
         let _ = reply.send(Err(anyhow::anyhow!(
-            "{symbol} is not listed as tradable on this venue"
+            "{instrument} is not listed as tradable on this venue",
         )));
         return;
     }
 
-    if router.contains(&symbol) {
-        tracing::error!(%symbol, "already subscribed on this connector");
-        let _ = reply.send(Err(anyhow::anyhow!("{symbol} is already subscribed")));
+    if router.contains(instrument_id) {
+        let instrument = Instrument::by_id(instrument_id);
+        tracing::error!(%instrument, "already subscribed on this connector");
+        let _ = reply.send(Err(anyhow::anyhow!("{instrument} is already subscribed")));
         return;
     }
 
@@ -224,7 +212,7 @@ async fn handle_subscribe<V, R, W>(
         id
     });
 
-    send_subscribe::<V, R, W>(symbol, reply, lane_id, router, tasks, ctx).await;
+    send_subscribe::<V, R, W>(instrument_id, reply, lane_id, router, tasks, ctx).await;
 }
 
 /// Sends one `Subscribe` command to `lane_id`. On a dead lane - one whose task exited between
@@ -232,20 +220,20 @@ async fn handle_subscribe<V, R, W>(
 /// lane is purged and the command is retried once on a freshly opened one; a second failure
 /// gives up and answers the request's reply channel with `Err`.
 async fn send_subscribe<V, R, W>(
-    symbol: Symbol,
+    instrument_id: InstrumentId,
     reply: oneshot::Sender<anyhow::Result<crate::connector::book_publisher::BookReader>>,
     mut lane_id: LaneId,
-    router: &mut Router<Symbol, LaneCommand>,
+    router: &mut Router<LaneCommand>,
     tasks: &mut JoinSet<()>,
     ctx: &ConnCtx<V, R, W>,
 ) where
-    V: Venue,
+    V: VenueSpec,
     R: RestClient,
     W: WsConnector,
     V::ReplayError: From<SnapshotFetchError<R::Builder>>,
 {
     let mut cmd = LaneCommand::Subscribe {
-        symbol: symbol.clone(),
+        instrument_id,
         reply,
     };
 
@@ -255,7 +243,7 @@ async fn send_subscribe<V, R, W>(
         if let Some(tx) = router.tx(lane_id) {
             match tx.send(cmd).await {
                 Ok(()) => {
-                    router.bind(symbol, lane_id);
+                    router.bind(instrument_id, lane_id);
                     return;
                 }
                 Err(mpsc::error::SendError(returned)) => cmd = returned,
@@ -274,24 +262,29 @@ async fn send_subscribe<V, R, W>(
         lane_id = spawn_lane::<V, R, W>(router, tasks, ctx);
     }
 
-    let LaneCommand::Subscribe { symbol, reply } = cmd else {
+    let LaneCommand::Subscribe {
+        instrument_id,
+        reply,
+    } = cmd
+    else {
         unreachable!("only Subscribe is ever routed here")
     };
-    tracing::error!(%symbol, "connection task gone, dropping subscription");
+    let instrument = Instrument::by_id(instrument_id);
+    tracing::error!(%instrument, "connection task gone, dropping subscription");
     let _ = reply.send(Err(anyhow::anyhow!(
-        "connection task carrying {symbol} is gone"
+        "connection task carrying {instrument} is gone"
     )));
 }
 
 /// Opens a new connection task, registers it in `tasks`, and returns the lane the router
 /// created for it.
 fn spawn_lane<V, R, W>(
-    router: &mut Router<Symbol, LaneCommand>,
+    router: &mut Router<LaneCommand>,
     tasks: &mut JoinSet<()>,
     ctx: &ConnCtx<V, R, W>,
 ) -> LaneId
 where
-    V: Venue,
+    V: VenueSpec,
     R: RestClient,
     W: WsConnector,
     V::ReplayError: From<SnapshotFetchError<R::Builder>>,
@@ -307,27 +300,24 @@ where
     router.insert_lane(tx)
 }
 
-async fn handle_unsubscribe(unsub: Unsubscribe, router: &mut Router<Symbol, LaneCommand>) {
-    let requested = unsub.into_symbol();
-    let symbol = match Symbol::new(requested) {
-        Ok(symbol) => symbol,
-        Err(err) => {
-            tracing::debug!(symbol = err.as_str(), %err, "ignoring unsubscribe");
-            return;
-        }
-    };
+async fn handle_unsubscribe(unsub: Unsubscribe, router: &mut Router<LaneCommand>) {
+    let instrument_id = unsub.into_instrument();
 
-    let Some(lane_id) = router.take(&symbol) else {
-        tracing::debug!(%symbol, "unsubscribe for a symbol that is not subscribed");
+    let Some(lane_id) = router.take(instrument_id) else {
+        let instrument = Instrument::by_id(instrument_id);
+        tracing::debug!(%instrument, "unsubscribe for a symbol that is not subscribed");
         return;
     };
 
     match router.tx(lane_id) {
         // The lane is already gone; nothing left to tell it. The next `join_next` reap will
         // notice and purge whatever else it was carrying.
-        None => tracing::debug!(%symbol, "lane already gone, nothing to unsubscribe"),
+        None => {
+            let instrument = Instrument::by_id(instrument_id);
+            tracing::debug!(%instrument, "lane already gone, nothing to unsubscribe");
+        }
         Some(tx) => {
-            let _ = tx.send(LaneCommand::Unsubscribe { symbol }).await;
+            let _ = tx.send(LaneCommand::Unsubscribe { instrument_id }).await;
         }
     }
 
@@ -338,7 +328,7 @@ async fn handle_unsubscribe(unsub: Unsubscribe, router: &mut Router<Symbol, Lane
 ///
 /// Dropping every lane's sender is the signal: each connection sees its queue close, sends a
 /// close frame and returns.
-async fn stop_connections(router: Router<Symbol, LaneCommand>, mut tasks: JoinSet<()>) {
+async fn stop_connections(router: Router<LaneCommand>, mut tasks: JoinSet<()>) {
     let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
     // Dropping `router` here drops every lane's `tx`, which is what tells the connections to
     // stop.
@@ -366,24 +356,28 @@ async fn stop_connections(router: Router<Symbol, LaneCommand>, mut tasks: JoinSe
 #[cfg(test)]
 mod test {
     use super::{ConnCtx, handle_subscribe, retire_unlisted, run};
+    use crate::connector::VenueGuard;
     use crate::connector::book_publisher::BookReader;
     use crate::connector::events::{ConnectorEvent, Subscribe, create_event_channel};
+    use crate::instrument::InstrumentId;
+    use crate::map::{InternalHashSet, new_internal_set};
     use crate::venue::connection::LaneCommand;
     use crate::venue::router::Router;
-    use crate::venue::symbol::Symbol;
-    use crate::venue::test_util::{Incoming, ScriptedWs, StubRest, TestConfig, TestVenue};
+    use crate::venue::test_util::{
+        Incoming, ScriptedWs, StubRest, TestConfig, TestVenue, test_instrument_for,
+    };
     use crate::venue::{ConnectorConfig, CoreConfig};
-    use std::collections::HashSet;
+    use all_venues::Venue;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{Semaphore, mpsc};
 
-    fn symbol(name: &str) -> Symbol {
-        Symbol::new(name.into()).unwrap()
-    }
-
-    fn listing(names: &[&str]) -> HashSet<Symbol> {
-        names.iter().map(|name| symbol(name)).collect()
+    fn listing(names: &[&str]) -> InternalHashSet<InstrumentId> {
+        let mut set = new_internal_set();
+        for name in names {
+            set.insert(test_instrument_for(Venue::BinanceSpot, name).id());
+        }
+        set
     }
 
     /// A context nothing in these tests reaches: every path exercised here answers the reply
@@ -397,12 +391,12 @@ mod test {
         }
     }
 
-    async fn rejection(universe: Option<&HashSet<Symbol>>, name: &str) -> String {
-        let (sub, reply) = Subscribe::new(name.into());
-        let mut router: Router<Symbol, LaneCommand> = Router::new(10);
+    async fn rejection(listed: &InternalHashSet<InstrumentId>, name: &str) -> String {
+        let (sub, reply) = Subscribe::new(test_instrument_for(Venue::BinanceSpot, name).id());
+        let mut router: Router<LaneCommand> = Router::new(10);
         let mut tasks = tokio::task::JoinSet::new();
 
-        handle_subscribe(sub, universe, &mut router, &mut tasks, &ctx()).await;
+        handle_subscribe(sub, listed, &mut router, &mut tasks, &ctx()).await;
 
         assert_eq!(
             router.lane_count(),
@@ -417,84 +411,64 @@ mod test {
     }
 
     #[tokio::test]
-    async fn a_symbol_the_venue_does_not_list_is_rejected_before_a_lane_is_chosen() {
+    async fn an_instrument_the_venue_does_not_currently_list_is_rejected_before_a_lane_is_chosen() {
         let listed = listing(&["btcusd"]);
-        let why = rejection(Some(&listed), "ethusd").await;
+        let why = rejection(&listed, "ethusd").await;
         assert!(why.contains("not listed as tradable"), "{why}");
     }
 
-    /// Fail closed: with no listing in hand there is nothing to check a symbol against, so
-    /// `handle_subscribe` refuses rather than routing on trust. `run` never actually calls it
-    /// in that state - it holds the request until a listing lands - so this is the backstop.
+    /// Fail closed: with nothing listed there is nothing to check an instrument against, so
+    /// `handle_subscribe` refuses rather than routing on trust.
     #[tokio::test]
-    async fn a_subscribe_with_no_listing_at_all_is_refused() {
-        let why = rejection(None, "btcusd").await;
+    async fn a_subscribe_with_nothing_listed_at_all_is_refused() {
+        let why = rejection(&new_internal_set(), "btcusd").await;
         assert!(why.contains("not listed as tradable"), "{why}");
-    }
-
-    #[tokio::test]
-    async fn an_invalid_symbol_is_still_rejected_on_its_own_terms() {
-        let listed = listing(&["btcusd"]);
-        let why = rejection(Some(&listed), "btc-usd").await;
-        assert!(why.contains("invalid symbol"), "{why}");
     }
 
     #[tokio::test]
     async fn a_symbol_dropped_from_a_refresh_is_torn_down() {
         let (tx, mut lane_rx) = mpsc::channel(4);
-        let mut router: Router<Symbol, LaneCommand> = Router::new(10);
+        let mut router: Router<LaneCommand> = Router::new(10);
         let lane = router.insert_lane(tx);
-        router.bind(symbol("btcusd"), lane);
-        router.bind(symbol("lunausd"), lane);
+        let btcusd = test_instrument_for(Venue::BinanceSpot, "btcusd");
+        let lunausd = test_instrument_for(Venue::BinanceSpot, "lunausd");
+        router.bind(btcusd.id(), lane);
+        router.bind(lunausd.id(), lane);
 
         retire_unlisted(&listing(&["btcusd"]), &mut router).await;
 
-        assert!(
-            router.contains(&symbol("btcusd")),
-            "a still-listed symbol stays"
-        );
-        assert!(!router.contains(&symbol("lunausd")));
+        assert!(router.contains(btcusd.id()), "a still-listed symbol stays");
+        assert!(!router.contains(lunausd.id()));
 
         let sent = lane_rx
             .recv()
             .await
             .expect("the lane must be told to drop it");
-        let LaneCommand::Unsubscribe { symbol: dropped } = sent else {
+        let LaneCommand::Unsubscribe {
+            instrument_id: dropped,
+        } = sent
+        else {
             panic!("expected an unsubscribe, got {sent:?}");
         };
-        assert_eq!(dropped, symbol("lunausd"));
+        assert_eq!(dropped, lunausd.id());
     }
 
-    /// The listing is fetched asynchronously, so a subscribe sent the instant the connector
-    /// starts routinely beats it. Refusing those would answer "not tradable" for symbols that
-    /// in fact are, so they wait instead.
-    #[tokio::test(start_paused = true)]
-    async fn a_subscribe_that_beats_the_first_listing_is_served_once_it_lands() {
-        let client = StubRest::always("100").with_route("listing", "btcusd,ethusd");
-        let ws = ScriptedWs::with_fallback(Vec::new(), vec![Incoming::Parks]);
-        let (rx, tx) = create_event_channel();
+    /// The wait queue this used to exercise is gone: an instrument can only reach
+    /// `handle_subscribe` as an already-registered [`Instrument`], so a listed one is accepted
+    /// immediately rather than eventually, once a listing lands, drained from a queue.
+    #[tokio::test]
+    async fn a_listed_instrument_is_accepted_immediately() {
+        let btcusd = test_instrument_for(Venue::BinanceSpot, "btcusd");
+        let listed = listing(&["btcusd"]);
+        let (sub, reply) = Subscribe::new(btcusd.id());
+        let mut router: Router<LaneCommand> = Router::new(10);
+        let mut tasks = tokio::task::JoinSet::new();
 
-        let supervisor = tokio::spawn(run::<TestVenue, StubRest, ScriptedWs>(
-            rx,
-            ConnectorConfig::new(CoreConfig::default(), TestConfig),
-            client,
-            ws,
-        ));
+        handle_subscribe(sub, &listed, &mut router, &mut tasks, &ctx()).await;
 
-        let (event, reply) = Subscribe::new("btcusd".into());
-        tx.send(ConnectorEvent::Subscribe(event));
-
-        let reader: BookReader = tokio::time::timeout(Duration::from_secs(30), reply)
-            .await
-            .expect("the held request must be answered once the listing lands")
-            .unwrap()
-            .expect("btcusd is listed");
+        assert_eq!(router.lane_count(), 1, "a listed instrument opens a lane");
+        let reader: BookReader = reply.await.unwrap().expect("btcusd is listed");
         drop(reader);
-
-        let (ack, acked) = oneshot::channel();
-        tx.send(ConnectorEvent::ShutDown(ack));
-        let _ = tokio::time::timeout(Duration::from_secs(120), acked).await;
-        let _ = tokio::time::timeout(Duration::from_secs(120), supervisor).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -508,9 +482,13 @@ mod test {
             ConnectorConfig::new(CoreConfig::default(), TestConfig),
             client,
             ws,
+            VenueGuard::new(Venue::BinanceSpot),
         ));
 
-        let (event, reply) = Subscribe::new("dogeusd".into());
+        // Interned so the event can carry a real `Instrument`, but never listed by the venue
+        // above - the same shape a delisted instrument would have.
+        let dogeusd = test_instrument_for(Venue::BinanceSpot, "dogeusd");
+        let (event, reply) = Subscribe::new(dogeusd.id());
         tx.send(ConnectorEvent::Subscribe(event));
 
         let why = tokio::time::timeout(Duration::from_secs(30), reply)

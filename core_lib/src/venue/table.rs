@@ -1,32 +1,32 @@
 //! The symbols carried by one connection.
 //!
 //! Two type parameters, both a venue's own: the "ready" half of the slot state machine
-//! ([`Venue::Ready`] - Binance has `Seeded`/`Live`, Bitstamp only `Live`) and the arena its
-//! bootstrapping half buffers parsed diffs into ([`Venue::Pending`]). [`Bootstrap`] used to be
+//! ([`VenueSpec::Ready`] - Binance has `Seeded`/`Live`, Bitstamp only `Live`) and the arena its
+//! bootstrapping half buffers parsed diffs into ([`VenueSpec::Pending`]). [`Bootstrap`] used to be
 //! concrete because every venue buffered the same thing - raw bytes - which is no longer true;
 //! see [`crate::venue::pending`] for why that changed.
 //!
 //! Generic over those two concrete types directly rather than over the venue itself - unlike
 //! [`crate::venue::connection::Connection`]/[`crate::venue::connection::Handler`], nothing here
 //! needs any *other* piece of a venue (its config, its pacer, ...) at the same time, so there is
-//! no reason to name the whole `Venue` trait. Every type below is consequently unbounded: no
-//! `Ready: Venue`, no `P: PendingDiffs`, since a bare type parameter used only as a plain field
+//! no reason to name the whole `VenueSpec` trait. Every type below is consequently unbounded: no
+//! `Ready: VenueSpec`, no `P: PendingDiffs`, since a bare type parameter used only as a plain field
 //! never needs one. The single exception is [`Slot`]'s inherent impl, which needs
 //! `P: PendingDiffs` because [`Slot::reset`] both empties an existing arena and builds a fresh
 //! one for a slot that was not already bootstrapping - an ordinary "this function calls it"
 //! bound, not a trait-shaped one.
 //!
-//! [`Venue::Ready`]: crate::venue::spec::Venue::Ready
-//! [`Venue::Pending`]: crate::venue::spec::Venue::Pending
+//! [`VenueSpec::Ready`]: crate::venue::spec::VenueSpec::Ready
+//! [`VenueSpec::Pending`]: crate::venue::spec::VenueSpec::Pending
 
 use crate::connector::book_publisher::BookPublisher;
 use crate::incremental_book::IncrementalBook;
+use crate::instrument::Instrument;
+use crate::map::{InternalHashMap, new_internal_map};
+use crate::shared_string::SharedString;
 use crate::venue::pending::PendingDiffs;
-use crate::venue::symbol::Symbol;
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use hashbrown::hash_map::Entry;
 use std::time::Instant;
-use crate::map::InternalHashMap;
 
 /// State held while a symbol waits for its REST snapshot.
 ///
@@ -66,16 +66,14 @@ impl<Ready, P> SlotState<Ready, P> {
     }
 }
 
-/// One symbol's book, publish sink, and bootstrap state, as carried on a connection.
+/// One instrument's book, publish sink, and bootstrap state, as carried on a connection.
 ///
 /// `wire_name` is the name this venue's frames echo back (a Binance stream name, a Bitstamp
-/// channel name). It is kept here rather than derived, because it is what a
-/// subscribe/resubscribe needs and because [`SlotTable`] itself is keyed by `symbol`, not by
-/// this string - see the table's doc for why.
+/// channel name); it is also [`SlotTable`]'s key - see that type's doc for why.
 #[derive(Debug)]
 pub struct Slot<Ready, P> {
-    pub symbol: Symbol,
-    pub wire_name: Box<str>,
+    pub instrument: Instrument,
+    pub wire_name: SharedString,
     pub book: IncrementalBook,
     pub publisher: BookPublisher,
     pub state: SlotState<Ready, P>,
@@ -126,15 +124,15 @@ impl<Ready, P: PendingDiffs> Slot<Ready, P> {
     }
 }
 
-/// The symbols carried by one connection, keyed by [`Symbol`] rather than by wire name.
+/// The symbols carried by one connection, keyed by wire name rather than by [`Instrument`].
 ///
-/// A wire frame names a *stream/channel* (e.g. `btcusdt@depth@100ms`), but the table is keyed
-/// by the *symbol* (`btcusdt`) that name carries: `Symbol` implements
-/// [`std::borrow::Borrow<str>`], so a lookup can be done straight off the symbol prefix a
-/// decoder pulls out of the wire name, with no `Symbol` allocated per frame.
+/// A wire frame names a *stream/channel* (e.g. `btcusdt@depth@100ms`), the same string this
+/// connection subscribed with, so keying on it lets a decoder resolve a frame straight off the
+/// bytes it already has - via [`std::borrow::Borrow<str>`] - with nothing built or looked up
+/// twice.
 ///
-/// Dedup is connector-wide, not per-socket: the supervisor's routing table keeps a symbol from
-/// being routed to two connections in the first place, so this table's own check is a
+/// Dedup is connector-wide, not per-socket: the supervisor's routing table keeps an instrument
+/// from being routed to two connections in the first place, so this table's own check is a
 /// defensive backstop rather than the primary guard.
 ///
 /// Hashed with `FxHasher` rather than the standard `SipHash-1-3`: this lookup is on the
@@ -145,13 +143,13 @@ impl<Ready, P: PendingDiffs> Slot<Ready, P> {
 /// come from clients.
 #[derive(Debug)]
 pub struct SlotTable<Ready, P> {
-    by_symbol: InternalHashMap<Symbol, Slot<Ready, P>>,
+    by_wire_name: InternalHashMap<SharedString, Slot<Ready, P>>,
 }
 
 impl<Ready, P> Default for SlotTable<Ready, P> {
     fn default() -> Self {
         Self {
-            by_symbol: HashMap::default(),
+            by_wire_name: new_internal_map(),
         }
     }
 }
@@ -161,7 +159,7 @@ impl<Ready, P> SlotTable<Ready, P> {
     /// `is_empty` to pair it with: nothing asks that question, and the count is only ever a
     /// log field.
     pub fn symbol_count(&self) -> usize {
-        self.by_symbol.len()
+        self.by_wire_name.len()
     }
 
     /// Adds a symbol.
@@ -172,9 +170,9 @@ impl<Ready, P> SlotTable<Ready, P> {
     /// rather than leak it.
     ///
     /// # Errors
-    /// The boxed `slot` back, unchanged, if `slot.symbol` is already present.
+    /// The boxed `slot` back, unchanged, if `slot.wire_name` is already present.
     pub fn insert(&mut self, slot: Slot<Ready, P>) -> Result<(), Box<Slot<Ready, P>>> {
-        match self.by_symbol.entry(slot.symbol.clone()) {
+        match self.by_wire_name.entry(slot.wire_name.clone()) {
             Entry::Occupied(_) => Err(Box::new(slot)),
             Entry::Vacant(vac) => {
                 vac.insert(slot);
@@ -183,23 +181,22 @@ impl<Ready, P> SlotTable<Ready, P> {
         }
     }
 
-    pub fn get_mut(&mut self, symbol: &str) -> Option<&mut Slot<Ready, P>> {
-        self.by_symbol.get_mut(symbol)
+    pub fn get_mut(&mut self, wire_name: &str) -> Option<&mut Slot<Ready, P>> {
+        self.by_wire_name.get_mut(wire_name)
     }
 
     /// Removes a symbol's slot, if this connection carries it. Dropping the returned slot
     /// drops its `BookPublisher`, which is what tells the reader the stream is gone.
-    pub fn remove(&mut self, symbol: &Symbol) -> Option<Slot<Ready, P>> {
-        self.by_symbol.remove(symbol.as_str())
+    pub fn remove(&mut self, wire_name: &str) -> Option<Slot<Ready, P>> {
+        self.by_wire_name.remove(wire_name)
     }
 
     pub fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = &mut Slot<Ready, P>> {
-        self.by_symbol.values_mut()
+        self.by_wire_name.values_mut()
     }
 
-    /// Every subscribed wire name, for the reconnect resubscribe. Built from the slots rather
-    /// than the keys, since the keys are symbols, not wire names.
-    pub fn wire_names(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.by_symbol.values().map(|s| s.wire_name.as_ref())
+    /// Every subscribed wire name, for the reconnect resubscribe.
+    pub fn wire_names(&self) -> impl ExactSizeIterator<Item = &SharedString> {
+        self.by_wire_name.keys()
     }
 }

@@ -37,6 +37,11 @@ heapless = "0.9.3"
 
 [dev-dependencies]
 md_server = { path = ".", features = ["test-util"] }
+# The same crate as the dependency above, with the in-memory instrument registrar
+# (`core_lib::venue::test_util`) turned on - `#[cfg(test)]`-gated items in `core_lib` are not
+# visible from here, and this crate's own tests need to register instruments the way a
+# connector's listing refresh would.
+core_lib = { path = "../core_lib", features = ["test_util"] }
 # The same crate as the dependency above, with `start_paused` for the sweep tests. Resolver 3
 # keeps this feature out of a plain build.
 tokio = { version = "1.53.1", features = [

@@ -1,39 +1,42 @@
 use crate::connector::book_publisher::BookReader;
+use crate::instrument::InstrumentId;
 
 #[derive(Debug)]
 pub struct Subscribe {
-    symbol: Box<str>,
+    instrument_id: InstrumentId,
     tx: oneshot::Sender<anyhow::Result<BookReader>>,
 }
 
 impl Subscribe {
-    pub fn new(symbol: Box<str>) -> (Self, oneshot::Receiver<anyhow::Result<BookReader>>) {
+    pub fn new(
+        instrument_id: InstrumentId,
+    ) -> (Self, oneshot::Receiver<anyhow::Result<BookReader>>) {
         let (tx, rx) = oneshot::channel();
-        (Self { symbol, tx }, rx)
+        (Self { instrument_id, tx }, rx)
     }
 
-    pub fn into_parts(self) -> (Box<str>, oneshot::Sender<anyhow::Result<BookReader>>) {
-        (self.symbol, self.tx)
+    pub fn into_parts(self) -> (InstrumentId, oneshot::Sender<anyhow::Result<BookReader>>) {
+        (self.instrument_id, self.tx)
     }
 }
 
-/// A request to tear down one symbol's stream.
+/// A request to tear down one instrument's stream.
 ///
 /// Fire-and-forget: no reply channel, because the teardown is already observable through the
 /// book channel - the publisher's drop hands the reader an empty book and then `None`. The
 /// field is private so a reply channel could be added later without changing call sites.
 #[derive(Debug)]
 pub struct Unsubscribe {
-    symbol: Box<str>,
+    instrument_id: InstrumentId,
 }
 
 impl Unsubscribe {
-    pub fn new(symbol: Box<str>) -> Self {
-        Self { symbol }
+    pub fn new(instrument_id: InstrumentId) -> Self {
+        Self { instrument_id }
     }
 
-    pub fn into_symbol(self) -> Box<str> {
-        self.symbol
+    pub fn into_instrument(self) -> InstrumentId {
+        self.instrument_id
     }
 }
 

@@ -8,6 +8,7 @@
 //! drain one per tick, without ever blocking the read half.
 
 use core_lib::net::WsConnector;
+use core_lib::shared_string::SharedString;
 use core_lib::venue::{ControlPacer, Method, SessionError, ws_err};
 use futures_util::SinkExt as _;
 use std::collections::VecDeque;
@@ -19,10 +20,10 @@ const CONTROL_GAP: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
 pub struct QueuePacer {
-    queue: VecDeque<(Method, Box<str>)>,
+    queue: VecDeque<(Method, SharedString)>,
     /// The channel of the frame most recently sent, for [`ControlPacer::names_for`]. `Option`
     /// rather than a `Vec` because exactly one channel goes out per frame.
-    last_sent: Option<Box<str>>,
+    last_sent: Option<SharedString>,
     /// When the front of the queue may next be sent. Advances by [`CONTROL_GAP`] every time a
     /// frame goes out, regardless of whether the queue emptied in between - see
     /// [`ControlPacer::next_deadline`].
@@ -40,7 +41,7 @@ impl Default for QueuePacer {
 }
 
 impl ControlPacer for QueuePacer {
-    fn enqueue(&mut self, method: Method, name: Box<str>) {
+    fn enqueue(&mut self, method: Method, name: SharedString) {
         self.queue.push_back((method, name));
     }
 
@@ -81,7 +82,7 @@ impl ControlPacer for QueuePacer {
     /// channel, so the only thing that can be said is which channel the last frame named. It
     /// is a good guess because exactly one frame goes out per [`CONTROL_GAP`] and Bitstamp
     /// answers promptly, and it is only ever used to enrich a log line.
-    fn names_for(&self, _id: Option<u64>) -> &[Box<str>] {
+    fn names_for(&self, _id: Option<u64>) -> &[SharedString] {
         self.last_sent.as_slice()
     }
 }

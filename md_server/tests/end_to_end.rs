@@ -11,6 +11,8 @@
     reason = "an integration test target is checked against the whole manifest's dependencies, most of which only the library target itself uses"
 )]
 
+use core_lib::Venue;
+use core_lib::venue::test_util::test_instrument_for;
 use md_proto::md::v1 as proto;
 use md_server::test_util::serve;
 use md_server::test_util::{FakeConnectors, FakeSource, book};
@@ -21,7 +23,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 
-const SYMBOL: &str = "btcusdt";
+/// Registers `name` as tradable on `venue`, the way a connector's own listing refresh would -
+/// the wire contract is case-sensitive now, so a test has to name exactly what it registers.
+fn list(venue: Venue, name: &str) {
+    let _ = test_instrument_for(venue, name);
+}
 
 /// A server on a loopback port, with the handle a test needs to stop it.
 struct Running {
@@ -106,8 +112,9 @@ async fn a_client_streams_a_book_over_the_wire() {
     let source = Arc::new(FakeSource::default());
     let server = start(&source).await;
 
-    // Mixed case on purpose: the request names the symbol however the client likes.
-    let mut sock = subscribe(server.addr, "binance_spot", "BTCUSDT").await;
+    // The wire contract is case-sensitive: a client sends the venue's own spelling.
+    list(Venue::BinanceSpot, "WIREBTCUSDT");
+    let mut sock = subscribe(server.addr, "binance_spot", "WIREBTCUSDT").await;
     let mut buf = Vec::new();
     framing::read_response(&mut sock, &mut buf)
         .await
@@ -115,7 +122,7 @@ async fn a_client_streams_a_book_over_the_wire() {
         .expect("the fake source accepts every symbol");
     opening_snapshot(&mut sock, &mut buf).await;
 
-    source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[(99.5, 2.0)]));
+    source.publish("WIREBTCUSDT", &book(&[(100.5, 1.25)], &[(99.5, 2.0)]));
 
     let body = next_book(&mut sock, &mut buf).await;
     assert_eq!(body.asks.len(), 1);
@@ -135,9 +142,14 @@ async fn a_multi_pair_request_streams_the_first_pairs_book() {
     let source = Arc::new(FakeSource::default());
     let server = start(&source).await;
 
+    list(Venue::BinanceSpot, "MULTIBTCUSDT");
+    list(Venue::Bitstamp, "multibtcusd");
     let mut sock = subscribe_pairs(
         server.addr,
-        &[("binance_spot", "BTCUSDT"), ("bitstamp", "btcusd")],
+        &[
+            ("binance_spot", "MULTIBTCUSDT"),
+            ("bitstamp", "multibtcusd"),
+        ],
     )
     .await;
     let mut buf = Vec::new();
@@ -147,12 +159,12 @@ async fn a_multi_pair_request_streams_the_first_pairs_book() {
         .expect("the fake source accepts every symbol");
     opening_snapshot(&mut sock, &mut buf).await;
 
-    source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[(99.5, 2.0)]));
+    source.publish("MULTIBTCUSDT", &book(&[(100.5, 1.25)], &[(99.5, 2.0)]));
 
     let body = next_book(&mut sock, &mut buf).await;
     assert_eq!(
         body.asks[0].venue, "binance_spot",
-        "only the first pair - binance_spot/BTCUSDT - is served today"
+        "only the first pair - binance_spot/MULTIBTCUSDT - is served today"
     );
 
     drop(sock);
@@ -166,7 +178,7 @@ async fn a_refused_request_says_why_and_ends_the_connection() {
     let source = Arc::new(FakeSource::default());
     let server = start(&source).await;
 
-    let mut sock = subscribe(server.addr, "nope", SYMBOL).await;
+    let mut sock = subscribe(server.addr, "nope", "REFUSEDBTCUSDT").await;
     let mut buf = Vec::new();
     let rejected = framing::read_response(&mut sock, &mut buf)
         .await
@@ -196,8 +208,10 @@ async fn two_symbols_are_two_connections() {
     let source = Arc::new(FakeSource::default());
     let server = start(&source).await;
 
-    let mut btc = subscribe(server.addr, "binance_spot", SYMBOL).await;
-    let mut eth = subscribe(server.addr, "binance_spot", "ethusdt").await;
+    list(Venue::BinanceSpot, "twobtcusdt");
+    list(Venue::BinanceSpot, "twoethusdt");
+    let mut btc = subscribe(server.addr, "binance_spot", "twobtcusdt").await;
+    let mut eth = subscribe(server.addr, "binance_spot", "twoethusdt").await;
     let (mut btc_buf, mut eth_buf) = (Vec::new(), Vec::new());
     framing::read_response(&mut btc, &mut btc_buf)
         .await
@@ -210,8 +224,8 @@ async fn two_symbols_are_two_connections() {
     opening_snapshot(&mut btc, &mut btc_buf).await;
     opening_snapshot(&mut eth, &mut eth_buf).await;
 
-    source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[]));
-    source.publish("ethusdt", &book(&[(3.5, 2.0)], &[]));
+    source.publish("twobtcusdt", &book(&[(100.5, 1.25)], &[]));
+    source.publish("twoethusdt", &book(&[(3.5, 2.0)], &[]));
 
     assert_eq!(next_book(&mut btc, &mut btc_buf).await.asks[0].price, 100.5);
     assert_eq!(next_book(&mut eth, &mut eth_buf).await.asks[0].price, 3.5);
@@ -228,7 +242,8 @@ async fn shutdown_ends_an_attached_client() {
     let source = Arc::new(FakeSource::default());
     let server = start(&source).await;
 
-    let mut sock = subscribe(server.addr, "binance_spot", SYMBOL).await;
+    list(Venue::BinanceSpot, "shutdownbtcusdt");
+    let mut sock = subscribe(server.addr, "binance_spot", "shutdownbtcusdt").await;
     let mut buf = Vec::new();
     framing::read_response(&mut sock, &mut buf)
         .await

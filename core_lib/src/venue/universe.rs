@@ -1,4 +1,4 @@
-//! The set of symbols a venue currently lists as tradable, refreshed on the hour.
+//! The set of instruments a venue currently lists as tradable, refreshed on the hour.
 //!
 //! A symbol nobody trades used to be discovered the hard way: the subscribe went out, the venue
 //! rejected the control frame, and nothing decoded that rejection - the slot sat there
@@ -11,12 +11,13 @@
 //! fetched, leaves the last good one in place: a listing endpoint having a bad minute must not
 //! take every symbol down with it.
 
+use crate::connector::InstrumentRegistrar;
+use crate::instrument::{InstrumentId};
+use crate::map::InternalHashSet;
 use crate::net::{RequestBuilder, Response as _, RestClient};
 use crate::venue::ConnectorConfig;
 use crate::venue::backoff::Backoff;
-use crate::venue::spec::Venue;
-use crate::venue::symbol::Symbol;
-use std::collections::HashSet;
+use crate::venue::spec::VenueSpec;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
@@ -41,10 +42,10 @@ pub enum ListingErrorImpl<T, U, E> {
 pub type ListingError<V, R> = ListingErrorImpl<
     <<R as RestClient>::Builder as RequestBuilder>::Error,
     <<<R as RestClient>::Builder as RequestBuilder>::Response as crate::net::Response>::Error,
-    <V as Venue>::SymbolsError,
+    <V as VenueSpec>::SymbolsError,
 >;
 
-/// Fetches the venue's listing once.
+/// Fetches the venue's listing once, registering every decoded instrument through `reg`.
 ///
 /// Takes the venue's extras alone, since building the URL and decoding the body is all this
 /// does - unlike [`refresh_loop`], which also paces itself off [`CoreConfig`] and so needs the
@@ -55,9 +56,13 @@ pub type ListingError<V, R> = ListingErrorImpl<
 /// # Errors
 /// [`ListingError`] if the request fails, the response is a non-success status, or the body
 /// does not decode.
-pub async fn fetch<V, R>(client: &R, cfg: &V::Config) -> Result<HashSet<Symbol>, ListingError<V, R>>
+pub async fn fetch<V, R>(
+    client: &R,
+    cfg: &V::Config,
+    reg: &impl InstrumentRegistrar,
+) -> Result<InternalHashSet<InstrumentId>, ListingError<V, R>>
 where
-    V: Venue,
+    V: VenueSpec,
     R: RestClient,
 {
     let body = client
@@ -71,7 +76,7 @@ where
         .await
         .map_err(ListingErrorImpl::HttpResponse)?;
 
-    V::parse_symbols(body).map_err(ListingErrorImpl::Decode)
+    V::parse_symbols(body, reg).map_err(ListingErrorImpl::Decode)
 }
 
 /// Fetches the listing now, then again at every wall-clock hour, sending each success to the
@@ -80,23 +85,19 @@ where
 /// Returns when the supervisor drops its receiver, which is the only stop signal there is.
 /// A failure never ends the loop and never sends: the supervisor keeps whatever listing it
 /// already had.
-#[expect(
-    clippy::implicit_hasher,
-    reason = "the supervisor on the other end of this channel owns the concrete set; a hasher \
-              parameter here would only propagate through every caller for nothing"
-)]
 pub async fn refresh_loop<V, R>(
     cfg: ConnectorConfig<V::Config>,
     client: R,
-    tx: mpsc::Sender<HashSet<Symbol>>,
+    reg: impl InstrumentRegistrar + 'static,
+    tx: mpsc::Sender<InternalHashSet<InstrumentId>>,
 ) where
-    V: Venue,
+    V: VenueSpec,
     R: RestClient,
 {
     let mut backoff = Backoff::new(cfg.core().max_backoff());
 
     loop {
-        match fetch::<V, R>(&client, cfg.inner()).await {
+        match fetch::<V, R>(&client, cfg.inner(), &reg).await {
             Ok(listed) => {
                 tracing::debug!(symbols = listed.len(), "symbol listing refreshed");
                 if tx.send(listed).await.is_err() {

@@ -1,33 +1,32 @@
-//! Turning a `SubscribeBookRequest` into the [`Key`] its broadcaster is filed under, or into
-//! the reason it cannot be one.
+//! Turning a `SubscribeBookRequest` into the [`Instrument`] its broadcaster is filed under, or
+//! into the reason it cannot be one.
 //!
 //! Separate from the transport on purpose: it reports a [`RejectCode`] the wire protocol can
 //! carry, rather than being entangled with how a refusal is written.
 
-use crate::registry::Key;
 use crate::venue::Venue;
+use core_lib::instrument::Instrument;
 use md_proto::md::v1::SubscribeBookRequest;
 use md_wire::framing::{RejectCode, Rejected};
 
 /// Longest symbol name a request may carry.
 ///
-/// Nothing upstream imposes a length limit - `core_lib`'s `Symbol` only requires non-empty
-/// ASCII alphanumerics - so this is purely a bound on what a hostile request can make the
-/// server allocate and log. No venue symbol comes close.
+/// Nothing upstream imposes a length limit, so this is purely a bound on what a hostile request
+/// can make the server allocate and log. No venue symbol comes close.
 const MAX_SYMBOL_LEN: usize = 32;
 
-/// Validates and normalises `request` into the key its broadcaster is filed under.
+/// Validates `request` and resolves it to the instrument its broadcaster is filed under.
 ///
 /// Every pair in `request.pairs` is validated, but only the first is served today - merging
 /// the rest into one book is the next stage.
 ///
 /// # Errors
 ///
-/// [`RejectCode::InvalidArgument`] for an empty pair list, an unknown venue, a symbol no
-/// connector would accept, or a pair that duplicates one earlier in the list (after
-/// normalisation). Nothing here can fail any other way: whether the venue *lists* the symbol
-/// is the connector's answer, not this function's.
-pub(crate) fn key_of(request: &SubscribeBookRequest) -> Result<Key, Rejected> {
+/// [`RejectCode::InvalidArgument`] for an empty pair list, an unknown venue, a symbol shaped
+/// wrong on its own terms, a symbol no venue lists as tradable, or a pair that duplicates one
+/// earlier in the list. The listing check is a plain registry lookup - no round trip to a
+/// connector - so an unlisted symbol is refused right here, in the handshake.
+pub(crate) fn key_of(request: &SubscribeBookRequest) -> Result<Instrument, Rejected> {
     if request.pairs.is_empty() {
         return Err(Rejected::new(
             RejectCode::InvalidArgument,
@@ -35,7 +34,7 @@ pub(crate) fn key_of(request: &SubscribeBookRequest) -> Result<Key, Rejected> {
         ));
     }
 
-    let mut seen: Vec<Key> = Vec::with_capacity(request.pairs.len());
+    let mut seen: Vec<Instrument> = Vec::with_capacity(request.pairs.len());
     for pair in &request.pairs {
         let Some(venue) = Venue::parse(&pair.venue) else {
             return Err(Rejected::new(
@@ -43,15 +42,25 @@ pub(crate) fn key_of(request: &SubscribeBookRequest) -> Result<Key, Rejected> {
                 format!("unknown venue {:?}", pair.venue).into_boxed_str(),
             ));
         };
-        let key = Key::new(venue, normalise_symbol(&pair.symbol)?);
-        if seen.contains(&key) {
+        let name = normalise_symbol(&pair.symbol)?;
+        let Some(instrument) = Instrument::lookup(venue, name) else {
             return Err(Rejected::new(
                 RejectCode::InvalidArgument,
-                format!("duplicate pair {}/{}", key.venue().as_str(), key.symbol())
-                    .into_boxed_str(),
+                format!("{name} is not listed as tradable on {}", venue.as_str()).into_boxed_str(),
+            ));
+        };
+        if seen.contains(&instrument) {
+            return Err(Rejected::new(
+                RejectCode::InvalidArgument,
+                format!(
+                    "duplicate pair {}/{}",
+                    instrument.venue().as_str(),
+                    instrument.name()
+                )
+                .into_boxed_str(),
             ));
         }
-        seen.push(key);
+        seen.push(instrument);
     }
 
     // The rest are validated above and dropped here; merging them into one book is the next
@@ -59,11 +68,10 @@ pub(crate) fn key_of(request: &SubscribeBookRequest) -> Result<Key, Rejected> {
     Ok(seen.into_iter().next().expect("checked non-empty above"))
 }
 
-/// Lowercases `raw` after checking it is something a connector would accept.
-///
-/// Lowercase is the connector's own canonical form, so normalising here is what keeps
-/// `BTCUSDT` and `btcusdt` on one broadcaster instead of racing for one subscription.
-fn normalise_symbol(raw: &str) -> Result<Box<str>, Rejected> {
+/// Checks `raw` is something a connector would accept, without allocating: the wire contract is
+/// case-sensitive now - a client sends a venue's own spelling - so there is nothing left to
+/// normalise, only to probe the registry with.
+fn normalise_symbol(raw: &str) -> Result<&str, Rejected> {
     if raw.is_empty() || raw.len() > MAX_SYMBOL_LEN {
         return Err(Rejected::new(
             RejectCode::InvalidArgument,
@@ -76,13 +84,14 @@ fn normalise_symbol(raw: &str) -> Result<Box<str>, Rejected> {
             Box::from("symbol must be ASCII alphanumeric"),
         ));
     }
-    Ok(raw.to_ascii_lowercase().into_boxed_str())
+    Ok(raw)
 }
 
 #[cfg(test)]
 mod test {
     use super::{MAX_SYMBOL_LEN, key_of, normalise_symbol};
     use crate::venue::Venue;
+    use core_lib::venue::test_util::test_instrument_for;
     use md_proto::md::v1::{Pair, SubscribeBookRequest};
     use md_wire::framing::RejectCode;
 
@@ -99,22 +108,11 @@ mod test {
         }
     }
 
-    /// Two clients naming the same symbol in different cases have to land on one broadcaster:
-    /// every connector keys its subscriptions by the lowercase form, and a second subscribe
-    /// for one symbol is rejected outright.
     #[test]
-    fn a_symbol_is_normalised_to_the_form_the_connector_uses() {
+    fn a_shaped_ok_symbol_probes_without_allocating() {
         assert_eq!(
-            normalise_symbol("BTCUSDT")
-                .expect("a valid symbol")
-                .as_ref(),
-            "btcusdt"
-        );
-        assert_eq!(
-            normalise_symbol("btcusdt")
-                .expect("a valid symbol")
-                .as_ref(),
-            "btcusdt"
+            normalise_symbol("BTCUSDT").expect("a valid symbol"),
+            "BTCUSDT"
         );
     }
 
@@ -142,10 +140,10 @@ mod test {
     }
 
     #[test]
-    fn a_whole_request_resolves_to_the_key_its_broadcaster_uses() {
-        let key = key_of(&asking("BINANCE_SPOT", "BTCUSDT")).expect("a valid request");
-        assert_eq!(key.venue(), Venue::BinanceSpot);
-        assert_eq!(key.symbol(), "btcusdt");
+    fn a_whole_request_resolves_to_the_instrument_its_broadcaster_uses() {
+        let registered = test_instrument_for(Venue::BinanceSpot, "BTCUSDTRESOLVETEST");
+        let instrument = key_of(&asking("BINANCE_SPOT", "BTCUSDTRESOLVETEST")).expect("listed");
+        assert_eq!(instrument, registered);
 
         let rejection = key_of(&asking("kraken", "btcusdt")).expect_err("an unknown venue");
         assert_eq!(rejection.code(), RejectCode::InvalidArgument);
@@ -154,6 +152,22 @@ mod test {
             "the reason names the venue that was asked for, got {:?}",
             rejection.reason()
         );
+    }
+
+    /// The wire contract is case-sensitive: a client must send the venue's own spelling.
+    #[test]
+    fn a_symbol_in_the_wrong_case_is_refused() {
+        let _ = test_instrument_for(Venue::BinanceSpot, "CASETEST");
+        let rejection = key_of(&asking("binance_spot", "casetest")).expect_err("wrong-case symbol");
+        assert_eq!(rejection.code(), RejectCode::InvalidArgument);
+    }
+
+    #[test]
+    fn an_unlisted_symbol_is_refused_with_no_round_trip() {
+        let rejection = key_of(&asking("binance_spot", "NEVERLISTEDXYZ"))
+            .expect_err("nothing has ever registered this name");
+        assert_eq!(rejection.code(), RejectCode::InvalidArgument);
+        assert!(rejection.reason().contains("not listed"));
     }
 
     #[test]
@@ -165,44 +179,39 @@ mod test {
 
     #[test]
     fn a_request_names_the_first_pairs_key() {
+        let binance = test_instrument_for(Venue::BinanceSpot, "FIRSTPAIRTEST");
+        let _bitstamp = test_instrument_for(Venue::Bitstamp, "firstpairtest2");
         let request = SubscribeBookRequest {
-            pairs: vec![pair("binance_spot", "BTCUSDT"), pair("bitstamp", "btcusd")],
+            pairs: vec![
+                pair("binance_spot", "FIRSTPAIRTEST"),
+                pair("bitstamp", "firstpairtest2"),
+            ],
         };
-        let key = key_of(&request).expect("a valid request");
-        assert_eq!(key.venue(), Venue::BinanceSpot);
-        assert_eq!(key.symbol(), "btcusdt");
+        let instrument = key_of(&request).expect("a valid request");
+        assert_eq!(instrument, binance);
     }
 
     #[test]
     fn a_duplicate_pair_rejects_the_whole_request() {
+        let _ = test_instrument_for(Venue::BinanceSpot, "DUPTEST");
         let request = SubscribeBookRequest {
             pairs: vec![
-                pair("binance_spot", "btcusdt"),
-                pair("binance_spot", "btcusdt"),
+                pair("binance_spot", "DUPTEST"),
+                pair("binance_spot", "DUPTEST"),
             ],
         };
         let rejection = key_of(&request).expect_err("a duplicate pair");
         assert_eq!(rejection.code(), RejectCode::InvalidArgument);
     }
 
-    /// Two pairs that differ only in case still normalise to one key, and are still a
-    /// duplicate.
-    #[test]
-    fn a_duplicate_pair_is_caught_after_case_normalisation() {
-        let request = SubscribeBookRequest {
-            pairs: vec![
-                pair("BINANCE_SPOT", "BTCUSDT"),
-                pair("binance_spot", "btcusdt"),
-            ],
-        };
-        let rejection = key_of(&request).expect_err("a case-insensitive duplicate");
-        assert_eq!(rejection.code(), RejectCode::InvalidArgument);
-    }
-
     #[test]
     fn an_invalid_second_pair_rejects_the_whole_request() {
+        let _ = test_instrument_for(Venue::BinanceSpot, "SECONDPAIRTEST");
         let request = SubscribeBookRequest {
-            pairs: vec![pair("binance_spot", "btcusdt"), pair("kraken", "btcusd")],
+            pairs: vec![
+                pair("binance_spot", "SECONDPAIRTEST"),
+                pair("kraken", "btcusd"),
+            ],
         };
         let rejection = key_of(&request).expect_err("the second pair is unusable");
         assert_eq!(rejection.code(), RejectCode::InvalidArgument);

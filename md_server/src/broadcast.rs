@@ -7,11 +7,11 @@
 //! [`crate::session`] for the write state machine and what backpressure does to it.
 
 use crate::encode::{BookEncoder, BufferProvider};
-use crate::registry::Key;
 use crate::registry::events::{Claim, RegistryTx};
 use crate::session::{Session, SessionCtx};
 use bytes::{Bytes, BytesMut};
 use core_lib::connector::book_publisher::BookReader;
+use core_lib::instrument::Instrument;
 use md_wire::framing::{self, RejectCode};
 use std::future::poll_fn;
 use std::sync::Arc;
@@ -180,7 +180,7 @@ enum Wake<S> {
 /// Owns one symbol's [`BookReader`] and every client socket attached to it.
 #[derive(Debug)]
 pub(crate) struct Broadcaster<S> {
-    key: Key,
+    key: Instrument,
     reader: BookReader,
     /// One entry per attached client, written to in order on every update.
     sessions: Vec<Session<S>>,
@@ -208,7 +208,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcaster<S> {
     /// last of them is dropped, which is on the way out of this function.
     pub(crate) async fn start(
         registry: RegistryTx<S>,
-        key: Key,
+        key: Instrument,
         mut joins: mpsc::UnboundedReceiver<Join<S>>,
         pending_joins: Arc<AtomicUsize>,
         subscribed: oneshot::Receiver<anyhow::Result<BookReader>>,
@@ -218,7 +218,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcaster<S> {
             Ok(Err(err)) => {
                 tracing::warn!(
                     venue = key.venue().as_str(),
-                    symbol = key.symbol(),
+                    symbol = key.name(),
                     %err,
                     "subscribe rejected"
                 );
@@ -367,10 +367,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcaster<S> {
         }
     }
 
-    /// Names this broadcaster to the registry. The `Key` clone is one allocation on a path
-    /// taken only when this task is stopping or thinks it might be.
+    /// Names this broadcaster to the registry. `Instrument` is `Copy`, so this costs nothing.
     fn claim(&self) -> Claim {
-        Claim::new(self.key.clone(), Arc::clone(&self.pending_joins))
+        Claim::new(self.key, Arc::clone(&self.pending_joins))
     }
 }
 
@@ -424,22 +423,23 @@ async fn drain_joins<S: AsyncRead + AsyncWrite + Unpin>(
 mod test {
     use super::SESSION_SWEEP;
     use crate::encode::BufferProvider;
-    use crate::registry::Key;
     use crate::registry::harness::{Harness, registry_for};
     use crate::session::peer::{Client, connected, connected_congested};
     use crate::test_util::{FakeSource, book};
     use crate::transport::mock::{MockControl, MockStream};
     use crate::venue::Venue;
     use bytes::BytesMut;
+    use core_lib::instrument::Instrument;
+    use core_lib::venue::test_util::test_instrument_for;
     use md_proto::md::v1 as proto;
     use md_wire::framing::LENGTH_PREFIX;
     use std::sync::Arc;
     use std::time::Duration;
 
-    const SYMBOL: &str = "btcusdt";
+    const SYMBOL: &str = "btcusdt-broadcast-test";
 
-    fn key() -> Key {
-        Key::new(Venue::BinanceSpot, SYMBOL.into())
+    fn key() -> Instrument {
+        test_instrument_for(Venue::BinanceSpot, SYMBOL)
     }
 
     /// Subscribes one client, reads its acceptance header and its opening snapshot, leaving it
@@ -459,9 +459,7 @@ mod test {
 
     /// The same, but also hands back the [`MockControl`] so a test can watch
     /// flushes on this connection.
-    async fn attach_congested_watched(
-        harness: &Harness,
-    ) -> (Client, MockControl) {
+    async fn attach_congested_watched(harness: &Harness) -> (Client, MockControl) {
         let (mut client, server) = connected_congested();
         let control = server.control();
         hand_over(harness, server).await;
@@ -473,10 +471,7 @@ mod test {
         (client, control)
     }
 
-    async fn attach_over(
-        harness: &Harness,
-        connection: (Client, MockStream),
-    ) -> Client {
+    async fn attach_over(harness: &Harness, connection: (Client, MockStream)) -> Client {
         let (mut client, server) = connection;
         hand_over(harness, server).await;
         client
@@ -841,7 +836,7 @@ mod test {
 
         assert_eq!(
             source.unsubscribed(),
-            vec![Box::from(SYMBOL)],
+            vec![SYMBOL],
             "the last client leaving releases the connector subscription"
         );
         assert!(!is_registered(&harness).await);

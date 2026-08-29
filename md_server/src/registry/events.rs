@@ -7,7 +7,8 @@
 //! an answer carry an `oneshot::Sender` for it; the ones that do not are fire-and-forget,
 //! and are still ordered against everything else by the queue.
 
-use crate::registry::{Key, Refused};
+use crate::registry::Refused;
+use core_lib::instrument::Instrument;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tokio::sync::mpsc;
@@ -20,16 +21,16 @@ use tokio::sync::mpsc;
 /// allocated to name a generation.
 #[derive(Debug)]
 pub(crate) struct Claim {
-    key: Key,
+    key: Instrument,
     pending_joins: Arc<AtomicUsize>,
 }
 
 impl Claim {
-    pub(crate) fn new(key: Key, pending_joins: Arc<AtomicUsize>) -> Self {
+    pub(crate) fn new(key: Instrument, pending_joins: Arc<AtomicUsize>) -> Self {
         Self { key, pending_joins }
     }
 
-    pub(crate) fn key(&self) -> &Key {
+    pub(crate) fn key(&self) -> &Instrument {
         &self.key
     }
 
@@ -44,18 +45,18 @@ impl Claim {
 /// or the venue's own refusal - is written by the broadcaster on the socket itself.
 #[derive(Debug)]
 pub(super) struct Subscribe<S> {
-    key: Key,
+    key: Instrument,
     sock: S,
     reply: oneshot::Sender<Result<(), Refused<S>>>,
 }
 
 impl<S> Subscribe<S> {
-    fn new(key: Key, sock: S) -> (Self, oneshot::Receiver<Result<(), Refused<S>>>) {
+    fn new(key: Instrument, sock: S) -> (Self, oneshot::Receiver<Result<(), Refused<S>>>) {
         let (reply, rx) = oneshot::channel();
         (Self { key, sock, reply }, rx)
     }
 
-    pub(super) fn into_parts(self) -> (Key, S, oneshot::Sender<Result<(), Refused<S>>>) {
+    pub(super) fn into_parts(self) -> (Instrument, S, oneshot::Sender<Result<(), Refused<S>>>) {
         (self.key, self.sock, self.reply)
     }
 }
@@ -94,9 +95,9 @@ pub(super) enum RegistryEvent<S> {
     /// [`RegistryHandle::shutdown`](super::RegistryHandle::shutdown).
     ShutDown,
     #[cfg(test)]
-    IsRegistered(Key, oneshot::Sender<bool>),
+    IsRegistered(Instrument, oneshot::Sender<bool>),
     #[cfg(test)]
-    EntryToken(Key, oneshot::Sender<Option<Arc<AtomicUsize>>>),
+    EntryToken(Instrument, oneshot::Sender<Option<Arc<AtomicUsize>>>),
 }
 
 /// The receiving half, owned by the registry task.
@@ -141,7 +142,11 @@ impl<S> RegistryTx<S> {
     /// The reply carries the socket back only when the registry declined to take it at all.
     /// A reply of `Err` - the task gone, or a handler that panicked on the way - means the
     /// same thing to a caller as a refusal it could not write: drop the connection.
-    pub(crate) fn subscribe(&self, key: Key, sock: S) -> oneshot::Receiver<Result<(), Refused<S>>> {
+    pub(crate) fn subscribe(
+        &self,
+        key: Instrument,
+        sock: S,
+    ) -> oneshot::Receiver<Result<(), Refused<S>>> {
         let (event, rx) = Subscribe::new(key, sock);
         self.send(RegistryEvent::Subscribe(event));
         rx
@@ -177,14 +182,17 @@ impl<S> RegistryTx<S> {
     }
 
     #[cfg(test)]
-    pub(crate) fn is_registered(&self, key: Key) -> oneshot::Receiver<bool> {
+    pub(crate) fn is_registered(&self, key: Instrument) -> oneshot::Receiver<bool> {
         let (reply, rx) = oneshot::channel();
         self.send(RegistryEvent::IsRegistered(key, reply));
         rx
     }
 
     #[cfg(test)]
-    pub(super) fn entry_token(&self, key: Key) -> oneshot::Receiver<Option<Arc<AtomicUsize>>> {
+    pub(super) fn entry_token(
+        &self,
+        key: Instrument,
+    ) -> oneshot::Receiver<Option<Arc<AtomicUsize>>> {
         let (reply, rx) = oneshot::channel();
         self.send(RegistryEvent::EntryToken(key, reply));
         rx

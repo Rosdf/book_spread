@@ -77,7 +77,10 @@ mod shared {
             //    for the counter
             // 2. counter_offset is a multiple of ALIGN = align_of::<Counter>(),
             //    and `ptr` is ALIGN-aligned, so the counter address is aligned
-            #[expect(clippy::cast_ptr_alignment, reason = "counter offset is internally aligned")]
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "counter offset is internally aligned"
+            )]
             unsafe {
                 ptr.add(Self::counter_offset(data_len))
                     .cast::<Counter>()
@@ -136,7 +139,12 @@ mod shared {
             // SAFETY:
             // 1. caller guaranty provides that we are inside allocation
             // 2. ptr + counter_offset(len) is ALIGN-aligned
-            unsafe { self.0.add(Self::counter_offset(len)).cast::<Counter>().as_ref() }
+            unsafe {
+                self.0
+                    .add(Self::counter_offset(len))
+                    .cast::<Counter>()
+                    .as_ref()
+            }
         }
 
         /// # Safety
@@ -184,7 +192,10 @@ pub struct SharedString {
     inner: Inner,
 }
 
-const _: () = assert!(size_of::<SharedString>() == 16, "SharedString should be 16 bytes");
+const _: () = assert!(
+    size_of::<SharedString>() == 16,
+    "SharedString should be 16 bytes"
+);
 
 impl Default for SharedString {
     fn default() -> Self {
@@ -240,8 +251,11 @@ macro_rules! handle_small_or {
                     let len = $st.len() as u8 | INLINE_PREFIX;
                     len_buf[0] = len;
 
-                    return Self { header: len_buf, inner: Inner { inlined: val } };
-                },
+                    return Self {
+                        header: len_buf,
+                        inner: Inner { inlined: val },
+                    };
+                }
                 None => Self::$f($st),
             }
         } else {
@@ -255,7 +269,10 @@ impl SharedString {
         const DATA: NonZeroU64 = NonZeroU64::new(1).unwrap();
         const HEADER: [u8; 8] = [INLINE_PREFIX, 0, 0, 0, 0, 0, 0, 0];
 
-        Self { header: HEADER, inner: Inner { inlined: DATA } }
+        Self {
+            header: HEADER,
+            inner: Inner { inlined: DATA },
+        }
     }
 
     fn from_str(st: &str) -> Self {
@@ -292,7 +309,9 @@ impl SharedString {
 
         Self {
             header: prefix_buf,
-            inner: Inner { shared: ManuallyDrop::new(shared) },
+            inner: Inner {
+                shared: ManuallyDrop::new(shared),
+            },
         }
     }
 
@@ -307,7 +326,9 @@ impl SharedString {
 
         Self {
             header: prefix_buf,
-            inner: Inner { static_str: NonNull::from_ref(st).cast() },
+            inner: Inner {
+                static_str: NonNull::from_ref(st).cast(),
+            },
         }
     }
 
@@ -320,8 +341,8 @@ impl SharedString {
                 let leaked = unsafe { ManuallyDrop::take(&mut self.inner.shared) }.leak();
                 self.inner.static_str = leaked;
                 self.header[0] = (self.header[0] & PREFIX_REMOVED) | STATIC_PREFIX;
-            },
-            Prefix::Static | Prefix::Inline => {},
+            }
+            Prefix::Static | Prefix::Inline => {}
         }
     }
 
@@ -374,7 +395,7 @@ impl SharedString {
                 // SAFETY:
                 // len is passed from the same string
                 unsafe { shared.get(len) }
-            },
+            }
             Prefix::Inline => {
                 // SAFETY:
                 // header is 8 bytes, so offset by 1 is ok
@@ -385,7 +406,7 @@ impl SharedString {
                 // SAFETY:
                 // we got data from valid utf8 string
                 unsafe { std::str::from_utf8_unchecked(buf) }
-            },
+            }
             Prefix::Static => {
                 // SAFETY:
                 // STATIC_PREFIX indicates that we are storing static_str variant
@@ -396,7 +417,7 @@ impl SharedString {
                 // SAFETY:
                 // we stored valid utf8 string
                 unsafe { std::str::from_utf8_unchecked(buf) }
-            },
+            }
         }
     }
 }
@@ -473,20 +494,26 @@ impl Clone for SharedString {
 
                 Self {
                     header: self.header,
-                    inner: Inner { shared: ManuallyDrop::new(shared) },
+                    inner: Inner {
+                        shared: ManuallyDrop::new(shared),
+                    },
                 }
-            },
+            }
             Prefix::Inline => Self {
                 header: self.header,
                 // SAFETY:
                 // INLINE_PREFIX means we have inlined variant
-                inner: Inner { inlined: unsafe { self.inner.inlined } },
+                inner: Inner {
+                    inlined: unsafe { self.inner.inlined },
+                },
             },
             Prefix::Static => Self {
                 header: self.header,
                 // SAFETY:
                 // STATIC_PREFIX means we have static_str variant
-                inner: Inner { static_str: unsafe { self.inner.static_str } },
+                inner: Inner {
+                    static_str: unsafe { self.inner.static_str },
+                },
             },
         }
     }

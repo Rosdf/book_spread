@@ -6,6 +6,7 @@
 //! `bitstamp::pacer` for that side of [`core_lib::venue::ControlPacer`].
 
 use core_lib::net::WsConnector;
+use core_lib::shared_string::SharedString;
 use core_lib::venue::{ControlPacer, Method, SessionError, ws_err};
 use futures_util::SinkExt as _;
 use std::collections::VecDeque;
@@ -34,11 +35,11 @@ const INFLIGHT_IDS: usize = 32;
 
 #[derive(Debug)]
 pub struct BatchPacer {
-    queue: Vec<(Method, Box<str>)>,
+    queue: Vec<(Method, SharedString)>,
     next_control_id: u64,
     /// Ids sent on this socket and the streams each named, oldest first, for
     /// [`ControlPacer::names_for`].
-    in_flight: VecDeque<(u64, Vec<Box<str>>)>,
+    in_flight: VecDeque<(u64, Vec<SharedString>)>,
     /// When the last control frame went out, for [`MIN_CONTROL_GAP`] pacing.
     last_control: Instant,
 }
@@ -60,7 +61,7 @@ impl Default for BatchPacer {
 }
 
 impl ControlPacer for BatchPacer {
-    fn enqueue(&mut self, method: Method, name: Box<str>) {
+    fn enqueue(&mut self, method: Method, name: SharedString) {
         self.queue.push((method, name));
     }
 
@@ -81,7 +82,7 @@ impl ControlPacer for BatchPacer {
             return Ok(());
         }
         let items = std::mem::take(&mut self.queue);
-        let mut run: Vec<Box<str>> = Vec::new();
+        let mut run: Vec<SharedString> = Vec::new();
         let mut run_method: Option<Method> = None;
 
         for (method, name) in items {
@@ -115,7 +116,7 @@ impl ControlPacer for BatchPacer {
 
     /// Binance echoes the request id back on every reply, so a rejection can be attributed
     /// exactly - as long as the id is still one of the last [`INFLIGHT_IDS`] sent.
-    fn names_for(&self, id: Option<u64>) -> &[Box<str>] {
+    fn names_for(&self, id: Option<u64>) -> &[SharedString] {
         let Some(wanted) = id else { return &[] };
         self.in_flight
             .iter()
@@ -131,7 +132,7 @@ impl BatchPacer {
         &mut self,
         stream: &mut W::Stream,
         method: Method,
-        names: &[Box<str>],
+        names: &[SharedString],
     ) -> Result<(), SessionError<W>> {
         for chunk in names.chunks(SUBSCRIBE_CHUNK) {
             if let Some(wait) = MIN_CONTROL_GAP.checked_sub(self.last_control.elapsed()) {
@@ -166,7 +167,7 @@ const fn method_str(method: Method) -> &'static str {
 ///
 /// Stream names are ASCII alphanumerics plus `@`, so none of them needs JSON escaping and this
 /// can be assembled directly instead of going through a serializer.
-fn control_payload(method: Method, id: u64, streams: &[Box<str>]) -> String {
+fn control_payload(method: Method, id: u64, streams: &[SharedString]) -> String {
     let mut out = String::from(r#"{"method":""#);
     out.push_str(method_str(method));
     out.push_str(r#"","params":["#);
@@ -187,6 +188,7 @@ fn control_payload(method: Method, id: u64, streams: &[Box<str>]) -> String {
 #[cfg(test)]
 mod test {
     use super::{BatchPacer, ControlPacer as _, Method, control_payload};
+    use core_lib::shared_string::SharedString;
     use core_lib::venue::test_util::{MockStream, ScriptedWs};
     use tokio_tungstenite::tungstenite::Message;
 
@@ -247,7 +249,7 @@ mod test {
 
     #[test]
     fn control_payload_names_the_method_and_every_stream() {
-        let streams: Vec<Box<str>> = vec!["btcusdt@depth@100ms".into(), "ethusdt@depth".into()];
+        let streams: Vec<SharedString> = vec!["btcusdt@depth@100ms".into(), "ethusdt@depth".into()];
         assert_eq!(
             control_payload(Method::Subscribe, 7, &streams),
             r#"{"method":"SUBSCRIBE","params":["btcusdt@depth@100ms","ethusdt@depth"],"id":7}"#

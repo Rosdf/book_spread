@@ -1,23 +1,25 @@
 //! The trait a venue implements to plug into the generic connection/supervisor machinery in
 //! [`crate::venue::connection`] and [`crate::venue::supervisor`].
 //!
-//! Deliberately absent: `R: RestClient` and `W: WsConnector` appear nowhere in [`Venue`]
+//! Deliberately absent: `R: RestClient` and `W: WsConnector` appear nowhere in [`VenueSpec`]
 //! itself. That is what keeps a venue's decode and sequencing logic - the part worth unit
 //! testing on its own - free of transport generics and independently testable against plain
 //! JSON fixtures, with no socket or HTTP client in sight.
 //!
-//! Absent for the same reason: the shared tuning. [`Venue::Config`] is a venue's own extras
+//! Absent for the same reason: the shared tuning. [`VenueSpec::Config`] is a venue's own extras
 //! alone, and the connection loop keeps [`crate::venue::config::CoreConfig`] to itself rather
 //! than routing it back through this trait - so there is no way for venue code to read a knob
 //! that is not about its wire format.
 
+use crate::connector::InstrumentRegistrar;
+use crate::instrument::{Instrument, InstrumentId};
+use crate::map::InternalHashSet;
 use crate::net::RequestBuilder;
+use crate::shared_string::SharedString;
 use crate::venue::pending::PendingDiffs;
 use crate::venue::scratch::Scratch;
-use crate::venue::symbol::Symbol;
 use crate::venue::table::{Slot, SlotTable};
 use bytes::Bytes;
-use std::collections::HashSet;
 use std::fmt::Debug;
 use std::time::Instant;
 
@@ -53,9 +55,9 @@ impl Generations {
 }
 
 /// The reusable parse state one connection owns, passed as one argument to
-/// [`Venue::on_frame`]/[`Venue::seed_and_replay`].
+/// [`VenueSpec::on_frame`]/[`VenueSpec::seed_and_replay`].
 ///
-/// Generic directly over `Stage` (a venue's [`Venue::Stage`]) rather than over the whole
+/// Generic directly over `Stage` (a venue's [`VenueSpec::Stage`]) rather than over the whole
 /// venue, same as [`crate::venue::table::SlotState`] is over `Ready` - see that type's doc.
 /// Unbounded as a result: nothing here needs `Stage` to be anything but a plain value.
 ///
@@ -95,7 +97,7 @@ impl<Stage> Decoder<Stage> {
     }
 }
 
-/// Everything [`Venue::on_frame`] needs: the slot table to resolve a frame's symbol against,
+/// Everything [`VenueSpec::on_frame`] needs: the slot table to resolve a frame's symbol against,
 /// the reusable decode scratch, and the generation counter for a slot that needs resetting.
 ///
 /// Generic directly over `Ready`, `Stage` and `P` rather than over the whole venue - same
@@ -104,7 +106,7 @@ impl<Stage> Decoder<Stage> {
 ///
 /// Three independent lifetimes, not one shared across all three fields: [`FrameAction`] borrows
 /// a slot out of `table` for `'t` and hands it back to the caller, so `'t` has to outlive the
-/// call to [`Venue::on_frame`] - but `dec` and `generations` must not be forced to outlive it
+/// call to [`VenueSpec::on_frame`] - but `dec` and `generations` must not be forced to outlive it
 /// too, or the caller could never touch `self.handler` again (which owns both) while still
 /// holding the returned slot. Naming `'d` and `'g` separately is what lets those two borrows
 /// end when the call returns, same as if they had been ordinary by-value arguments.
@@ -122,13 +124,13 @@ impl<Ready, Stage, P> std::fmt::Debug for FrameCtx<'_, '_, '_, Ready, Stage, P> 
 
 /// What decoding and acting on one frame produced.
 ///
-/// Borrows out of [`FrameCtx::table`] for `'t` rather than naming a [`Symbol`] - see
-/// [`FrameCtx`]'s doc for why that borrow is free to outlive the call to [`Venue::on_frame`]
+/// Borrows out of [`FrameCtx::table`] for `'t` rather than naming an [`Instrument`] - see
+/// [`FrameCtx`]'s doc for why that borrow is free to outlive the call to [`VenueSpec::on_frame`]
 /// while `dec`/`generations` are not. This is why the `Handled` path (which needs no slot back)
 /// and the `Buffer`/`Undecodable` paths (which do) all cost nothing: no clone, no re-lookup.
 #[derive(Debug)]
 pub enum FrameAction<'t, Ready, P> {
-    /// Applied, a control reply, or deliberately ignored - `Venue::on_frame` has already done
+    /// Applied, a control reply, or deliberately ignored - `VenueSpec::on_frame` has already done
     /// everything there is to do, including publishing and stamping [`Slot::last_frame`].
     Handled,
     /// No book yet for this slot: the diff has already been staged into the slot's own pending
@@ -186,9 +188,9 @@ pub enum Retry {
     Resync,
 }
 
-/// Lets a [`Venue::ReplayError`] say which of [`Retry`]'s two recoveries it needs.
+/// Lets a [`VenueSpec::ReplayError`] say which of [`Retry`]'s two recoveries it needs.
 ///
-/// A one-method trait rather than a `Venue` method, because this is a property of the error
+/// A one-method trait rather than a `VenueSpec` method, because this is a property of the error
 /// value and nothing else: the connection already owns everything else the decision needs.
 pub trait BootstrapRetry {
     fn retry(&self) -> Retry;
@@ -200,7 +202,7 @@ pub trait BootstrapRetry {
 /// Everything transport-shaped - the socket, the REST client, reconnect/backoff, the slot
 /// table - is generic and lives in [`crate::venue::connection`] and
 /// [`crate::venue::supervisor`].
-pub trait Venue: Debug + Sized + Send + Sync + 'static {
+pub trait VenueSpec: Debug + Sized + Send + Sync + 'static {
     /// This venue's own extras and nothing else - its endpoints, its wire-format knobs.
     ///
     /// Deliberately *not* the whole connector config: the shared tuning lives in
@@ -233,24 +235,26 @@ pub trait Venue: Debug + Sized + Send + Sync + 'static {
     /// The REST URL listing every symbol this venue trades.
     fn symbols_url(cfg: &Self::Config) -> String;
 
-    /// Decodes a [`Self::symbols_url`] response into the symbols that are both listed and
+    /// Decodes a [`Self::symbols_url`] response into the instruments that are both listed and
     /// currently tradable - anything halted, delisted or not yet trading is left out, so a
     /// subscribe for it is rejected up front rather than discovered from a control rejection.
     ///
+    /// Registers every decoded name through `reg` as it goes, under the venue's own spelling -
+    /// this is the only place a raw name from the wire becomes an [`Instrument`].
+    ///
     /// # Errors
     /// `Self::SymbolsError` if the listing does not decode.
-    fn parse_symbols(body: Bytes) -> Result<HashSet<Symbol>, Self::SymbolsError>;
+    fn parse_symbols<R: InstrumentRegistrar>(
+        body: Bytes,
+        reg: &R,
+    ) -> Result<InternalHashSet<InstrumentId>, Self::SymbolsError>;
 
-    /// The REST URL to fetch `symbol`'s bootstrap snapshot from.
-    ///
-    /// `symbol` is `&mut` so a venue that needs a different casing for its REST parameter
-    /// (Binance uppercases) can case the buffer in place via [`Symbol::with_upper`] rather than
-    /// allocating a second string.
-    fn snapshot_url(cfg: &Self::Config, symbol: &mut Symbol) -> String;
+    /// The REST URL to fetch `instrument`'s bootstrap snapshot from.
+    fn snapshot_url(cfg: &Self::Config, instrument: Instrument) -> String;
 
-    /// The name this venue's control frames and data frames use for `symbol` on the wire (a
+    /// The name this venue's control frames and data frames use for `instrument` on the wire (a
     /// Binance stream name, a Bitstamp channel name).
-    fn wire_name(cfg: &Self::Config, symbol: &Symbol) -> Box<str>;
+    fn wire_name(cfg: &Self::Config, instrument: Instrument) -> SharedString;
 
     /// Decodes one frame and acts on it - the only venue-specific hot path. See [`FrameAction`]
     /// for what each outcome means.
@@ -319,7 +323,7 @@ pub type SnapshotFetchError<R> = SnapshotFetchErrorImpl<
 /// the leaf error types for the same reason as [`SnapshotFetchErrorImpl`].
 #[derive(Debug)]
 pub struct SnapshotResultImpl<E1, E2> {
-    pub symbol: Symbol,
+    pub instrument: Instrument,
     pub body: Result<Bytes, SnapshotFetchErrorImpl<E1, E2>>,
     /// The bootstrap attempt this fetch was spawned for. Compared against the slot's current
     /// [`Slot::generation`] on arrival, so a result that outran an unsubscribe/resubscribe or a
@@ -334,12 +338,12 @@ pub type SnapshotResult<R> = SnapshotResultImpl<
 
 impl<E1, E2> SnapshotResultImpl<E1, E2> {
     pub const fn new(
-        symbol: Symbol,
+        instrument: Instrument,
         body: Result<Bytes, SnapshotFetchErrorImpl<E1, E2>>,
         generation: u64,
     ) -> Self {
         Self {
-            symbol,
+            instrument,
             body,
             generation,
         }
@@ -356,7 +360,7 @@ impl<E1, E2> SnapshotResultImpl<E1, E2> {
 /// generic session loop has one code path for either strategy.
 pub trait ControlPacer: Default + Send {
     /// Queues one symbol's control frame. Never sends by itself.
-    fn enqueue(&mut self, method: Method, name: Box<str>);
+    fn enqueue(&mut self, method: Method, name: SharedString);
 
     /// Sends whatever is due to go out right now, right after a burst of commands has been
     /// admitted. Binance's batching pacer does its whole chunk-and-sleep dance here; Bitstamp's
@@ -383,5 +387,5 @@ pub trait ControlPacer: Default + Send {
     /// means is each pacer's own business: Binance echoes the id back, so its batching pacer
     /// keeps a bounded map of the ids still in flight; Bitstamp's `bts:error` carries neither
     /// an id nor a channel, so its queueing pacer can only name the frame it last sent.
-    fn names_for(&self, id: Option<u64>) -> &[Box<str>];
+    fn names_for(&self, id: Option<u64>) -> &[SharedString];
 }

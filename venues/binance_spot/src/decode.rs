@@ -1,5 +1,5 @@
 //! Decoders that apply Binance depth payloads straight into an [`IncrementalBook`], plus the
-//! two entry points [`on_frame`] and [`seed_and_replay`] that back `impl Venue for
+//! two entry points [`on_frame`] and [`seed_and_replay`] that back `impl VenueSpec for
 //! BinanceSpot`.
 //!
 //! Nothing here builds an intermediate model for a *live* frame. `serde`'s [`DeserializeSeed`]
@@ -18,19 +18,20 @@
 //! `{"stream": "...", "data": {...}}`, giving an unambiguous demux key as the first field.
 
 use bytes::Bytes;
+use core_lib::connector::InstrumentRegistrar;
 use core_lib::incremental_book::{IncrementalBook, UpdateResult};
+use core_lib::instrument::{InstrumentId};
+use core_lib::map::InternalHashSet;
 use core_lib::venue::levels::{
     BookSink, LevelSink, LevelsSeed, Side, apply_level, worth_publishing,
 };
 use core_lib::venue::{
     Decoder, FrameAction, FrameCtx, Generations, PendingDiffs, Retry, Scratch, Slot, SlotState,
-    Symbol,
 };
 use serde::Deserialize;
 use serde::de::{
     DeserializeSeed, Deserializer, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor,
 };
-use std::collections::HashSet;
 use std::fmt::{self, Formatter};
 use std::time::Instant;
 
@@ -653,8 +654,7 @@ impl<'de> Visitor<'de> for ErrorValueVisitor {
     }
 }
 
-/// Resolves the stream name's symbol prefix to a `&mut BinanceSlot`, borrowing nothing from
-/// the frame.
+/// Resolves the stream name to a `&mut BinanceSlot`, borrowing nothing from the frame.
 ///
 /// A name nobody carries is not an error: it comes back as the name itself, so the caller can
 /// skip the body and report [`Frame::Unknown`]. That happens routinely for a symbol
@@ -680,10 +680,10 @@ impl<'a> Visitor<'_> for StreamLookup<'a> {
     }
 
     fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-        // Symbols are ASCII alphanumeric, so the first `@` is unambiguously the suffix
-        // boundary. No allocation on the hit path: this is a borrow of the frame's own bytes.
-        let symbol = v.split('@').next().unwrap_or(v);
-        Ok(self.table.get_mut(symbol).ok_or_else(|| v.into()))
+        // The table is keyed by the whole stream name now, the same string Binance echoes
+        // back here - no allocation on the hit path: this is a borrow of the frame's own
+        // bytes.
+        Ok(self.table.get_mut(v).ok_or_else(|| v.into()))
     }
 }
 
@@ -963,7 +963,7 @@ struct ExchangeInfo {
 /// `BREAK`, `PRE_TRADING` and the rest all mean "not now".
 const TRADING: &str = "TRADING";
 
-/// Decodes `GET /api/v3/exchangeInfo` into the tradable symbols - `Venue::parse_symbols` for
+/// Decodes `GET /api/v3/exchangeInfo` into the tradable symbols - `VenueSpec::parse_symbols` for
 /// Binance.
 ///
 /// Deserialized into an owned intermediate rather than seeded straight into the set, unlike
@@ -972,7 +972,10 @@ const TRADING: &str = "TRADING";
 ///
 /// # Errors
 /// [`SymbolsError`] if the body does not decode.
-pub(crate) fn parse_symbols(body: Bytes) -> Result<HashSet<Symbol>, SymbolsError> {
+pub(crate) fn parse_symbols<R: InstrumentRegistrar>(
+    body: Bytes,
+    reg: &R,
+) -> Result<InternalHashSet<InstrumentId>, SymbolsError> {
     let mut scratch = Scratch::default();
     let info: ExchangeInfo = scratch.with_owned_bytes(body, |data| simd_json::from_slice(data))?;
 
@@ -980,12 +983,12 @@ pub(crate) fn parse_symbols(body: Bytes) -> Result<HashSet<Symbol>, SymbolsError
         .symbols
         .into_iter()
         .filter(|entry| &*entry.status == TRADING)
-        .filter_map(|entry| Symbol::new(entry.symbol).ok())
+        .map(|entry| reg.register(&entry.symbol).id())
         .collect())
 }
 
 // ---------------------------------------------------------------------------------------
-// Entry points consumed by `impl Venue for BinanceSpot`
+// Entry points consumed by `impl VenueSpec for BinanceSpot`
 // ---------------------------------------------------------------------------------------
 
 /// A live event for a slot seeded from the snapshot with nothing applied on top yet.
@@ -1003,7 +1006,7 @@ fn on_seeded(
         // Already covered by the snapshot; `DiffSeed` skipped it without touching the book.
         // Common right after bootstrap, because REST often runs ahead of the feed.
         tracing::trace!(
-            symbol = %slot.symbol,
+            instrument = %slot.instrument,
             u = outcome.last_id(),
             last_update_id,
             "event already covered by the snapshot"
@@ -1014,7 +1017,7 @@ fn on_seeded(
     let boundary = last_update_id + 1;
     if outcome.first_id() > boundary || boundary > outcome.last_id() {
         tracing::warn!(
-            symbol = %slot.symbol,
+            instrument = %slot.instrument,
             last_update_id,
             first_id = outcome.first_id(),
             "no event straddles the snapshot, resyncing"
@@ -1027,10 +1030,10 @@ fn on_seeded(
         prev_u: outcome.last_id(),
     });
     slot.publisher.publish(&slot.book);
-    tracing::info!(symbol = %slot.symbol, prev_u = outcome.last_id(), "book live");
+    tracing::info!(instrument = %slot.instrument, prev_u = outcome.last_id(), "book live");
 }
 
-/// Decodes one frame and acts on it - `Venue::on_frame` for Binance.
+/// Decodes one frame and acts on it - `VenueSpec::on_frame` for Binance.
 pub(crate) fn on_frame<'t>(
     ctx: FrameCtx<'t, '_, '_, Ready, (), Buffered>,
     bytes: Bytes,
@@ -1054,7 +1057,7 @@ pub(crate) fn on_frame<'t>(
             if outcome.publish() {
                 slot.publisher.publish(&slot.book);
                 tracing::trace!(
-                    symbol = %slot.symbol,
+                    instrument = %slot.instrument,
                     u = outcome.last_id(),
                     "published top of book"
                 );
@@ -1089,7 +1092,7 @@ pub(crate) fn on_frame<'t>(
 
 /// Seeds `slot.book` from the snapshot body and replays the buffered diffs onto it, returning
 /// the [`Ready`] state the slot lands in - `Seeded` if nothing buffered reached past the
-/// snapshot, `Live` if one already did. `Venue::seed_and_replay` for Binance.
+/// snapshot, `Live` if one already did. `VenueSpec::seed_and_replay` for Binance.
 pub(crate) fn seed_and_replay(
     slot: &mut BinanceSlot,
     pending: &Buffered,
@@ -1205,16 +1208,20 @@ mod test {
         BootstrapError, BufferSeed, Buffered, DiffSeed, Frame, MuxSeed, Ready, SnapshotSeed,
         on_seeded, parse_symbols, seed_and_replay,
     };
+    use core_lib::Venue;
+    use core_lib::connector::VenueGuard;
     use core_lib::connector::book_publisher::make_book_publisher_pair;
     use core_lib::incremental_book::{IncrementalBook, UpdateResult};
     use core_lib::positive_f64::PositiveF64;
     use core_lib::venue::levels::{Side, apply_level};
+    use core_lib::venue::test_util::test_instrument_for;
     use core_lib::venue::{
         BootstrapRetry as _, Decoder, Generations, PendingDiffs as _, Retry, Slot, SlotState,
-        SlotTable, Symbol,
+        SlotTable,
     };
     use serde::de::DeserializeSeed;
     use std::time::Instant;
+    use core_lib::instrument::Instrument;
 
     /// A genuine `GET /api/v3/depth?symbol=BTCUSDT&limit=5` response.
     const SNAPSHOT: &str = include_str!("../tests/data/depth_snapshot.json");
@@ -1227,11 +1234,11 @@ mod test {
     const ETH: &str = "ethusdt";
 
     fn test_slot(raw_symbol: &str, state: SlotState<Ready, Buffered>) -> Slot<Ready, Buffered> {
-        let symbol = Symbol::new(raw_symbol.into()).unwrap();
-        let wire_name = crate::symbol::stream_name(&symbol, crate::symbol::DepthSpeed::Fast);
+        let instrument = test_instrument_for(Venue::BinanceSpot, raw_symbol);
+        let wire_name = crate::symbol::stream_name(instrument, crate::symbol::DepthSpeed::Fast);
         let (publisher, _reader) = make_book_publisher_pair();
         Slot {
-            symbol,
+            instrument,
             wire_name,
             book: IncrementalBook::new(),
             publisher,
@@ -1300,7 +1307,7 @@ mod test {
             ));
         }
 
-        let slot = table.get_mut(BTC).unwrap();
+        let slot = table.get_mut("btcusdt@depth@100ms").unwrap();
         let SlotState::Bootstrapping(boot) = &mut slot.state else {
             unreachable!("the slot was inserted bootstrapping")
         };
@@ -1852,14 +1859,15 @@ mod test {
 
     #[test]
     fn the_listing_keeps_only_pairs_that_are_actually_trading() {
-        let listed = parse_symbols(EXCHANGE_INFO.into()).unwrap();
+        let listed =
+            parse_symbols(EXCHANGE_INFO.into(), &VenueGuard::new(Venue::BinanceSpot)).unwrap();
 
-        let mut names: Vec<&str> = listed.iter().map(Symbol::as_str).collect();
+        let mut names: Vec<&str> = listed.iter().copied().map(|inst| Instrument::by_id(inst).name()).collect();
         names.sort_unstable();
         assert_eq!(
             names,
-            vec!["btcusdt", "ethusdt"],
-            "HALT and BREAK pairs must not be subscribable"
+            vec!["BTCUSDT", "ETHUSDT"],
+            "the venue's own casing is kept, and HALT/BREAK pairs must not be subscribable"
         );
     }
 

@@ -1,8 +1,8 @@
 //! Tuning shared by every venue connector, and the generic container - [`ConnectorConfig`] -
 //! that pairs it with a venue's own extras.
 //!
-//! The two halves stay apart all the way down. A venue's [`crate::venue::spec::Venue::Config`]
-//! is *only* its extras - endpoints, wire-format knobs - and every `Venue` method is handed
+//! The two halves stay apart all the way down. A venue's [`crate::venue::spec::VenueSpec::Config`]
+//! is *only* its extras - endpoints, wire-format knobs - and every `VenueSpec` method is handed
 //! that alone, so venue code cannot read or depend on the shared tuning. [`CoreConfig`] belongs
 //! to the generic machinery instead, which is the only thing that acts on it. `ConnectorConfig`
 //! is where the two meet, and it is what a caller builds and what
@@ -12,7 +12,7 @@
 //! differs, and this type has exactly one [`Default`] impl - so an endpoint would either force
 //! one venue's default onto the other or need per-venue overrides for a value venue code
 //! already has to turn into a URL anyway. Endpoints stay in a venue's own `Inner`, next to the
-//! [`crate::venue::spec::Venue::stream_url`]/[`crate::venue::spec::Venue::snapshot_url`] that
+//! [`crate::venue::spec::VenueSpec::stream_url`]/[`crate::venue::spec::VenueSpec::snapshot_url`] that
 //! consume them.
 
 use serde::Deserialize;
@@ -125,10 +125,10 @@ impl Default for CoreConfig {
 
 /// Whole-connector config: [`CoreConfig`] paired with `Inner`, a venue's own extras (its
 /// endpoints and whatever else its wire format needs - see
-/// [`crate::venue::spec::Venue::Config`]).
+/// [`crate::venue::spec::VenueSpec::Config`]).
 ///
 /// The generic machinery holds one of these and never hands the whole thing to a venue: it
-/// reads [`Self::core`] for its own tuning and passes [`Self::inner`] to every `Venue` method.
+/// reads [`Self::core`] for its own tuning and passes [`Self::inner`] to every `VenueSpec` method.
 ///
 /// `inner` is flattened, so a config file spells this `{"core": {...}, "stream_endpoint":
 /// "...", ...}` - `inner`'s own fields sit next to `core`, not nested under an `"inner"` key.

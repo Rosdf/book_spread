@@ -6,8 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+all_venues = { path = "../venues/all_venues" }
 heapless = "0.9.3"
 crossbeam-utils = {version = "0.8.22"}
+hashbrown = "0.17.1"
 triomphe = "0.1.16"
 tokio = {version = "1.53.1", features = ["sync", "rt", "time", "macros"]}
 serde = "1.0.229"

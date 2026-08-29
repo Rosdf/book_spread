@@ -1,7 +1,7 @@
 use core_lib::venue::{CoreConfig, Defaults};
 use serde::Deserialize;
 
-/// What [`crate::Bitstamp`] declares as its [`core_lib::venue::Venue::Config`]: Bitstamp's own
+/// What [`crate::Bitstamp`] declares as its [`core_lib::venue::VenueSpec::Config`]: Bitstamp's own
 /// extras, and only those.
 ///
 /// The shared tuning is not in here. A caller pairs this with [`CoreConfig`] by building a
@@ -10,7 +10,7 @@ use serde::Deserialize;
 /// [`ConnectorHandle::new`](core_lib::connector::ConnectorHandle::new).
 pub type Config = Extra;
 
-/// Bitstamp-specific tuning: the endpoints the `Venue` methods read.
+/// Bitstamp-specific tuning: the endpoints the `VenueSpec` methods read.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Extra {

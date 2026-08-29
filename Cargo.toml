@@ -6,7 +6,7 @@ rust-version = "1.97.1"
 
 [workspace]
 resolver = "3"
-members = ["core_lib", "md_proto", "md_wire", "md_server", "md_client", "venues/binance_spot", "venues/bitstamp"]
+members = ["core_lib", "md_proto", "md_wire", "md_server", "md_client", "venues/all_venues", "venues/binance_spot", "venues/bitstamp"]
 
 [workspace.dependencies]
 # `release_max_level_debug` compiles every `trace!` callsite out of a release build. Cargo

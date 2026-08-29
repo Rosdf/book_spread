@@ -12,17 +12,18 @@
 use crate::venue::{BookSource, Connectors, Venue};
 use core_lib::connector::book_publisher::{BookPublisher, BookReader, make_book_publisher_pair};
 use core_lib::incremental_book::IncrementalBook;
+use core_lib::instrument::{Instrument, InstrumentId};
+use core_lib::map::InternalHashMap;
 use core_lib::positive_f64::PositiveF64;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::net::TcpListener;
-use core_lib::map::InternalHashMap;
 
 #[derive(Debug, Default)]
 struct SourceState {
     /// The publisher half of every live subscription.
-    live: InternalHashMap<Box<str>, BookPublisher>,
-    subscribed: Vec<Box<str>>,
-    unsubscribed: Vec<Box<str>>,
+    live: InternalHashMap<&'static str, BookPublisher>,
+    subscribed: Vec<&'static str>,
+    unsubscribed: Vec<&'static str>,
     /// When set, every subscribe is answered with this rejection instead of a reader.
     reject: Option<String>,
     /// When set, `unsubscribe` panics rather than releasing the symbol.
@@ -61,12 +62,12 @@ impl FakeSource {
 
     /// Every symbol `subscribe` was called with, in order. Duplicates are the point of
     /// looking: the registry's job is to make sure there are none.
-    pub fn subscribed(&self) -> Vec<Box<str>> {
+    pub fn subscribed(&self) -> Vec<&'static str> {
         self.lock().subscribed.clone()
     }
 
     /// Every symbol `unsubscribe` was called with, in order.
-    pub fn unsubscribed(&self) -> Vec<Box<str>> {
+    pub fn unsubscribed(&self) -> Vec<&'static str> {
         self.lock().unsubscribed.clone()
     }
 
@@ -97,9 +98,9 @@ impl FakeSource {
     }
 
     /// Records the subscribe and opens a book channel for it, keeping the publisher half.
-    fn open(&self, symbol: Box<str>) -> anyhow::Result<BookReader> {
+    fn open(&self, symbol: &'static str) -> anyhow::Result<BookReader> {
         let mut state = self.lock();
-        state.subscribed.push(symbol.clone());
+        state.subscribed.push(symbol);
         if let Some(why) = state.reject.clone() {
             return Err(anyhow::anyhow!(why));
         }
@@ -115,13 +116,14 @@ impl FakeSource {
 }
 
 impl BookSource for FakeSource {
-    fn subscribe(&self, symbol: Box<str>) -> oneshot::Receiver<anyhow::Result<BookReader>> {
+    fn subscribe(&self, instrument_id: InstrumentId) -> oneshot::Receiver<anyhow::Result<BookReader>> {
         let (reply, result) = oneshot::channel();
-        let _ = reply.send(self.open(symbol));
+        let _ = reply.send(self.open(Instrument::by_id(instrument_id).name()));
         result
     }
 
-    fn unsubscribe(&self, symbol: Box<str>) {
+    fn unsubscribe(&self, instrument_id: InstrumentId) {
+        let symbol = Instrument::by_id(instrument_id).name();
         let mut state = self.lock();
         assert!(
             !state.panic_on_unsubscribe,
@@ -129,7 +131,7 @@ impl BookSource for FakeSource {
         );
         // A real unsubscribe drops the symbol's publisher, which is what ends the reader's
         // stream. The fake does the same so teardown looks identical from above.
-        state.live.remove(&symbol);
+        state.live.remove(symbol);
         state.unsubscribed.push(symbol);
     }
 }

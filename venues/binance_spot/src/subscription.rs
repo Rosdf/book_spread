@@ -2,7 +2,7 @@ use crate::symbol::DepthSpeed;
 use core_lib::venue::Defaults;
 use serde::Deserialize;
 
-/// What [`crate::BinanceSpot`] declares as its [`core_lib::venue::Venue::Config`]: Binance's
+/// What [`crate::BinanceSpot`] declares as its [`core_lib::venue::VenueSpec::Config`]: Binance's
 /// own extras, and only those.
 ///
 /// The shared tuning is not in here. A caller pairs this with
@@ -12,7 +12,7 @@ use serde::Deserialize;
 /// [`ConnectorHandle::new`](core_lib::connector::ConnectorHandle::new).
 pub type Config = Extra;
 
-/// Binance-specific tuning: the endpoints and wire-format knobs the `Venue` methods read.
+/// Binance-specific tuning: the endpoints and wire-format knobs the `VenueSpec` methods read.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Extra {

@@ -81,7 +81,8 @@ pub(crate) struct BookEncoder {
 
 impl BookEncoder {
     /// `venue` is the identity every level from this broadcaster carries; it comes from its
-    /// [`Key`](crate::registry::Key), since a book carries no identity itself.
+    /// [`Instrument`](core_lib::instrument::Instrument), since a book carries no identity
+    /// itself.
     pub(crate) fn new(venue: &str) -> Self {
         // Built with prost rather than by hand: this runs once per broadcaster, so there is
         // nothing to win by open-coding it, and borrowing prost's own varint keeps the

@@ -4,49 +4,17 @@ use crate::broadcast::{Broadcaster, Join};
 use crate::registry::events::{
     Claim, RegistryEvent, RegistryRx, RegistryTx, RegistryWeakTx, create_event_channel,
 };
-use crate::venue::{BookSource as _, Connectors, Venue};
+use crate::venue::{BookSource as _, Connectors};
+use core_lib::instrument::{Instrument};
+use core_lib::map::{InternalHashMap, new_internal_map};
 use core_lib::panic::panic_message;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
-use core_lib::map::{new_internal_map, InternalHashMap};
 
 pub(crate) mod events;
-
-/// Identifies one book stream.
-///
-/// Also where a `BookUpdate`'s levels get their `venue` from: `SmallBook` carries no identity
-/// of its own, so the only thing that knows what a book is *of* is the key of the broadcaster
-/// holding its reader. The symbol itself is no longer on the wire at all.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct Key {
-    venue: Venue,
-    symbol: Box<str>,
-}
-
-impl Key {
-    /// `symbol` must already be lowercase - see [`crate::request`], which is where a
-    /// request's symbol is validated and normalised. Every connector keys its subscriptions
-    /// by the lowercase form, so two keys differing only in case would race for one
-    /// subscription and the loser would be rejected as already subscribed.
-    pub(crate) fn new(venue: Venue, symbol: Box<str>) -> Self {
-        debug_assert!(
-            symbol.bytes().all(|b| !b.is_ascii_uppercase()),
-            "keys must hold the lowercase symbol the connector uses"
-        );
-        Self { venue, symbol }
-    }
-
-    pub(crate) fn venue(&self) -> Venue {
-        self.venue
-    }
-
-    pub(crate) fn symbol(&self) -> &str {
-        &self.symbol
-    }
-}
 
 /// The registry's half of one running broadcaster.
 #[derive(Debug)]
@@ -152,7 +120,7 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
 /// play.
 #[derive(Debug)]
 struct Registry<C, S> {
-    entries: InternalHashMap<Key, Entry<S>>,
+    entries: InternalHashMap<Instrument, Entry<S>>,
     connectors: C,
     /// Set by [`RegistryEvent::ShutDown`]. "Do not start anything new" - an entry that is
     /// still being torn down is still served.
@@ -236,7 +204,7 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
     /// occupied and queue a join. Exactly one `BookSource::subscribe` is ever issued per key -
     /// which is an invariant, not a nicety: the connector hard-errors a duplicate subscribe,
     /// and `BookReader` is not `Clone`, so a symbol has exactly one reader.
-    fn subscribe(&mut self, key: Key, sock: S) -> Result<(), Refused<S>> {
+    fn subscribe(&mut self, key: Instrument, sock: S) -> Result<(), Refused<S>> {
         let mut join = Join::new(sock);
 
         if let Some(entry) = self.entries.get(&key) {
@@ -271,7 +239,7 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
             .send(join)
             .expect("the receiving half is still in scope");
         self.entries.insert(
-            key.clone(),
+            key,
             Entry {
                 joins,
                 pending_joins: Arc::clone(&pending_joins),
@@ -282,10 +250,7 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
         // put it after the `unsubscribe` of whatever generation held this key before. It
         // costs no await: `BookSource::subscribe` hands back the reply channel rather than a
         // future, so the broadcaster is what waits for the venue.
-        let reader = self
-            .connectors
-            .source(key.venue())
-            .subscribe(key.symbol.clone());
+        let reader = self.connectors.source(key.venue()).subscribe(key.id());
 
         tokio::spawn(Broadcaster::start(tx, key, queued, pending_joins, reader));
         Ok(())
@@ -307,7 +272,7 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
         }
 
         self.entries.remove(claim.key());
-        self.unsubscribe(claim.key());
+        self.unsubscribe(*claim.key());
         true
     }
 
@@ -319,7 +284,7 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
     /// that exited through [`Registry::retire_if_idle`] can still send this on its way out.
     fn retire(&mut self, claim: &Claim) {
         if self.take_entry(claim) {
-            self.unsubscribe(claim.key());
+            self.unsubscribe(*claim.key());
         }
     }
 
@@ -342,16 +307,13 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
         true
     }
 
-    fn unsubscribe(&self, key: &Key) {
-        self.connectors
-            .source(key.venue())
-            .unsubscribe(key.symbol.clone());
+    fn unsubscribe(&self, key: Instrument) {
+        self.connectors.source(key.venue()).unsubscribe(key.id());
     }
 }
 
 #[cfg(test)]
 mod test {
-    use super::Key;
     use super::events::Claim;
     use crate::broadcast::SESSION_SWEEP;
     use crate::registry::harness::{Harness, registry_for};
@@ -359,15 +321,17 @@ mod test {
     use crate::test_util::FakeSource;
     use crate::transport::mock::MockStream;
     use crate::venue::Venue;
+    use core_lib::instrument::Instrument;
+    use core_lib::venue::test_util::test_instrument_for;
     use md_wire::framing::RejectCode;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
-    const SYMBOL: &str = "btcusdt";
+    const SYMBOL: &str = "btcusdt-registry-test";
 
-    fn key() -> Key {
-        Key::new(Venue::BinanceSpot, SYMBOL.into())
+    fn key() -> Instrument {
+        test_instrument_for(Venue::BinanceSpot, SYMBOL)
     }
 
     /// Hands a fresh mock socket to the registry and keeps the client half.
@@ -436,7 +400,7 @@ mod test {
         }
         assert_eq!(
             source.subscribed(),
-            vec![Box::from(SYMBOL)],
+            vec![SYMBOL],
             "eight clients, one connector subscription"
         );
     }
@@ -515,12 +479,12 @@ mod test {
 
         assert_eq!(
             source.subscribed(),
-            vec![Box::from(SYMBOL), Box::from(SYMBOL)],
+            vec![SYMBOL, SYMBOL],
             "the second client subscribes the symbol again"
         );
         assert_eq!(
             source.unsubscribed(),
-            vec![Box::from(SYMBOL)],
+            vec![SYMBOL],
             "and the first teardown released it exactly once"
         );
 

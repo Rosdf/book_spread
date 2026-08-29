@@ -13,7 +13,8 @@ package md.v1;
 message Pair {
   // "binance_spot" or "bitstamp", case-insensitive.
   string venue = 1;
-  // The venue's own symbol, case-insensitive; non-empty ASCII alphanumerics.
+  // The venue's own symbol, spelled exactly as that venue lists it - case-sensitive:
+  // "BTCUSDT" on binance_spot, "btcusd" on bitstamp. Non-empty ASCII alphanumerics.
   string symbol = 2;
 }
 

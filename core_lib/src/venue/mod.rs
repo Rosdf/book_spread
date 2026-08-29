@@ -9,12 +9,12 @@
 //! the duplication did. Comparing `binance_spot` and `bitstamp` once both existed showed that
 //! judgment was wrong: `connection.rs` alone was 55% identical text, `table.rs` and `rest.rs`
 //! nearly all of it, and the parts that actually varied - a config field name, a URL, a cursor
-//! field name, one extra slot state - all fit behind [`spec::Venue`] without forcing either
+//! field name, one extra slot state - all fit behind [`spec::VenueSpec`] without forcing either
 //! venue's observable wire behavior to change.
 //!
 //! So this module now owns the connection loop, the slot table, the supervisor, the REST
-//! snapshot fetch and the hourly symbol listing, all generic over [`spec::Venue`]. A venue
-//! crate keeps its own `decode.rs`, its wire naming, its config extras, and a `impl Venue`
+//! snapshot fetch and the hourly symbol listing, all generic over [`spec::VenueSpec`]. A venue
+//! crate keeps its own `decode.rs`, its wire naming, its config extras, and a `impl VenueSpec`
 //! block wiring the two together - see `spec.rs`'s module doc for why that trait carries no
 //! transport generics of its own.
 //!
@@ -34,7 +34,6 @@ pub mod scratch;
 pub mod session;
 pub mod spec;
 pub mod supervisor;
-pub mod symbol;
 pub mod table;
 #[cfg(any(test, feature = "test_util"))]
 pub mod test_util;
@@ -53,8 +52,7 @@ pub use scratch::Scratch;
 pub use session::{CLOSE_TIMEOUT, SessionEnd, SessionError, close, ws_err};
 pub use spec::{
     BootstrapRetry, ControlPacer, Decoder, FrameAction, FrameCtx, Generations, Method, Retry,
-    SnapshotFetchError, SnapshotResult, Venue,
+    SnapshotFetchError, SnapshotResult, VenueSpec,
 };
-pub use symbol::{InvalidSymbol, Symbol};
 pub use table::{Bootstrap, Slot, SlotState, SlotTable};
 pub use universe::ListingError;

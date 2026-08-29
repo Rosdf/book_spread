@@ -1,43 +1,15 @@
-//! Venue identity, and the slice of a connector the fan-out layer actually uses.
+//! The slice of a connector the fan-out layer actually uses.
 
 use binance_spot::BinanceSpot;
 use bitstamp::Bitstamp;
+pub(crate) use core_lib::Venue;
+
 use core_lib::connector::ConnectorHandle;
 use core_lib::connector::book_publisher::BookReader;
+use core_lib::instrument::InstrumentId;
 use core_lib::venue::ConnectorConfig;
 use std::fmt::Debug;
 use std::future::Future;
-
-/// The venues this server carries.
-///
-/// The names live here rather than in `core_lib`: `core_lib`'s `Venue::wire_name` names a
-/// *symbol* on a venue, and nothing upstream names the venue itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum Venue {
-    BinanceSpot,
-    Bitstamp,
-}
-
-impl Venue {
-    /// Every venue, in the order a listing should present them.
-    pub(crate) const ALL: [Self; 2] = [Self::BinanceSpot, Self::Bitstamp];
-
-    /// The name a client puts in `SubscribeBookRequest::venue`, and the one echoed back on
-    /// every `BookUpdate`.
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::BinanceSpot => "binance_spot",
-            Self::Bitstamp => "bitstamp",
-        }
-    }
-
-    /// Case-insensitive. `None` for a venue this server does not carry.
-    pub(crate) fn parse(raw: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|venue| venue.as_str().eq_ignore_ascii_case(raw))
-    }
-}
 
 /// What a broadcaster needs from a connector.
 ///
@@ -45,13 +17,16 @@ impl Venue {
 /// `make_book_publisher_pair()` with no socket involved; [`ConnectorHandle`] is the only
 /// implementation that talks to a venue.
 pub(crate) trait BookSource: Debug + Send + Sync + 'static {
-    /// Asks for `symbol`'s book stream. The reply carries the venue's own rejection when the
-    /// symbol is not tradable there, or when it is already subscribed.
-    fn subscribe(&self, symbol: Box<str>) -> oneshot::Receiver<anyhow::Result<BookReader>>;
+    /// Asks for `instrument`'s book stream. The reply carries the venue's own rejection when
+    /// the instrument is not tradable there, or when it is already subscribed.
+    fn subscribe(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> oneshot::Receiver<anyhow::Result<BookReader>>;
 
-    /// Tears one symbol's stream down. Nothing to report: the teardown is already visible
+    /// Tears one instrument's stream down. Nothing to report: the teardown is already visible
     /// in-band, as the book channel ending.
-    fn unsubscribe(&self, symbol: Box<str>);
+    fn unsubscribe(&self, instrument_id: InstrumentId);
 }
 
 #[expect(
@@ -59,12 +34,15 @@ pub(crate) trait BookSource: Debug + Send + Sync + 'static {
     reason = "naming the concrete type is what shows these forward to the inherent methods rather than to themselves"
 )]
 impl BookSource for ConnectorHandle {
-    fn subscribe(&self, symbol: Box<str>) -> oneshot::Receiver<anyhow::Result<BookReader>> {
-        ConnectorHandle::subscribe(self, symbol)
+    fn subscribe(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> oneshot::Receiver<anyhow::Result<BookReader>> {
+        ConnectorHandle::subscribe(self, instrument_id)
     }
 
-    fn unsubscribe(&self, symbol: Box<str>) {
-        ConnectorHandle::unsubscribe(self, symbol);
+    fn unsubscribe(&self, instrument_id: InstrumentId) {
+        ConnectorHandle::unsubscribe(self, instrument_id);
     }
 }
 

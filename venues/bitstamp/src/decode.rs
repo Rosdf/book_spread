@@ -1,5 +1,5 @@
 //! Decoders for Bitstamp's `diff_order_book` payloads, plus the two entry points [`on_frame`]
-//! and [`seed_and_replay`] that back `impl Venue for Bitstamp`.
+//! and [`seed_and_replay`] that back `impl VenueSpec for Bitstamp`.
 //!
 //! Binance's decoder ([`binance_spot`]'s `decode.rs`) applies every price level straight into
 //! the book it belongs to, with zero intermediate model, because its envelope names the
@@ -9,7 +9,7 @@
 //! belong to.
 //!
 //! That forces a two-phase decode. [`LevelStage`] is a reusable buffer - owned by the
-//! connection as `Venue::Stage`, cleared and refilled every frame rather than reallocated -
+//! connection as `VenueSpec::Stage`, cleared and refilled every frame rather than reallocated -
 //! that the level arrays are parsed into during the first phase. [`FrameSeed`] then resolves
 //! `channel` to a slot and hands the caller back a [`Frame`] naming that slot; the caller
 //! applies the already-staged levels onto the resolved book (see [`on_frame`]), or - for a
@@ -31,18 +31,19 @@
 //! and [`MalformedPayload::FieldOrder`] rejects a payload that breaks it, rather than the
 //! decoder trying to cope with either order.
 
-use crate::symbol;
 use bytes::Bytes;
+use core_lib::connector::InstrumentRegistrar;
 use core_lib::incremental_book::{IncrementalBook, UpdateResult};
+use core_lib::instrument::InstrumentId;
+use core_lib::map::InternalHashSet;
 use core_lib::venue::levels::{
     BookSink, LevelSink, LevelsSeed, Side, apply_level, merge, worth_publishing,
 };
 use core_lib::venue::{
-    Decoder, FrameAction, FrameCtx, PendingDiffs, Retry, Scratch, Slot, SlotState, Symbol,
+    Decoder, FrameAction, FrameCtx, PendingDiffs, Retry, Scratch, Slot, SlotState,
 };
 use serde::Deserialize;
 use serde::de::{DeserializeSeed, Deserializer, Error as _, IgnoredAny, MapAccess, Visitor};
-use std::collections::HashSet;
 use std::fmt::{self, Formatter};
 use std::time::Instant;
 
@@ -441,7 +442,7 @@ impl<'de, 'a> Visitor<'de> for FrameSeed<'a, '_> {
         let mut micro: Option<u64> = None;
         let mut message: Option<Box<str>> = None;
         // Borrowed, not owned. Both are read back here and here only - `event` against two
-        // literals, `channel` sliced by `pair_of_channel` - and simd-json unescapes in place,
+        // literals, `channel` straight against the table - and simd-json unescapes in place,
         // so `next_value` hands back a `&str` into the frame buffer at no cost. Owning them
         // would be two mallocs and two copies on every diff frame. The only paths that need
         // an owned copy are the cold ones below, which take it there.
@@ -482,8 +483,9 @@ impl<'de, 'a> Visitor<'de> for FrameSeed<'a, '_> {
             let data_micro =
                 micro.ok_or_else(|| A::Error::custom(MalformedPayload::MissingMicrotimestamp))?;
 
-            let resolved =
-                symbol::pair_of_channel(data_channel).and_then(|pair| self.table.get_mut(pair));
+            // The table is keyed by the whole channel name now, the same string Bitstamp
+            // echoes back here.
+            let resolved = self.table.get_mut(data_channel);
 
             let Some(slot) = resolved else {
                 return Ok(Frame::Unknown(data_channel.into()));
@@ -581,7 +583,7 @@ impl<'de> Visitor<'de> for SnapshotSeed<'_> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Entry points consumed by `impl Venue for Bitstamp`
+// Entry points consumed by `impl VenueSpec for Bitstamp`
 // ---------------------------------------------------------------------------------------
 
 /// Logs one control reply, or reports a rejection for the caller to attribute.
@@ -607,7 +609,7 @@ fn on_control(control: &ControlFrame) -> FrameAction<'static, Ready, Buffered> {
     FrameAction::Handled
 }
 
-/// Decodes one frame and acts on it - `Venue::on_frame` for Bitstamp.
+/// Decodes one frame and acts on it - `VenueSpec::on_frame` for Bitstamp.
 pub(crate) fn on_frame<'t>(
     ctx: FrameCtx<'t, '_, '_, Ready, LevelStage, Buffered>,
     bytes: Bytes,
@@ -633,13 +635,13 @@ pub(crate) fn on_frame<'t>(
             if micro <= last_micro {
                 // Only reachable via duplicate delivery - TCP preserves order on one socket,
                 // so this is not a gap, just a repeat.
-                tracing::trace!(symbol = %slot.symbol, micro, last_micro, "duplicate diff dropped");
+                tracing::trace!(instrument = %slot.instrument, micro, last_micro, "duplicate diff dropped");
             } else {
                 let merged = apply_stage(&mut slot.book, stage);
                 slot.state = SlotState::Ready(Ready { last_micro: micro });
                 if stage_worth_publishing(merged) {
                     slot.publisher.publish(&slot.book);
-                    tracing::trace!(symbol = %slot.symbol, micro, "published top of book");
+                    tracing::trace!(instrument = %slot.instrument, micro, "published top of book");
                 }
             }
             FrameAction::Handled
@@ -672,7 +674,7 @@ pub(crate) fn on_frame<'t>(
 
 /// Seeds `slot.book` from the snapshot body and replays the buffered diffs onto it, returning
 /// the microtimestamp of the last diff applied - the snapshot's own, if nothing buffered
-/// reached past it. `Venue::seed_and_replay` for Bitstamp.
+/// reached past it. `VenueSpec::seed_and_replay` for Bitstamp.
 ///
 /// The sync rule, since there is no sequence id to straddle a boundary with: the snapshot's
 /// microtimestamp must reach at least as far as the earliest buffered diff, or there is a
@@ -743,7 +745,7 @@ struct PairInfo {
 const ENABLED: &str = "Enabled";
 
 /// Decodes `GET /api/v2/trading-pairs-info/` into the tradable symbols -
-/// `Venue::parse_symbols` for Bitstamp.
+/// `VenueSpec::parse_symbols` for Bitstamp.
 ///
 /// Deserialized into an owned intermediate rather than seeded straight into the set, unlike
 /// everything else in this file: this runs once an hour, not once per frame, and the readable
@@ -751,7 +753,10 @@ const ENABLED: &str = "Enabled";
 ///
 /// # Errors
 /// [`SymbolsError`] if the body does not decode.
-pub(crate) fn parse_symbols(body: Bytes) -> Result<HashSet<Symbol>, SymbolsError> {
+pub(crate) fn parse_symbols<R: InstrumentRegistrar>(
+    body: Bytes,
+    reg: &R,
+) -> Result<InternalHashSet<InstrumentId>, SymbolsError> {
     let mut scratch = Scratch::default();
     let pairs: Vec<PairInfo> =
         scratch.with_owned_bytes(body, |data| simd_json::from_slice(data))?;
@@ -759,7 +764,7 @@ pub(crate) fn parse_symbols(body: Bytes) -> Result<HashSet<Symbol>, SymbolsError
     Ok(pairs
         .into_iter()
         .filter(|pair| &*pair.trading == ENABLED)
-        .filter_map(|pair| Symbol::new(pair.url_symbol).ok())
+        .map(|pair| reg.register(&pair.url_symbol).id())
         .collect())
 }
 
@@ -769,12 +774,16 @@ mod test {
         Buffered, ControlFrame, Frame, FrameSeed, LevelStage, Ready, SnapshotSeed, apply_stage,
         parse_symbols, seed_and_replay,
     };
+    use core_lib::Venue;
+    use core_lib::connector::VenueGuard;
     use core_lib::connector::book_publisher::make_book_publisher_pair;
     use core_lib::incremental_book::{IncrementalBook, UpdateResult};
+    use core_lib::instrument::Instrument;
     use core_lib::positive_f64::PositiveF64;
     use core_lib::venue::levels::{Side, apply_level};
+    use core_lib::venue::test_util::test_instrument_for;
     use core_lib::venue::{
-        BootstrapRetry as _, Decoder, PendingDiffs as _, Retry, Slot, SlotState, SlotTable, Symbol,
+        BootstrapRetry as _, Decoder, PendingDiffs as _, Retry, Slot, SlotState, SlotTable,
     };
     use serde::de::DeserializeSeed as _;
     use std::time::Instant;
@@ -800,11 +809,11 @@ mod test {
     }
 
     fn slot(raw_symbol: &str, state: SlotState<Ready, Buffered>) -> Slot<Ready, Buffered> {
-        let symbol = Symbol::new(raw_symbol.into()).unwrap();
-        let wire_name = crate::symbol::channel_name(&symbol);
+        let instrument = test_instrument_for(Venue::Bitstamp, raw_symbol);
+        let wire_name = crate::symbol::channel_name(instrument);
         let (publisher, _reader) = make_book_publisher_pair();
         Slot {
-            symbol,
+            instrument,
             wire_name,
             book: IncrementalBook::new(),
             publisher,
@@ -896,7 +905,7 @@ mod test {
 
         stage_into_slot(&mut table, &mut stage, DIFF);
 
-        let target = table.get_mut("btcusd").unwrap();
+        let target = table.get_mut("diff_order_book_btcusd").unwrap();
         assert_eq!(
             target.book.first_bids().len(),
             0,
@@ -929,7 +938,7 @@ mod test {
         stage_into_slot(&mut table, &mut stage, DIFF);
         stage_into_slot(&mut table, &mut stage, second);
 
-        let target = table.get_mut("btcusd").unwrap();
+        let target = table.get_mut("diff_order_book_btcusd").unwrap();
         let SlotState::Bootstrapping(boot) = &mut target.state else {
             unreachable!("still bootstrapping")
         };
@@ -970,7 +979,7 @@ mod test {
         stage_into_slot(&mut staged_table, &mut staged_stage, DIFF);
 
         let mut replayed = IncrementalBook::new();
-        let boot_slot = staged_table.get_mut("btcusd").unwrap();
+        let boot_slot = staged_table.get_mut("diff_order_book_btcusd").unwrap();
         let SlotState::Bootstrapping(boot) = &boot_slot.state else {
             unreachable!("still bootstrapping")
         };
@@ -993,7 +1002,7 @@ mod test {
                     .collect::<Vec<_>>(),
             )
         };
-        let inline_slot = inline_table.get_mut("btcusd").unwrap();
+        let inline_slot = inline_table.get_mut("diff_order_book_btcusd").unwrap();
         assert_eq!(seen(&replayed), seen(&inline_slot.book));
     }
 
@@ -1122,7 +1131,7 @@ mod test {
         stage_into_slot(&mut table, &mut stage, &covered);
         stage_into_slot(&mut table, &mut stage, DIFF);
 
-        let target = table.get_mut("btcusd").unwrap();
+        let target = table.get_mut("diff_order_book_btcusd").unwrap();
         let SlotState::Bootstrapping(boot) = &mut target.state else {
             unreachable!("still bootstrapping")
         };
@@ -1172,9 +1181,13 @@ mod test {
 
     #[test]
     fn the_listing_keeps_only_pairs_that_are_actually_trading() {
-        let listed = parse_symbols(PAIRS.into()).unwrap();
+        let listed = parse_symbols(PAIRS.into(), &VenueGuard::new(Venue::Bitstamp)).unwrap();
 
-        let mut names: Vec<&str> = listed.iter().map(Symbol::as_str).collect();
+        let mut names: Vec<&str> = listed
+            .iter()
+            .copied()
+            .map(|inst| Instrument::by_id(inst).name())
+            .collect();
         names.sort_unstable();
         assert_eq!(
             names,
