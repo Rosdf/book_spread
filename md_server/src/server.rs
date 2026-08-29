@@ -11,7 +11,6 @@ use crate::transport::Listener;
 use crate::venue::{Connectors, LiveConnectors};
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use tokio::net::TcpListener;
 
 /// Binds `addr` and serves the book feed until ctrl-c.

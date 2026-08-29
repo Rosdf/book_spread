@@ -14,7 +14,6 @@ use crate::client::{ClientHandshake as _, HandshakeError, Handshaker};
 use crate::registry::events::RegistryTx;
 use crate::transport::{self, Listener};
 use std::fmt::Debug;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinSet;
 
@@ -84,7 +83,7 @@ pub(crate) async fn accept<L: Listener, H: Handshaker<L::Stream>>(
 /// refused with a reason, or simply dropped because the client never said anything usable.
 async fn handshake<S: Send + 'static, H: Handshaker<S>, P: Debug>(
     registry: RegistryTx<H::Client>,
-    handshaker: &'static H,
+    handshaker: &H,
     sock: S,
     peer: P,
 ) {
