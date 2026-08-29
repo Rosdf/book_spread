@@ -40,18 +40,27 @@ pub const LENGTH_PREFIX: usize = 4;
 pub const MAX_FRAME_LEN: usize = 4 * 1024;
 
 /// Why a subscription was turned down. The wire form is the discriminant byte.
-///
-/// Two codes rather than a copy of gRPC's status set: the client's only real decision is
-/// whether retrying could ever help.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RejectCode {
-    /// The request itself is wrong - an unknown venue, a malformed symbol. Retrying it
-    /// verbatim will fail the same way.
-    InvalidArgument = 1,
-    /// The request is well formed but cannot be served: the venue does not list the symbol,
-    /// the connector is gone, or the server is shutting down. Retrying may work later.
-    Unavailable = 2,
+    /// The request named no pairs.
+    EmptyRequest = 1,
+    /// The request named a venue this server does not carry.
+    UnknownVenue = 2,
+    /// The symbol is empty, over `MAX_SYMBOL_LEN`, or not ASCII alphanumeric.
+    MalformedSymbol = 3,
+    /// Well-formed, but the venue does not list it as tradable.
+    UnlistedSymbol = 4,
+    /// The same pair appears twice in one request.
+    DuplicatePair = 5,
+    /// The server is shutting down.
+    ShuttingDown = 6,
+    /// The connector answered the subscribe with a refusal.
+    ConnectorRefused = 7,
+    /// The connector went away before it could answer.
+    ConnectorGone = 8,
+    /// The broadcaster's book stream ended while joins were still queued.
+    StreamEnded = 9,
 }
 
 impl RejectCode {
@@ -61,10 +70,25 @@ impl RejectCode {
 
     fn from_byte(byte: u8) -> Option<Self> {
         match byte {
-            1 => Some(Self::InvalidArgument),
-            2 => Some(Self::Unavailable),
+            1 => Some(Self::EmptyRequest),
+            2 => Some(Self::UnknownVenue),
+            3 => Some(Self::MalformedSymbol),
+            4 => Some(Self::UnlistedSymbol),
+            5 => Some(Self::DuplicatePair),
+            6 => Some(Self::ShuttingDown),
+            7 => Some(Self::ConnectorRefused),
+            8 => Some(Self::ConnectorGone),
+            9 => Some(Self::StreamEnded),
             _ => None,
         }
+    }
+
+    /// Whether retrying the same request verbatim could ever succeed.
+    pub fn retryable(self) -> bool {
+        matches!(
+            self,
+            Self::ShuttingDown | Self::ConnectorRefused | Self::ConnectorGone | Self::StreamEnded
+        )
     }
 }
 
@@ -308,23 +332,33 @@ mod test {
 
     #[tokio::test]
     async fn a_rejection_carries_its_code_and_reason() {
-        let (mut client, mut server) = tokio::io::duplex(64);
-        let mut buf = Vec::new();
+        const ALL_CODES: [RejectCode; 9] = [
+            RejectCode::EmptyRequest,
+            RejectCode::UnknownVenue,
+            RejectCode::MalformedSymbol,
+            RejectCode::UnlistedSymbol,
+            RejectCode::DuplicatePair,
+            RejectCode::ShuttingDown,
+            RejectCode::ConnectorRefused,
+            RejectCode::ConnectorGone,
+            RejectCode::StreamEnded,
+        ];
 
-        write_reject(
-            &mut server,
-            RejectCode::InvalidArgument,
-            "unknown venue \"kraken\"",
-        )
-        .await
-        .expect("the pipe accepts the header");
+        for code in ALL_CODES {
+            let (mut client, mut server) = tokio::io::duplex(64);
+            let mut buf = Vec::new();
 
-        let rejected = read_response(&mut client, &mut buf)
-            .await
-            .expect("the header is well formed")
-            .expect_err("a non-empty header is a rejection");
-        assert_eq!(rejected.code(), RejectCode::InvalidArgument);
-        assert_eq!(rejected.reason(), "unknown venue \"kraken\"");
+            write_reject(&mut server, code, "unknown venue \"kraken\"")
+                .await
+                .expect("the pipe accepts the header");
+
+            let rejected = read_response(&mut client, &mut buf)
+                .await
+                .expect("the header is well formed")
+                .expect_err("a non-empty header is a rejection");
+            assert_eq!(rejected.code(), code);
+            assert_eq!(rejected.reason(), "unknown venue \"kraken\"");
+        }
     }
 
     /// A peer hanging up between frames is the ordinary end of a stream, and has to be

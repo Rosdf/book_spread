@@ -148,13 +148,13 @@ impl<S> Join<S> {
     ///
     /// Only ever reached off the hot path: a broadcaster whose own subscribe was refused, or
     /// one that is on its way out.
-    pub(super) async fn reject(mut self, why: &str)
+    pub(super) async fn reject(mut self, code: RejectCode, why: &str)
     where
         S: AsyncWrite + Unpin,
     {
         let written = tokio::time::timeout(
             REJECT_TIMEOUT,
-            framing::write_reject(&mut self.sock, RejectCode::Unavailable, why),
+            framing::write_reject(&mut self.sock, code, why),
         )
         .await;
         if !matches!(written, Ok(Ok(()))) {
@@ -287,7 +287,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcaster<S> {
         // A no-op when the loop exited through `retire_if_idle`, which already removed the
         // entry and issued the connector unsubscribe.
         self.registry.retire(self.claim());
-        self.joins.drain("stream ended").await;
+        self.joins.drain(RejectCode::StreamEnded, "stream ended").await;
         // `sessions` drops with `self`, and dropping a session closes its socket - which is
         // exactly how this protocol says a stream is over. There is nothing to drain.
     }

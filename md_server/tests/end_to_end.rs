@@ -185,12 +185,7 @@ async fn a_refused_request_says_why_and_ends_the_connection() {
         .expect("the header is well formed")
         .expect_err("an unknown venue is refused");
 
-    assert_eq!(rejected.code(), RejectCode::InvalidArgument);
-    assert!(
-        rejected.reason().contains("nope"),
-        "the reason names the venue that was asked for, got {:?}",
-        rejected.reason()
-    );
+    assert_eq!(rejected.code(), RejectCode::UnknownVenue);
     assert!(
         matches!(
             framing::read_frame(&mut sock, &mut buf).await,

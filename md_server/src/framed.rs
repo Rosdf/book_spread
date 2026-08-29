@@ -112,8 +112,8 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin + Send + 'static, P: Debug>
     match registry.subscribe(key, sock).await {
         Ok(Ok(())) => {}
         Ok(Err(refused)) => {
-            let (mut declined, why) = refused.into_parts();
-            reject(&mut declined, peer, framing::RejectCode::Unavailable, why).await;
+            let (mut declined, code, why) = refused.into_parts();
+            reject(&mut declined, peer, code, why).await;
         }
         Err(_) => tracing::debug!(?peer, "the registry could not answer for a connection"),
     }

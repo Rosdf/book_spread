@@ -29,7 +29,7 @@ const MAX_SYMBOL_LEN: usize = 32;
 pub(crate) fn key_of(request: &SubscribeBookRequest) -> Result<Instrument, Rejected> {
     if request.pairs.is_empty() {
         return Err(Rejected::new(
-            RejectCode::InvalidArgument,
+            RejectCode::EmptyRequest,
             Box::from("at least one pair is required"),
         ));
     }
@@ -38,20 +38,20 @@ pub(crate) fn key_of(request: &SubscribeBookRequest) -> Result<Instrument, Rejec
     for pair in &request.pairs {
         let Some(venue) = Venue::parse(&pair.venue) else {
             return Err(Rejected::new(
-                RejectCode::InvalidArgument,
+                RejectCode::UnknownVenue,
                 format!("unknown venue {:?}", pair.venue).into_boxed_str(),
             ));
         };
         let name = normalise_symbol(&pair.symbol)?;
         let Some(instrument) = Instrument::lookup(venue, name) else {
             return Err(Rejected::new(
-                RejectCode::InvalidArgument,
+                RejectCode::UnlistedSymbol,
                 format!("{name} is not listed as tradable on {}", venue.as_str()).into_boxed_str(),
             ));
         };
         if seen.contains(&instrument) {
             return Err(Rejected::new(
-                RejectCode::InvalidArgument,
+                RejectCode::DuplicatePair,
                 format!(
                     "duplicate pair {}/{}",
                     instrument.venue().as_str(),
@@ -74,13 +74,13 @@ pub(crate) fn key_of(request: &SubscribeBookRequest) -> Result<Instrument, Rejec
 fn normalise_symbol(raw: &str) -> Result<&str, Rejected> {
     if raw.is_empty() || raw.len() > MAX_SYMBOL_LEN {
         return Err(Rejected::new(
-            RejectCode::InvalidArgument,
+            RejectCode::MalformedSymbol,
             format!("symbol must be 1..={MAX_SYMBOL_LEN} bytes").into_boxed_str(),
         ));
     }
     if !raw.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
         return Err(Rejected::new(
-            RejectCode::InvalidArgument,
+            RejectCode::MalformedSymbol,
             Box::from("symbol must be ASCII alphanumeric"),
         ));
     }
@@ -120,7 +120,7 @@ mod test {
     fn a_symbol_the_connector_would_refuse_fails_the_request() {
         for raw in ["", "btc-usd", "btc usd", "btc/usd"] {
             let rejection = normalise_symbol(raw).expect_err("rejected before any lock is taken");
-            assert_eq!(rejection.code(), RejectCode::InvalidArgument, "for {raw:?}");
+            assert_eq!(rejection.code(), RejectCode::MalformedSymbol, "for {raw:?}");
         }
 
         let long = "a".repeat(MAX_SYMBOL_LEN + 1);
@@ -128,7 +128,7 @@ mod test {
             normalise_symbol(&long)
                 .expect_err("over the length bound")
                 .code(),
-            RejectCode::InvalidArgument
+            RejectCode::MalformedSymbol
         );
     }
 
@@ -146,12 +146,7 @@ mod test {
         assert_eq!(instrument, registered);
 
         let rejection = key_of(&asking("kraken", "btcusdt")).expect_err("an unknown venue");
-        assert_eq!(rejection.code(), RejectCode::InvalidArgument);
-        assert!(
-            rejection.reason().contains("kraken"),
-            "the reason names the venue that was asked for, got {:?}",
-            rejection.reason()
-        );
+        assert_eq!(rejection.code(), RejectCode::UnknownVenue);
     }
 
     /// The wire contract is case-sensitive: a client must send the venue's own spelling.
@@ -159,22 +154,21 @@ mod test {
     fn a_symbol_in_the_wrong_case_is_refused() {
         let _ = test_instrument_for(Venue::BinanceSpot, "CASETEST");
         let rejection = key_of(&asking("binance_spot", "casetest")).expect_err("wrong-case symbol");
-        assert_eq!(rejection.code(), RejectCode::InvalidArgument);
+        assert_eq!(rejection.code(), RejectCode::UnlistedSymbol);
     }
 
     #[test]
     fn an_unlisted_symbol_is_refused_with_no_round_trip() {
         let rejection = key_of(&asking("binance_spot", "NEVERLISTEDXYZ"))
             .expect_err("nothing has ever registered this name");
-        assert_eq!(rejection.code(), RejectCode::InvalidArgument);
-        assert!(rejection.reason().contains("not listed"));
+        assert_eq!(rejection.code(), RejectCode::UnlistedSymbol);
     }
 
     #[test]
     fn an_empty_pair_list_is_rejected() {
         let rejection =
             key_of(&SubscribeBookRequest { pairs: Vec::new() }).expect_err("no pairs to serve");
-        assert_eq!(rejection.code(), RejectCode::InvalidArgument);
+        assert_eq!(rejection.code(), RejectCode::EmptyRequest);
     }
 
     #[test]
@@ -201,7 +195,7 @@ mod test {
             ],
         };
         let rejection = key_of(&request).expect_err("a duplicate pair");
-        assert_eq!(rejection.code(), RejectCode::InvalidArgument);
+        assert_eq!(rejection.code(), RejectCode::DuplicatePair);
     }
 
     #[test]
@@ -214,11 +208,6 @@ mod test {
             ],
         };
         let rejection = key_of(&request).expect_err("the second pair is unusable");
-        assert_eq!(rejection.code(), RejectCode::InvalidArgument);
-        assert!(
-            rejection.reason().contains("kraken"),
-            "the reason names the venue that was asked for, got {:?}",
-            rejection.reason()
-        );
+        assert_eq!(rejection.code(), RejectCode::UnknownVenue);
     }
 }

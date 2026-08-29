@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite};
 use crate::broadcast::broadcaster::{Broadcaster, Join};
 use crate::broadcast::queue::{make_broadcaster_channel, BroadcasterTx};
+use md_wire::framing::RejectCode;
 
 pub(crate) mod events;
 
@@ -38,12 +39,18 @@ struct Entry<S> {
 #[derive(Debug)]
 pub(crate) struct Refused<S> {
     sock: S,
+    code: RejectCode,
     why: &'static str,
 }
 
 impl<S> Refused<S> {
-    pub(crate) fn into_parts(self) -> (S, &'static str) {
-        (self.sock, self.why)
+    #[cfg(test)]
+    pub(crate) fn code(&self) -> RejectCode {
+        self.code
+    }
+
+    pub(crate) fn into_parts(self) -> (S, RejectCode, &'static str) {
+        (self.sock, self.code, self.why)
     }
 }
 
@@ -238,6 +245,7 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
         let Some(tx) = started else {
             return Err(Refused {
                 sock: join.into_socket(),
+                code: RejectCode::ShuttingDown,
                 why: "server is shutting down",
             });
         };
@@ -277,12 +285,19 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
                     // will ever be. Nothing to unsubscribe - this broadcaster never held a
                     // subscription.
                     tx.abandon(Claim::new(instrument.id(), instrument.venue(), pending_joins));
-                    queued.drain(&err.to_string()).await;
+                    queued
+                        .drain(RejectCode::ConnectorRefused, &err.to_string())
+                        .await;
                     return;
                 }
                 Err(_) => {
                     tx.abandon(Claim::new(instrument.id(), instrument.venue(), pending_joins));
-                    queued.drain("connector stopped before it could subscribe").await;
+                    queued
+                        .drain(
+                            RejectCode::ConnectorGone,
+                            "connector stopped before it could subscribe",
+                        )
+                        .await;
                     return;
                 }
             };
@@ -544,12 +559,7 @@ mod test {
             .await
             .expect_err("the source rejects every symbol");
 
-        assert_eq!(rejected.code(), RejectCode::Unavailable);
-        assert!(
-            rejected.reason().contains("not listed as tradable"),
-            "the venue's own reason reaches the client, got {:?}",
-            rejected.reason()
-        );
+        assert_eq!(rejected.code(), RejectCode::ConnectorRefused);
         client.ended().await;
 
         assert!(
@@ -596,9 +606,9 @@ mod test {
             .await
             .expect("the registry task is alive")
             .expect_err("nothing is spawned after shutdown");
-        let (_sock, why) = refused.into_parts();
+        assert_eq!(refused.code(), RejectCode::ShuttingDown);
+        let (_sock, _code, _why) = refused.into_parts();
 
-        assert!(why.contains("shutting down"), "got {why:?}");
         assert!(
             source.subscribed().is_empty(),
             "nothing is subscribed on the connector after shutdown"

@@ -1,4 +1,5 @@
 use crate::broadcast::broadcaster::Join;
+use md_wire::framing::RejectCode;
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 
@@ -14,12 +15,12 @@ impl<S> BroadcasterTx<S> {
 }
 
 impl<S> BroadcasterRx<S> {
-    pub(crate) async fn drain(mut self, why: &str)
+    pub(crate) async fn drain(mut self, code: RejectCode, why: &str)
     where
         S: AsyncWrite + Unpin,
     {
         while let Some(join) = self.0.recv().await {
-            join.reject(why).await;
+            join.reject(code, why).await;
         }
     }
     
