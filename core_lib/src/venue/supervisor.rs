@@ -488,8 +488,7 @@ mod test {
         // Interned so the event can carry a real `Instrument`, but never listed by the venue
         // above - the same shape a delisted instrument would have.
         let dogeusd = test_instrument_for(Venue::BinanceSpot, "dogeusd");
-        let (event, reply) = Subscribe::new(dogeusd.id());
-        tx.send(ConnectorEvent::Subscribe(event));
+        let reply = tx.subscribe(dogeusd.id());
 
         let why = tokio::time::timeout(Duration::from_secs(30), reply)
             .await
@@ -500,7 +499,7 @@ mod test {
         assert!(why.contains("not listed as tradable"), "{why}");
 
         let (ack, acked) = oneshot::channel();
-        tx.send(ConnectorEvent::ShutDown(ack));
+        tx.send_test(ConnectorEvent::ShutDown(ack));
         let _ = tokio::time::timeout(Duration::from_secs(120), acked).await;
         let _ = tokio::time::timeout(Duration::from_secs(120), supervisor).await;
     }

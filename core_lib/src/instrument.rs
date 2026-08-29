@@ -111,7 +111,7 @@ impl Debug for Instrument {
 
 impl fmt::Display for Instrument {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
+        f.write_fmt(format_args!("{}|{}", self.name(), self.venue().as_str()))
     }
 }
 
@@ -267,7 +267,7 @@ static REGISTRY: Registry = Registry::new();
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::connector::{InstrumentRegistrar, VenueGuard};
+    use crate::connector::VenueGuard;
 
     #[test]
     fn interning_the_same_name_twice_returns_the_same_handle() {

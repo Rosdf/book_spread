@@ -134,8 +134,8 @@ async fn reject<S: AsyncWrite + Unpin, P: Debug>(
 
 #[cfg(test)]
 mod test {
+    use crate::peer::Client;
     use crate::registry::harness::registry_for;
-    use crate::session::peer::Client;
     use crate::test_util::FakeSource;
     use crate::transport::mock::MockListener;
     use crate::venue::Venue;

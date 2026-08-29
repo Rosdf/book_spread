@@ -53,7 +53,7 @@ pub struct ConnectorRx {
 }
 
 #[derive(Debug)]
-pub(crate) struct ConnectorTx {
+pub struct ConnectorTx {
     tx: tokio::sync::mpsc::UnboundedSender<ConnectorEvent>,
 }
 
@@ -64,8 +64,29 @@ impl ConnectorRx {
 }
 
 impl ConnectorTx {
-    pub(crate) fn send(&self, event: ConnectorEvent) {
+    pub(super) fn send(&self, event: ConnectorEvent) {
         let _ = self.tx.send(event);
+    }
+    
+    #[cfg(test)]
+    pub(crate) fn send_test(&self, event: ConnectorEvent) {
+        self.send(event);
+    }
+
+    /// Tears down one instrument's stream. An instrument this connector never carried is
+    /// logged by the connector and otherwise ignored - the teardown is already observable
+    /// in-band through the book channel, so there is nothing for this call to report.
+    pub fn unsubscribe(&self, instrument: InstrumentId) {
+        self.send(ConnectorEvent::Unsubscribe(Unsubscribe::new(instrument)));
+    }
+
+    pub fn subscribe(
+        &self,
+        instrument: InstrumentId,
+    ) -> oneshot::Receiver<anyhow::Result<BookReader>> {
+        let (event, rx) = Subscribe::new(instrument);
+        self.send(ConnectorEvent::Subscribe(event));
+        rx
     }
 }
 

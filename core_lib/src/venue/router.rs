@@ -108,7 +108,7 @@ impl<C> Router<C> {
         let mut orphaned = Vec::new();
         self.by_symbol.retain(|symbol, bound| {
             if *bound == id {
-                orphaned.push(symbol.clone());
+                orphaned.push(*symbol);
                 false
             } else {
                 true
@@ -153,7 +153,7 @@ impl<C> Router<C> {
         let mut orphaned = Vec::new();
         self.by_symbol.retain(|symbol, id| {
             if dead.contains(id) {
-                orphaned.push(symbol.clone());
+                orphaned.push(*symbol);
                 false
             } else {
                 true
@@ -166,7 +166,7 @@ impl<C> Router<C> {
 #[cfg(test)]
 mod test {
     use super::Router;
-    use crate::connector::{InstrumentRegistrar, VenueGuard};
+    use crate::connector::{InstrumentRegistrar as _, VenueGuard};
     use crate::instrument::InstrumentId;
     use all_venues::Venue;
     use tokio::sync::mpsc;

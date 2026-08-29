@@ -77,10 +77,7 @@ mod shared {
             //    for the counter
             // 2. counter_offset is a multiple of ALIGN = align_of::<Counter>(),
             //    and `ptr` is ALIGN-aligned, so the counter address is aligned
-            #[expect(
-                clippy::cast_ptr_alignment,
-                reason = "counter offset is internally aligned"
-            )]
+            #[expect(clippy::cast_ptr_alignment, reason = "counter offset is internally aligned")]
             unsafe {
                 ptr.add(Self::counter_offset(data_len))
                     .cast::<Counter>()
@@ -501,17 +498,17 @@ impl Clone for SharedString {
             }
             Prefix::Inline => Self {
                 header: self.header,
-                // SAFETY:
-                // INLINE_PREFIX means we have inlined variant
                 inner: Inner {
+                    // SAFETY:
+                    // INLINE_PREFIX means we have inlined variant
                     inlined: unsafe { self.inner.inlined },
                 },
             },
             Prefix::Static => Self {
                 header: self.header,
-                // SAFETY:
-                // STATIC_PREFIX means we have static_str variant
                 inner: Inner {
+                    // SAFETY:
+                    // STATIC_PREFIX means we have static_str variant
                     static_str: unsafe { self.inner.static_str },
                 },
             },

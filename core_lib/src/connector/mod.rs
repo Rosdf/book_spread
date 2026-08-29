@@ -1,7 +1,5 @@
 use crate::connector::book_publisher::BookReader;
-use crate::connector::events::{
-    ConnectorEvent, ConnectorRx, ConnectorTx, Subscribe, Unsubscribe, create_event_channel,
-};
+use crate::connector::events::{ConnectorEvent, ConnectorRx, ConnectorTx, create_event_channel};
 use crate::instrument::{Instrument, InstrumentId};
 use crate::venue::ConnectorConfig;
 use all_venues::Venue;
@@ -97,17 +95,14 @@ impl ConnectorHandle {
         &self,
         instrument: InstrumentId,
     ) -> oneshot::Receiver<anyhow::Result<BookReader>> {
-        let (event, rx) = Subscribe::new(instrument);
-        self.tx.send(ConnectorEvent::Subscribe(event));
-        rx
+        self.tx.subscribe(instrument)
     }
 
     /// Tears down one instrument's stream. An instrument this connector never carried is
     /// logged by the connector and otherwise ignored - the teardown is already observable
     /// in-band through the book channel, so there is nothing for this call to report.
     pub fn unsubscribe(&self, instrument: InstrumentId) {
-        self.tx
-            .send(ConnectorEvent::Unsubscribe(Unsubscribe::new(instrument)));
+        self.tx.unsubscribe(instrument);
     }
 
     pub async fn shutdown(self) {
@@ -122,8 +117,8 @@ impl ConnectorHandle {
     }
 }
 
-/// A [`InstrumentRegistrar`] over any venue, for test code that needs more than one at once - unlike
-/// [`TestGuard`], which is fixed to [`Venue::BinanceSpot`].
+/// An [`InstrumentRegistrar`] over any venue a test names, for test code that needs more than
+/// one venue registered at once.
 #[cfg(any(test, feature = "test_util"))]
 #[derive(Debug)]
 pub struct VenueGuard(Venue);

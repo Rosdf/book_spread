@@ -35,8 +35,9 @@ pub(crate) mod framed;
 pub(crate) mod registry;
 pub(crate) mod request;
 pub mod server;
-pub(crate) mod session;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
 pub(crate) mod transport;
 pub(crate) mod venue;
+#[cfg(test)]
+pub(crate) mod peer;

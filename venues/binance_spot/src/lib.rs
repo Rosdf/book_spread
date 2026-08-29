@@ -34,18 +34,19 @@
 //! use binance_spot::BinanceSpot;
 //! use core_lib::Venue;
 //! use core_lib::connector::ConnectorHandle;
+//! use core_lib::instrument::Instrument;
 //! use core_lib::venue::ConnectorConfig;
 //!
 //! // The venue's own `Config` is only its extras; `ConnectorConfig` pairs it with the
 //! // shared `CoreConfig`, and its `Default` picks up this venue's overrides for both.
 //! let handle = ConnectorHandle::new::<BinanceSpot>(ConnectorConfig::default());
 //!
-//! // `subscribe` takes an already-interned `Instrument` rather than a raw name: the connector
-//! // registers every symbol it lists as tradable, so a caller resolves one from the global
-//! // registry - here, after giving the connector's first listing refresh time to land.
-//! let btcusdt = core_lib::instrument::lookup(Venue::BinanceSpot, "BTCUSDT")
-//!     .expect("BTCUSDT is listed");
-//! let mut reader = handle.subscribe(btcusdt).await??;
+//! // `subscribe` takes an already-interned instrument's `InstrumentId` rather than a raw
+//! // name: the connector registers every symbol it lists as tradable, so a caller resolves
+//! // one from the global registry - here, after giving the connector's first listing refresh
+//! // time to land.
+//! let btcusdt = Instrument::lookup(Venue::BinanceSpot, "BTCUSDT").expect("BTCUSDT is listed");
+//! let mut reader = handle.subscribe(btcusdt.id()).await??;
 //!
 //! while reader.wait_update().await.is_some() {
 //!     let book = reader.get_last();

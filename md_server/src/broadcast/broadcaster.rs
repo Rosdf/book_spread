@@ -6,9 +6,10 @@
 //! turn, so the same `Bytes` reaches every client with no copy of its own. See
 //! [`crate::session`] for the write state machine and what backpressure does to it.
 
+use super::session::{Session, SessionCtx};
+use crate::broadcast::queue::BroadcasterRx;
 use crate::encode::{BookEncoder, BufferProvider};
 use crate::registry::events::{Claim, RegistryTx};
-use crate::session::{Session, SessionCtx};
 use bytes::{Bytes, BytesMut};
 use core_lib::connector::book_publisher::BookReader;
 use core_lib::instrument::Instrument;
@@ -19,7 +20,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
 
 /// How often a broadcaster re-checks whether anyone is left.
 ///
@@ -49,10 +49,7 @@ impl BufferPool {
     }
 
     fn get(&mut self, capacity: usize) -> BytesMut {
-        let pos = self
-            .unused
-            .iter_mut()
-            .rposition(|b| b.try_reclaim(capacity));
+        let pos = self.unused.iter_mut().position(|b| b.try_reclaim(capacity));
 
         if let Some(idx) = pos {
             self.unused.swap_remove(idx)
@@ -131,7 +128,7 @@ pub(crate) struct Join<S> {
     sock: S,
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> Join<S> {
+impl<S> Join<S> {
     pub(crate) fn new(sock: S) -> Self {
         Self { sock }
     }
@@ -151,7 +148,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Join<S> {
     ///
     /// Only ever reached off the hot path: a broadcaster whose own subscribe was refused, or
     /// one that is on its way out.
-    pub(crate) async fn reject(mut self, why: &str) {
+    pub(super) async fn reject(mut self, why: &str)
+    where
+        S: AsyncWrite + Unpin,
+    {
         let written = tokio::time::timeout(
             REJECT_TIMEOUT,
             framing::write_reject(&mut self.sock, RejectCode::Unavailable, why),
@@ -180,11 +180,11 @@ enum Wake<S> {
 /// Owns one symbol's [`BookReader`] and every client socket attached to it.
 #[derive(Debug)]
 pub(crate) struct Broadcaster<S> {
-    key: Instrument,
+    instrument: Instrument,
     reader: BookReader,
     /// One entry per attached client, written to in order on every update.
     sessions: Vec<Session<S>>,
-    joins: mpsc::UnboundedReceiver<Join<S>>,
+    joins: BroadcasterRx<S>,
     /// Joins the registry has queued but this task has not taken yet. Also this
     /// broadcaster's identity to the registry - see [`Claim`].
     pending_joins: Arc<AtomicUsize>,
@@ -208,37 +208,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcaster<S> {
     /// last of them is dropped, which is on the way out of this function.
     pub(crate) async fn start(
         registry: RegistryTx<S>,
-        key: Instrument,
-        mut joins: mpsc::UnboundedReceiver<Join<S>>,
+        instrument: Instrument,
+        joins: BroadcasterRx<S>,
         pending_joins: Arc<AtomicUsize>,
-        subscribed: oneshot::Receiver<anyhow::Result<BookReader>>,
+        mut reader: BookReader,
     ) {
-        let mut reader = match subscribed.await {
-            Ok(Ok(reader)) => reader,
-            Ok(Err(err)) => {
-                tracing::warn!(
-                    venue = key.venue().as_str(),
-                    symbol = key.name(),
-                    %err,
-                    "subscribe rejected"
-                );
-                // Queued before the drain: once the registry has taken the entry out, no
-                // further join can be sent here, so the drain below answers every one there
-                // will ever be. Nothing to unsubscribe - this broadcaster never held a
-                // subscription.
-                registry.abandon(Claim::new(key, pending_joins));
-                drain_joins(&mut joins, &err.to_string()).await;
-                return;
-            }
-            Err(_) => {
-                registry.abandon(Claim::new(key, pending_joins));
-                drain_joins(&mut joins, "connector stopped before it could subscribe").await;
-                return;
-            }
-        };
-
         let mut pool = BufferPool::new();
-        let encoder = BookEncoder::new(key.venue().as_str());
+        let encoder = BookEncoder::new(instrument.venue().as_str());
         let latest = {
             let book = reader.get_last();
             encoder.encode(book.asks(), book.bids(), &mut pool)
@@ -246,7 +222,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcaster<S> {
 
         Self {
             encoder,
-            key,
+            instrument,
             reader,
             sessions: Vec::new(),
             joins,
@@ -311,7 +287,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcaster<S> {
         // A no-op when the loop exited through `retire_if_idle`, which already removed the
         // entry and issued the connector unsubscribe.
         self.registry.retire(self.claim());
-        drain_joins(&mut self.joins, "stream ended").await;
+        self.joins.drain("stream ended").await;
         // `sessions` drops with `self`, and dropping a session closes its socket - which is
         // exactly how this protocol says a stream is over. There is nothing to drain.
     }
@@ -369,7 +345,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcaster<S> {
 
     /// Names this broadcaster to the registry. `Instrument` is `Copy`, so this costs nothing.
     fn claim(&self) -> Claim {
-        Claim::new(self.key, Arc::clone(&self.pending_joins))
+        Claim::new(
+            self.instrument.id(),
+            self.instrument.venue(),
+            Arc::clone(&self.pending_joins),
+        )
     }
 }
 
@@ -406,25 +386,12 @@ fn poll_sessions<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-/// Answers every queued join with `why` and returns once the channel is closed.
-///
-/// Only correct after the registry entry has been removed: that is what drops the sending
-/// half, so `recv` reports `None` instead of parking forever.
-async fn drain_joins<S: AsyncRead + AsyncWrite + Unpin>(
-    joins: &mut mpsc::UnboundedReceiver<Join<S>>,
-    why: &str,
-) {
-    while let Some(join) = joins.recv().await {
-        join.reject(why).await;
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::SESSION_SWEEP;
     use crate::encode::BufferProvider;
+    use crate::peer::{Client, connected, connected_congested};
     use crate::registry::harness::{Harness, registry_for};
-    use crate::session::peer::{Client, connected, connected_congested};
     use crate::test_util::{FakeSource, book};
     use crate::transport::mock::{MockControl, MockStream};
     use crate::venue::Venue;
@@ -496,7 +463,7 @@ mod test {
     async fn is_registered(harness: &Harness) -> bool {
         harness
             .registry
-            .is_registered(key())
+            .is_registered(key().id())
             .await
             .expect("the registry task is alive")
     }

@@ -377,7 +377,8 @@ use crate::venue::table::{Slot, SlotState};
 use all_venues::Venue;
 use std::time::Instant;
 
-/// As [`test_instrument`], under `venue` rather than always [`Venue::BinanceSpot`].
+/// Interns `name` under `venue` for a test, so test code can build an [`Instrument`] with no
+/// connector running - see [`VenueGuard`].
 #[must_use]
 pub fn test_instrument_for(venue: Venue, name: &str) -> Instrument {
     VenueGuard::new(venue).register(name)

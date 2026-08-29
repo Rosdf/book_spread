@@ -8,10 +8,11 @@
 //! and are still ordered against everything else by the queue.
 
 use crate::registry::Refused;
-use core_lib::instrument::Instrument;
+use core_lib::instrument::{Instrument, InstrumentId};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tokio::sync::mpsc;
+use core_lib::Venue;
 
 /// One generation of broadcaster for one key.
 ///
@@ -21,17 +22,22 @@ use tokio::sync::mpsc;
 /// allocated to name a generation.
 #[derive(Debug)]
 pub(crate) struct Claim {
-    key: Instrument,
+    instrument_id: InstrumentId,
+    venue: Venue,
     pending_joins: Arc<AtomicUsize>,
 }
 
 impl Claim {
-    pub(crate) fn new(key: Instrument, pending_joins: Arc<AtomicUsize>) -> Self {
-        Self { key, pending_joins }
+    pub(crate) fn new(instrument_id: InstrumentId, venue: Venue, pending_joins: Arc<AtomicUsize>) -> Self {
+        Self { instrument_id, venue, pending_joins }
     }
 
-    pub(crate) fn key(&self) -> &Instrument {
-        &self.key
+    pub(crate) fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    pub(crate) fn venue(&self) -> Venue {
+        self.venue
     }
 
     pub(crate) fn pending_joins(&self) -> &Arc<AtomicUsize> {
@@ -95,9 +101,9 @@ pub(super) enum RegistryEvent<S> {
     /// [`RegistryHandle::shutdown`](super::RegistryHandle::shutdown).
     ShutDown,
     #[cfg(test)]
-    IsRegistered(Instrument, oneshot::Sender<bool>),
+    IsRegistered(InstrumentId, oneshot::Sender<bool>),
     #[cfg(test)]
-    EntryToken(Instrument, oneshot::Sender<Option<Arc<AtomicUsize>>>),
+    EntryToken(InstrumentId, oneshot::Sender<Option<Arc<AtomicUsize>>>),
 }
 
 /// The receiving half, owned by the registry task.
@@ -182,7 +188,7 @@ impl<S> RegistryTx<S> {
     }
 
     #[cfg(test)]
-    pub(crate) fn is_registered(&self, key: Instrument) -> oneshot::Receiver<bool> {
+    pub(crate) fn is_registered(&self, key: InstrumentId) -> oneshot::Receiver<bool> {
         let (reply, rx) = oneshot::channel();
         self.send(RegistryEvent::IsRegistered(key, reply));
         rx
@@ -191,7 +197,7 @@ impl<S> RegistryTx<S> {
     #[cfg(test)]
     pub(super) fn entry_token(
         &self,
-        key: Instrument,
+        key: InstrumentId,
     ) -> oneshot::Receiver<Option<Arc<AtomicUsize>>> {
         let (reply, rx) = oneshot::channel();
         self.send(RegistryEvent::EntryToken(key, reply));

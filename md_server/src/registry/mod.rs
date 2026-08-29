@@ -1,25 +1,26 @@
 //! Which symbols are being broadcast, and the two races around starting and stopping one.
 
-use crate::broadcast::{Broadcaster, Join};
 use crate::registry::events::{
     Claim, RegistryEvent, RegistryRx, RegistryTx, RegistryWeakTx, create_event_channel,
 };
 use crate::venue::{BookSource as _, Connectors};
-use core_lib::instrument::{Instrument};
+use core_lib::Venue;
+use core_lib::instrument::{Instrument, InstrumentId};
 use core_lib::map::{InternalHashMap, new_internal_map};
 use core_lib::panic::panic_message;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use crate::broadcast::broadcaster::{Broadcaster, Join};
+use crate::broadcast::queue::{make_broadcaster_channel, BroadcasterTx};
 
 pub(crate) mod events;
 
 /// The registry's half of one running broadcaster.
 #[derive(Debug)]
 struct Entry<S> {
-    joins: mpsc::UnboundedSender<Join<S>>,
+    joins: BroadcasterTx<S>,
     /// Joins already queued on `joins` that the broadcaster has not taken yet.
     ///
     /// This is what closes the teardown race: the increment happens on the registry task,
@@ -115,12 +116,20 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
 /// preserves it.
 ///
 /// Every handler below is therefore *synchronous* - a hash lookup, a channel send and an
-/// atomic - and that is a rule rather than an accident. An `.await` inside one would let a
-/// later event overtake an earlier one's effects and put both of those orderings back in
-/// play.
+/// atomic - and that is a rule rather than an accident. `handle` is the critical section the
+/// `std::sync::Mutex` this task replaced used to hold, so an `.await` inside it is the same
+/// bug as holding a lock across a yield, minus the guard that would make it visible: the
+/// increment-then-send in [`Registry::subscribe`] and the zero-check-then-remove in
+/// [`Registry::retire_if_idle`] are indivisible only because nothing runs on this task
+/// between their steps, while broadcasters concurrently decrement `pending_joins` and drop
+/// the receiving half of the join channel. Being synchronous is also what lets
+/// [`Registry::run`] wrap a handler in `catch_unwind`, and what keeps the one queue every
+/// handshake and every broadcaster reaches the registry through from stalling on a venue
+/// round trip - which is why `subscribe` takes the connector's reply channel here and awaits
+/// it on the spawned task instead.
 #[derive(Debug)]
 struct Registry<C, S> {
-    entries: InternalHashMap<Instrument, Entry<S>>,
+    entries: InternalHashMap<InstrumentId, Entry<S>>,
     connectors: C,
     /// Set by [`RegistryEvent::ShutDown`]. "Do not start anything new" - an entry that is
     /// still being torn down is still served.
@@ -204,10 +213,10 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
     /// occupied and queue a join. Exactly one `BookSource::subscribe` is ever issued per key -
     /// which is an invariant, not a nicety: the connector hard-errors a duplicate subscribe,
     /// and `BookReader` is not `Clone`, so a symbol has exactly one reader.
-    fn subscribe(&mut self, key: Instrument, sock: S) -> Result<(), Refused<S>> {
+    fn subscribe(&mut self, instrument: Instrument, sock: S) -> Result<(), Refused<S>> {
         let mut join = Join::new(sock);
 
-        if let Some(entry) = self.entries.get(&key) {
+        if let Some(entry) = self.entries.get(&instrument.id()) {
             // Incremented before the send, so a broadcaster whose `RetireIfIdle` is queued
             // behind this event sees the join and stays alive for it.
             entry.pending_joins.fetch_add(1, Ordering::Relaxed);
@@ -215,9 +224,9 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
                 Ok(()) => return Ok(()),
                 // The broadcaster is gone but its `Retire` has not been handled yet. Drop the
                 // stale entry and start a fresh one below.
-                Err(mpsc::error::SendError(returned)) => {
+                Err(returned) => {
                     join = returned;
-                    self.entries.remove(&key);
+                    self.entries.remove(&instrument.id());
                 }
             }
         }
@@ -233,13 +242,14 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
             });
         };
 
-        let (joins, queued) = mpsc::unbounded_channel();
+        let (joins, queued) = make_broadcaster_channel();
         let pending_joins = Arc::new(AtomicUsize::new(1));
         joins
             .send(join)
+            .map_err(|_| ())
             .expect("the receiving half is still in scope");
         self.entries.insert(
-            key,
+            instrument.id(),
             Entry {
                 joins,
                 pending_joins: Arc::clone(&pending_joins),
@@ -250,16 +260,42 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
         // put it after the `unsubscribe` of whatever generation held this key before. It
         // costs no await: `BookSource::subscribe` hands back the reply channel rather than a
         // future, so the broadcaster is what waits for the venue.
-        let reader = self.connectors.source(key.venue()).subscribe(key.id());
+        let sub = self.connectors.source(instrument.venue()).subscribe(instrument.id());
 
-        tokio::spawn(Broadcaster::start(tx, key, queued, pending_joins, reader));
+        tokio::spawn(async move {
+            let reader = match sub.await {
+                Ok(Ok(reader)) => reader,
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        venue = instrument.venue().as_str(),
+                        symbol = instrument.name(),
+                        %err,
+                        "subscribe rejected"
+                    );
+                    // Queued before the drain: once the registry has taken the entry out, no
+                    // further join can be sent here, so the drain below answers every one there
+                    // will ever be. Nothing to unsubscribe - this broadcaster never held a
+                    // subscription.
+                    tx.abandon(Claim::new(instrument.id(), instrument.venue(), pending_joins));
+                    queued.drain(&err.to_string()).await;
+                    return;
+                }
+                Err(_) => {
+                    tx.abandon(Claim::new(instrument.id(), instrument.venue(), pending_joins));
+                    queued.drain("connector stopped before it could subscribe").await;
+                    return;
+                }
+            };
+
+            Broadcaster::start(tx, instrument, queued, pending_joins, reader).await;
+        });
         Ok(())
     }
 
     /// Called for a broadcaster whose session list has just emptied. `true` means the entry
     /// is gone and the task should stop.
     fn retire_if_idle(&mut self, claim: &Claim) -> bool {
-        let Some(entry) = self.entries.get(claim.key()) else {
+        let Some(entry) = self.entries.get(&claim.instrument_id()) else {
             return true;
         };
         if !Arc::ptr_eq(&entry.pending_joins, claim.pending_joins()) {
@@ -271,8 +307,8 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
             return false;
         }
 
-        self.entries.remove(claim.key());
-        self.unsubscribe(*claim.key());
+        self.entries.remove(&claim.instrument_id());
+        self.unsubscribe(claim.venue(), claim.instrument_id());
         true
     }
 
@@ -284,7 +320,7 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
     /// that exited through [`Registry::retire_if_idle`] can still send this on its way out.
     fn retire(&mut self, claim: &Claim) {
         if self.take_entry(claim) {
-            self.unsubscribe(*claim.key());
+            self.unsubscribe(claim.venue(), claim.instrument_id());
         }
     }
 
@@ -296,28 +332,28 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
     /// rejected sends no unsubscribe, because it never held a subscription, and if the
     /// rejection was "already subscribed" then the subscription belongs to someone else.
     fn take_entry(&mut self, claim: &Claim) -> bool {
-        let Some(entry) = self.entries.get(claim.key()) else {
+        let Some(entry) = self.entries.get(&claim.instrument_id()) else {
             return false;
         };
         if !Arc::ptr_eq(&entry.pending_joins, claim.pending_joins()) {
             return false;
         }
 
-        self.entries.remove(claim.key());
+        self.entries.remove(&claim.instrument_id());
         true
     }
 
-    fn unsubscribe(&self, key: Instrument) {
-        self.connectors.source(key.venue()).unsubscribe(key.id());
+    fn unsubscribe(&self, venue: Venue, instrument_id: InstrumentId) {
+        self.connectors.source(venue).unsubscribe(instrument_id);
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::events::Claim;
-    use crate::broadcast::SESSION_SWEEP;
+    use crate::broadcast::broadcaster::SESSION_SWEEP;
     use crate::registry::harness::{Harness, registry_for};
-    use crate::session::peer::{Client, connected};
+    use crate::peer::{Client, connected};
     use crate::test_util::FakeSource;
     use crate::transport::mock::MockStream;
     use crate::venue::Venue;
@@ -363,7 +399,7 @@ mod test {
     async fn is_registered(harness: &Harness) -> bool {
         harness
             .registry
-            .is_registered(key())
+            .is_registered(key().id())
             .await
             .expect("the registry task is alive")
     }
@@ -371,7 +407,7 @@ mod test {
     async fn entry_token(harness: &Harness) -> Option<Arc<AtomicUsize>> {
         harness
             .registry
-            .entry_token(key())
+            .entry_token(key().id())
             .await
             .expect("the registry task is alive")
     }
@@ -430,9 +466,11 @@ mod test {
         drop(first);
 
         let (mut second, queued) = subscribe(&harness);
-        let retiring = harness
-            .registry
-            .retire_if_idle(Claim::new(key(), Arc::clone(&token)));
+        let retiring = harness.registry.retire_if_idle(Claim::new(
+            key().id(),
+            key().venue(),
+            Arc::clone(&token),
+        ));
 
         assert!(
             !retiring.await.expect("the registry task is alive"),

@@ -386,7 +386,18 @@ where
 
                 received = subs_rx.recv() => {
                     let Some(cmd) = received else { return false };
-                    self.apply(cmd);
+                    // Not `self.apply(cmd)`: that also enqueues the command's control frame on
+                    // the pacer, but there is no socket to send one on while backing off, and
+                    // the next `session` resubscribes every wire name in the table anyway - see
+                    // this method's doc.
+                    match cmd {
+                        LaneCommand::Subscribe { instrument_id, reply } => {
+                            self.insert_slot(Instrument::by_id(instrument_id), reply);
+                        }
+                        LaneCommand::Unsubscribe { instrument_id } => {
+                            self.remove_slot(Instrument::by_id(instrument_id));
+                        }
+                    }
                 }
             }
         }
