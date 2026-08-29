@@ -11,17 +11,17 @@ use core_lib::panic::panic_message;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::io::{AsyncRead, AsyncWrite};
 use crate::broadcast::broadcaster::{Broadcaster, Join};
 use crate::broadcast::queue::{make_broadcaster_channel, BroadcasterTx};
-use md_wire::framing::RejectCode;
+use crate::client::ClientHandshake;
+use md_wire::grpc::{RejectCode, Rejected};
 
 pub(crate) mod events;
 
 /// The registry's half of one running broadcaster.
 #[derive(Debug)]
-struct Entry<S> {
-    joins: BroadcasterTx<S>,
+struct Entry<C> {
+    joins: BroadcasterTx<C>,
     /// Joins already queued on `joins` that the broadcaster has not taken yet.
     ///
     /// This is what closes the teardown race: the increment happens on the registry task,
@@ -32,25 +32,24 @@ struct Entry<S> {
     pending_joins: Arc<AtomicUsize>,
 }
 
-/// A socket handed back because the registry would not start a broadcaster for it.
+/// A client handed back because the registry would not start a broadcaster for it.
 ///
 /// Returned rather than refused in place so the refusal is written by the caller, which is
 /// already in the async context the handshake runs in.
 #[derive(Debug)]
-pub(crate) struct Refused<S> {
-    sock: S,
-    code: RejectCode,
-    why: &'static str,
+pub(crate) struct Refused<C> {
+    client: C,
+    rejected: Rejected,
 }
 
-impl<S> Refused<S> {
+impl<C> Refused<C> {
     #[cfg(test)]
     pub(crate) fn code(&self) -> RejectCode {
-        self.code
+        self.rejected.code()
     }
 
-    pub(crate) fn into_parts(self) -> (S, RejectCode, &'static str) {
-        (self.sock, self.code, self.why)
+    pub(crate) fn into_parts(self) -> (C, Rejected) {
+        (self.client, self.rejected)
     }
 }
 
@@ -61,14 +60,14 @@ impl<S> Refused<S> {
 /// each broadcaster - holds a `RegistryTx` instead, which is what makes this the only place
 /// that can shut the registry down.
 #[derive(Debug)]
-pub(crate) struct RegistryHandle<C, S> {
-    tx: RegistryTx<S>,
-    task: tokio::task::JoinHandle<C>,
+pub(crate) struct RegistryHandle<V, C> {
+    tx: RegistryTx<C>,
+    task: tokio::task::JoinHandle<V>,
 }
 
-impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RegistryHandle<C, S> {
+impl<V: Connectors, C: ClientHandshake> RegistryHandle<V, C> {
     /// Spawns the registry task and gives it `connectors` to own.
-    pub(crate) fn spawn(connectors: C) -> Self {
+    pub(crate) fn spawn(connectors: V) -> Self {
         let (rx, tx) = create_event_channel();
         let registry = Registry {
             entries: new_internal_map(),
@@ -84,7 +83,7 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
     }
 
     /// A handle for something that will talk to the registry but must not be able to end it.
-    pub(crate) fn tx(&self) -> RegistryTx<S> {
+    pub(crate) fn tx(&self) -> RegistryTx<C> {
         self.tx.clone()
     }
 
@@ -99,7 +98,7 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
     ///
     /// `None` when the task did not finish - it panicked outside an event handler, or was
     /// aborted - in which case the connectors cannot be reclaimed and are left running.
-    pub(crate) async fn shutdown(self) -> Option<C> {
+    pub(crate) async fn shutdown(self) -> Option<V> {
         let Self { tx, task } = self;
         tx.shut_down();
         drop(tx);
@@ -135,9 +134,9 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
 /// round trip - which is why `subscribe` takes the connector's reply channel here and awaits
 /// it on the spawned task instead.
 #[derive(Debug)]
-struct Registry<C, S> {
-    entries: InternalHashMap<InstrumentId, Entry<S>>,
-    connectors: C,
+struct Registry<V, C> {
+    entries: InternalHashMap<InstrumentId, Entry<C>>,
+    connectors: V,
     /// Set by [`RegistryEvent::ShutDown`]. "Do not start anything new" - an entry that is
     /// still being torn down is still served.
     shutting_down: bool,
@@ -146,12 +145,12 @@ struct Registry<C, S> {
     /// Weak on purpose: a strong handle held here would count towards its own channel and
     /// the task's `recv` would never report `None`, so the one signal this whole shutdown
     /// path rests on would never fire.
-    tx: RegistryWeakTx<S>,
+    tx: RegistryWeakTx<C>,
 }
 
-impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry<C, S> {
+impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     /// Serves the queue until every [`RegistryTx`] is gone, then hands the connectors back.
-    async fn run(mut self, mut rx: RegistryRx<S>) -> C {
+    async fn run(mut self, mut rx: RegistryRx<C>) -> V {
         while let Some(event) = rx.recv().await {
             // A panicking handler must not take the map - or the connectors, or every
             // running broadcaster's only way to reach the registry - down with it. This is
@@ -173,12 +172,13 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
 
     /// The whole of the critical section, in one synchronous call. See the note on
     /// [`Registry`] about why nothing in here may await.
-    fn handle(&mut self, event: RegistryEvent<S>) {
+    fn handle(&mut self, event: RegistryEvent<C>) {
         match event {
             RegistryEvent::Subscribe(joining) => {
                 let (key, sock, reply) = joining.into_parts();
-                // A dropped receiver just means the handshake gave up; the socket in a
-                // `Refused` goes with it, which closes it - the same answer, unwritten.
+                // A dropped receiver just means the handshake gave up; the client in a
+                // `Refused` goes with it, which closes the connection - the same answer,
+                // unwritten.
                 let _ = reply.send(self.subscribe(key, sock));
             }
             RegistryEvent::RetireIfIdle(retiring) => {
@@ -208,20 +208,20 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
         }
     }
 
-    /// Hands `sock` to `key`'s broadcaster, starting one if this is the first client.
+    /// Hands `client` to `key`'s broadcaster, starting one if this is the first client.
     ///
-    /// The broadcaster answers on the socket itself - an acceptance header, or a refusal
+    /// The broadcaster answers on the connection itself - response headers, or a refusal
     /// carrying the venue's own reason - so a symbol the venue does not list ends the
     /// connection rather than opening a stream that never produces anything. Nothing comes
-    /// back to the caller except a socket the registry declined to take at all.
+    /// back to the caller except a client the registry declined to take at all.
     ///
     /// Every client of a brand new symbol is served by this one task, and the entry goes into
     /// the map before the broadcaster is even spawned, so all but the first can only find it
     /// occupied and queue a join. Exactly one `BookSource::subscribe` is ever issued per key -
     /// which is an invariant, not a nicety: the connector hard-errors a duplicate subscribe,
     /// and `BookReader` is not `Clone`, so a symbol has exactly one reader.
-    fn subscribe(&mut self, instrument: Instrument, sock: S) -> Result<(), Refused<S>> {
-        let mut join = Join::new(sock);
+    fn subscribe(&mut self, instrument: Instrument, client: C) -> Result<(), Refused<C>> {
+        let mut join = Join::new(client);
 
         if let Some(entry) = self.entries.get(&instrument.id()) {
             // Incremented before the send, so a broadcaster whose `RetireIfIdle` is queued
@@ -244,9 +244,11 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
         let started = (!self.shutting_down).then(|| self.tx.upgrade()).flatten();
         let Some(tx) = started else {
             return Err(Refused {
-                sock: join.into_socket(),
-                code: RejectCode::ShuttingDown,
-                why: "server is shutting down",
+                client: join.into_client(),
+                rejected: Rejected::new(
+                    RejectCode::ShuttingDown,
+                    Box::from("server is shutting down"),
+                ),
             });
         };
 
@@ -286,17 +288,20 @@ impl<C: Connectors, S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Registry
                     // subscription.
                     tx.abandon(Claim::new(instrument.id(), instrument.venue(), pending_joins));
                     queued
-                        .drain(RejectCode::ConnectorRefused, &err.to_string())
+                        .drain(Rejected::new(
+                            RejectCode::ConnectorRefused,
+                            err.to_string().into_boxed_str(),
+                        ))
                         .await;
                     return;
                 }
                 Err(_) => {
                     tx.abandon(Claim::new(instrument.id(), instrument.venue(), pending_joins));
                     queued
-                        .drain(
+                        .drain(Rejected::new(
                             RejectCode::ConnectorGone,
-                            "connector stopped before it could subscribe",
-                        )
+                            Box::from("connector stopped before it could subscribe"),
+                        ))
                         .await;
                     return;
                 }
@@ -368,13 +373,12 @@ mod test {
     use super::events::Claim;
     use crate::broadcast::broadcaster::SESSION_SWEEP;
     use crate::registry::harness::{Harness, registry_for};
-    use crate::peer::{Client, connected};
+    use crate::client::mock::{MockClient, MockPeer, connected};
     use crate::test_util::FakeSource;
-    use crate::transport::mock::MockStream;
     use crate::venue::Venue;
     use core_lib::instrument::Instrument;
     use core_lib::venue::test_util::test_instrument_for;
-    use md_wire::framing::RejectCode;
+    use md_wire::grpc::RejectCode;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -385,24 +389,24 @@ mod test {
         test_instrument_for(Venue::BinanceSpot, SYMBOL)
     }
 
-    /// Hands a fresh mock socket to the registry and keeps the client half.
+    /// Hands a fresh mock client to the registry and keeps the peer half.
     ///
     /// The send is synchronous - see [`super::events::RegistryTx`] - so the event is on the
     /// registry's queue by the time this returns, ahead of anything queued after it. The
-    /// reply comes back with the client, for the tests that care that it was taken.
+    /// reply comes back with the peer, for the tests that care that it was taken.
     fn subscribe(
         harness: &Harness,
     ) -> (
-        Client,
-        oneshot::Receiver<Result<(), super::Refused<MockStream>>>,
+        MockPeer,
+        oneshot::Receiver<Result<(), super::Refused<MockClient>>>,
     ) {
-        let (client, server) = connected();
-        let queued = harness.registry.subscribe(key(), server);
-        (client, queued)
+        let (peer, client) = connected();
+        let queued = harness.registry.subscribe(key(), client);
+        (peer, queued)
     }
 
-    /// The same, for a test that only wants the client half and expects it to be taken.
-    async fn subscribed(harness: &Harness) -> Client {
+    /// The same, for a test that only wants the peer half and expects it to be taken.
+    async fn subscribed(harness: &Harness) -> MockPeer {
         let (client, queued) = subscribe(harness);
         queued
             .await
@@ -439,7 +443,7 @@ mod test {
         // Every send happens before any reply is awaited, so all eight events are on the
         // registry's queue in a row and the entry the first one inserts is what the other
         // seven find.
-        let mut clients: Vec<Client> = std::iter::repeat_with(|| subscribe(&harness).0)
+        let mut clients: Vec<MockPeer> = std::iter::repeat_with(|| subscribe(&harness).0)
             .take(8)
             .collect();
 
@@ -467,7 +471,7 @@ mod test {
     async fn a_join_queued_before_the_zero_check_keeps_the_broadcaster_alive() {
         let source = Arc::new(FakeSource::default());
         let harness = registry_for(&source);
-        let mut first = subscribed(&harness).await;
+        let first = subscribed(&harness).await;
         first
             .accepted()
             .await
@@ -480,7 +484,7 @@ mod test {
             .expect("the broadcaster is still registered");
         drop(first);
 
-        let (mut second, queued) = subscribe(&harness);
+        let (second, queued) = subscribe(&harness);
         let retiring = harness.registry.retire_if_idle(Claim::new(
             key().id(),
             key().venue(),
@@ -514,7 +518,7 @@ mod test {
         let source = Arc::new(FakeSource::default());
         let harness = registry_for(&source);
 
-        let mut first = subscribed(&harness).await;
+        let first = subscribed(&harness).await;
         first
             .accepted()
             .await
@@ -523,7 +527,7 @@ mod test {
         tokio::time::sleep(SESSION_SWEEP * 2).await;
         assert!(!is_registered(&harness).await);
 
-        let mut second = subscribed(&harness).await;
+        let second = subscribed(&harness).await;
         second
             .accepted()
             .await
@@ -553,14 +557,13 @@ mod test {
         let source = Arc::new(FakeSource::rejecting("nosuch is not listed as tradable"));
         let harness = registry_for(&source);
 
-        let mut client = subscribed(&harness).await;
+        let client = subscribed(&harness).await;
         let rejected = client
             .accepted()
             .await
             .expect_err("the source rejects every symbol");
 
         assert_eq!(rejected.code(), RejectCode::ConnectorRefused);
-        client.ended().await;
 
         assert!(
             !is_registered(&harness).await,
@@ -599,15 +602,15 @@ mod test {
         let harness = registry_for(&source);
         harness.registry.shut_down();
 
-        let (_client, server) = connected();
+        let (_peer, client) = connected();
         let refused = harness
             .registry
-            .subscribe(key(), server)
+            .subscribe(key(), client)
             .await
             .expect("the registry task is alive")
             .expect_err("nothing is spawned after shutdown");
         assert_eq!(refused.code(), RejectCode::ShuttingDown);
-        let (_sock, _code, _why) = refused.into_parts();
+        let (_declined, _rejected) = refused.into_parts();
 
         assert!(
             source.subscribed().is_empty(),
@@ -621,7 +624,7 @@ mod test {
     async fn shutting_down_ends_a_running_broadcaster() {
         let source = Arc::new(FakeSource::default());
         let harness = registry_for(&source);
-        let mut client = subscribed(&harness).await;
+        let client = subscribed(&harness).await;
         client
             .accepted()
             .await
@@ -630,7 +633,11 @@ mod test {
 
         harness.registry.shut_down();
 
-        client.ended().await;
+        assert_eq!(
+            client.ended().await.code(),
+            RejectCode::StreamEnded,
+            "a shutting-down broadcaster says why the stream ended rather than just closing"
+        );
     }
 
     /// A panicking event handler must not take the registry down with it - the map, the
@@ -644,7 +651,7 @@ mod test {
     async fn a_panicking_handler_does_not_end_the_registry() {
         let source = Arc::new(FakeSource::panicking_unsubscribe());
         let harness = registry_for(&source);
-        let mut client = subscribed(&harness).await;
+        let client = subscribed(&harness).await;
         client
             .accepted()
             .await
@@ -665,7 +672,7 @@ mod test {
             "the registry must still be answering after a handler panicked"
         );
 
-        let mut next = subscribed(&harness).await;
+        let next = subscribed(&harness).await;
         next.accepted()
             .await
             .expect("the fake source accepts every symbol");
@@ -687,7 +694,7 @@ pub(crate) mod harness {
     use super::RegistryHandle;
     use super::events::RegistryTx;
     use crate::test_util::{FakeConnectors, FakeSource};
-    use crate::transport::mock::MockStream;
+    use crate::client::mock::MockClient;
     use std::sync::Arc;
 
     /// A registry task over one Binance-side source, and the way in that a test drives it
@@ -710,6 +717,6 @@ pub(crate) mod harness {
     /// broadcaster reaches it.
     #[derive(Debug)]
     pub(crate) struct Harness {
-        pub(crate) registry: RegistryTx<MockStream>,
+        pub(crate) registry: RegistryTx<MockClient>,
     }
 }

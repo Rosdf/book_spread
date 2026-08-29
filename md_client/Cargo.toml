@@ -5,12 +5,31 @@ publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+# A library as well as a binary: the generated `md.v1.MarketData` client is what
+# `md_server`'s gRPC end-to-end test drives the server with, and a test cannot reach into a
+# binary crate. Everything but argument parsing therefore lives in the library.
+[lib]
+name = "md_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "md_client"
+path = "src/main.rs"
+
 [dependencies]
 md_proto = { path = "../md_proto" }
 md_wire = { path = "../md_wire" }
 anyhow = "1.0.104"
-prost = "0.14.4"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net"] }
+# The one place tonic is allowed. A client has one stream and no fan-out, so a generated codec
+# costs it nothing - and using the real thing is what proves the hand-written server is gRPC
+# rather than something gRPC-shaped. `md_server` never depends on this.
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14.6"
+protoc-bin-vendored = "3.2.0"
 
 [lints]
 workspace = true

@@ -6,14 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-md_proto = { path = "../md_proto" }
-prost = "0.14.4"
 thiserror = "2"
-tokio = { version = "1.53.1", features = ["io-util"] }
-
-[dev-dependencies]
-# `duplex` and the round-trip tests in `framing`.
-tokio = { version = "1.53.1", features = ["io-util", "macros", "rt"] }
 
 [lints]
 workspace = true

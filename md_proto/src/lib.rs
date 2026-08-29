@@ -1,7 +1,8 @@
 //! Wire types for the `md.v1` book feed.
 //!
-//! Messages only. They travel over the length-prefixed framing in `md_wire::framing`, which
-//! is a plain TCP protocol rather than gRPC - see that module for how a connection is framed.
+//! Messages only - no generated client or server. They travel as gRPC length-prefixed
+//! messages; `md_wire::grpc` holds the framing constants and the refusal codes, and
+//! `md_client` holds the generated tonic client.
 
 pub mod md {
     pub mod v1 {

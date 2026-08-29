@@ -1,237 +1,109 @@
-//! One client's socket, as the broadcaster holds it.
+//! One client's place in a broadcaster: which book it needs next, and where to put it.
 //!
-//! This is what replaces the per-client task the gRPC transport needed. A broadcaster owns
-//! the write half of every socket attached to its symbol outright - one connection per
-//! subscription is what makes that possible - so a book goes from the encoder to the kernel
-//! with no channel and no task hop in between.
+//! Almost nothing is left here, and that is the point. The transport used to be a socket this
+//! module wrote into by hand, with a half-written frame to remember between polls; it is now a
+//! [`ClientSink`], which takes a payload whole or not at all - h2 owns splitting a message
+//! across DATA frames, and guarantees the stream's ordering while it does. What remains is the epoch
+//! bookkeeping - the one thing that is about *fan-out* rather than about bytes.
 //!
-//! # Backpressure
+//! # Epochs, and why a session holds no payload
 //!
-//! Non-blocking writes mean a frame can be half written, and a half-written frame *must* be
-//! finished before a newer one starts or the peer sees two messages spliced together.
-//! Newest-only therefore applies to the queue, not to the frame in flight: [`Session::epoch`]
-//! is overwritten freely, [`Session::inflight`] is not. A client that falls behind loses the
-//! books it missed, which is the right answer for market data - a stale book is worth less
-//! than the current one, and HTTP/2 flow control would rather block the whole connection than
-//! drop anything.
-//!
-//! # The opening snapshot
-//!
-//! A session's [`inflight`](Session::inflight) starts with the acceptance header, and its
-//! `epoch` starts at 0 - the same epoch [`crate::broadcast::Ctx`] seeds at construction from
-//! the reader's current book. So the first frame a client reads after the header is always
-//! that snapshot, empty when nothing has been published yet. That is not a special case: an
-//! empty book is already this wire's resync signal, and "nothing published yet" is
-//! indistinguishable from - and no different in meaning to - a connector that is resyncing.
+//! [`Ctx`](super::broadcaster::Ctx) holds one book, and a counter that goes up each time it is
+//! replaced. A session holds the number of the book it needs next. So "has this client seen the
+//! current book" is an integer comparison, and a client that is behind is offered whatever is
+//! current at the moment it can take something - never the book it missed. That is the whole of
+//! the newest-only policy, and it is why a stalled client costs one `u64` rather than a queue.
 
+use crate::client::{ClientSink, Sent, State};
 use bytes::Bytes;
-use md_wire::framing::LENGTH_PREFIX;
-use std::mem::MaybeUninit;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use md_wire::grpc::Rejected;
+use std::task::Context;
 
-/// The response header for an accepted subscription: a zero-length frame.
-///
-/// Seeded as the first thing in flight on a new session rather than written by the
-/// broadcaster directly, so the accept goes out through the same state machine as every book
-/// and needs no special case for a socket that will not take four bytes right now.
-const ACCEPTED: Bytes = Bytes::from_static(&[0; LENGTH_PREFIX]);
-
-/// Bytes read into a throwaway buffer just to tell "nothing" from "something", never kept.
-const SCRATCH_LEN: usize = 32;
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub(crate) enum State {
-    Running,
-    NeedsFlush,
-    Ended,
+/// What a session needs to know about the book its broadcaster is publishing.
+pub(super) trait SessionCtx {
+    /// The number of the current book. Goes up by one each time a new one replaces it.
+    fn epoch(&self) -> u64;
+    /// The current book, framed and ready to send.
+    fn payload(&self) -> &Bytes;
 }
 
-impl State {
-    pub(crate) fn is_ended(self) -> bool {
-        self == Self::Ended
-    }
-}
-
-/// A frame part-written on the socket, and therefore untouchable until it is finished.
+/// One attached client, and the book it needs next.
 #[derive(Debug)]
-struct Inflight {
-    frame: Bytes,
-    written: usize,
-    /// False only for the acceptance header, which is not a book and so does not settle
-    /// [`Session::epoch`] when it finishes.
-    is_book: bool,
-}
-
-pub(crate) trait SessionCtx {
-    fn payload_for_epoch(&self, epoch: u64) -> Option<&[u8]>;
-    fn current_payload(&self) -> Bytes;
-    fn return_buffer(&mut self, buffer: Bytes);
-}
-
-/// One attached client: its socket, the frame being written, and the newest one waiting.
-///
-/// # What TLS would cost
-///
-/// `S` is `TcpStream` everywhere this is instantiated for real, but the bound is
-/// `AsyncRead + AsyncWrite` rather than the concrete type on purpose: the shape it leaves room
-/// for is the point. A TLS stream would live *inside* `S` - a `rustls::ServerConnection` and
-/// its own encrypt-then-write buffer - because a TLS session buffers and encrypts per client.
-/// That per-client copy is the same copy this whole transport rework removed from tonic's
-/// codec. Turning TLS on would hand a meaningful part of the win back; better to know that
-/// here than to discover it after the fact.
-#[derive(Debug)]
-pub(crate) struct Session<S> {
-    sock: S,
-    inflight: Option<Inflight>,
-    state: State,
+pub(super) struct Session<K> {
+    sink: K,
+    /// The epoch of the first book this client has not been given. Starts at 0, which is the
+    /// epoch [`Ctx`](super::broadcaster::Ctx) seeds at construction from the reader's current
+    /// book - so the first thing a client reads is always that snapshot, empty when nothing
+    /// has been published yet.
     epoch: u64,
+    state: State,
+    /// The stream's closing status has been queued; only the flush is left. No further book
+    /// is offered from here, so a teardown can keep polling this session to completion without
+    /// it trying to send on a stream that is already over.
+    finishing: bool,
 }
 
-impl<S> Session<S> {
-    /// Wraps a freshly accepted socket, with the acceptance header already in flight.
-    pub(crate) fn new(sock: S) -> Self {
+impl<K: ClientSink> Session<K> {
+    pub(super) fn new(sink: K) -> Self {
         Self {
-            sock,
-            inflight: Some(Inflight {
-                frame: ACCEPTED,
-                written: 0,
-                is_book: false,
-            }),
-            state: State::Running,
+            sink,
             epoch: 0,
+            state: State::Running,
+            finishing: false,
         }
     }
-}
 
-impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
-    pub(crate) fn ended(&self) -> bool {
+    pub(super) fn ended(&self) -> bool {
         self.state.is_ended()
     }
 
-    /// Makes `frame` the newest book waiting, and writes what the socket will take.
-    ///
-    /// Whatever was queued and unsent is dropped: a client that has not kept up wants the
-    /// current book, not the one before it.
-    pub(crate) fn deliver(
-        &mut self,
-        new_epoch: u64,
-        cx: &mut Context<'_>,
-        session_ctx: &mut impl SessionCtx,
-    ) {
-        self.epoch = new_epoch;
-        self.pump(cx, session_ctx);
-    }
-
-    /// Writes until the socket is full, the queue is empty, or the session is finished, then
-    /// flushes once there is nothing left queued.
-    ///
-    /// A `Pending` from `poll_write` leaves whatever is left in `inflight` for the waker it
-    /// just registered to wake this back up - see [`Session::poll_progress`].
-    pub(crate) fn pump(&mut self, async_cx: &mut Context<'_>, session_ctx: &mut impl SessionCtx) {
-        loop {
-            if self.state.is_ended() {
-                return;
-            }
-
-            let frame = match self.inflight.as_ref() {
-                None => match session_ctx.payload_for_epoch(self.epoch) {
-                    None => break,
-                    Some(frame) => frame,
-                },
-                Some(inflight) => &inflight.frame[inflight.written..],
-            };
-
-            match Pin::new(&mut self.sock).poll_write(async_cx, frame) {
-                Poll::Ready(Ok(count)) if count > 0 => {
-                    let fully_written = frame.len() == count;
-
-                    if fully_written {
-                        self.state = State::NeedsFlush;
-                        if let Some(inflight) = self.inflight.take() {
-                            if inflight.is_book {
-                                self.epoch += 1;
-                            }
-                            session_ctx.return_buffer(inflight.frame);
-                        } else {
-                            self.epoch += 1;
-                        }
-                    } else if let Some(inflight) = &mut self.inflight {
-                        inflight.written += count;
-                    } else {
-                        self.inflight = Some(Inflight {
-                            frame: session_ctx.current_payload(),
-                            written: count,
-                            is_book: true,
-                        });
-                    }
-                }
-                // A zero-length write on a non-empty buffer is the peer having gone, same as
-                // a write that failed outright.
-                Poll::Ready(_) => {
-                    self.state = State::Ended;
-                    if let Some(inflight) = self.inflight.take() {
-                        session_ctx.return_buffer(inflight.frame);
-                    }
-                    return;
-                }
-                // Full: whatever is left stays in flight, and the waker just registered is
-                // what comes back to it.
-                Poll::Pending => return,
-            }
+    /// Offers this client the current book, if it has not had it.
+    pub(super) fn deliver(&mut self, cx: &mut Context<'_>, session_ctx: &impl SessionCtx) {
+        if self.finishing || self.state.is_ended() || self.epoch > session_ctx.epoch() {
+            return;
         }
 
-        if self.state == State::NeedsFlush
-            && Pin::new(&mut self.sock).poll_flush(async_cx).is_ready()
-        {
-            self.state = State::Running;
+        match self.sink.poll_send(cx, session_ctx.payload()) {
+            Sent::Queued => self.epoch = session_ctx.epoch() + 1,
+            // Deliberately leaves `epoch` behind. The waker the sink just registered brings
+            // this back round, and what gets sent then is whatever is current *then*.
+            Sent::Full => {}
+            Sent::Ended => self.state = State::Ended,
         }
     }
 
-    /// Both halves are polled from the broadcaster's own `select!` rather than from a task of
-    /// their own: end-of-stream interest, and a write poll that both drains the queue and
-    /// registers for more room - normally none of it, so this normally registers one read
-    /// interest per session and returns.
+    /// Drives this client's transport, then offers it anything it is missing.
     ///
-    /// A client sends its request and then nothing at all, so anything arriving afterwards is
-    /// either the hang-up this is watching for or a protocol violation; both end the session.
-    /// A clean hang-up gets a best-effort `poll_shutdown` back, its result discarded - the
-    /// client is already gone, so there is nothing to do with a failure. The one case this
-    /// reads too strictly is a client that shuts down its write half while still reading -
-    /// nothing in this protocol asks it to, and treating that as "gone" is better than never
-    /// noticing a real disconnect.
-    pub(crate) fn poll_progress(
+    /// Called for every session on every lap of the broadcaster's loop. In the steady state it
+    /// registers one interest and returns, which is what makes polling every client from one
+    /// task cheap enough to be the design rather than a compromise.
+    pub(super) fn poll_progress(
         &mut self,
         cx: &mut Context<'_>,
-        session_ctx: &mut impl SessionCtx,
+        session_ctx: &impl SessionCtx,
     ) -> State {
         if self.state.is_ended() {
             return State::Ended;
         }
 
-        let mut scratch = const { [MaybeUninit::<u8>::uninit(); SCRATCH_LEN] };
-        let mut read_buf = ReadBuf::uninit(&mut scratch);
-        match Pin::new(&mut self.sock).poll_read(cx, &mut read_buf) {
-            Poll::Ready(Ok(())) if read_buf.filled().is_empty() => {
-                let _ = Pin::new(&mut self.sock).poll_shutdown(cx);
-                self.state = State::Ended;
-                return State::Ended;
-            }
-            Poll::Ready(Ok(())) => {
-                // The client sent data after its subscription request - a protocol violation,
-                // ended the same way a hang-up is.
-                self.state = State::Ended;
-                return State::Ended;
-            }
-            Poll::Ready(Err(_)) => {
-                self.state = State::Ended;
-                return State::Ended;
-            }
-            Poll::Pending => {}
+        self.state = self.sink.poll_progress(cx);
+        if self.state.is_ended() {
+            return State::Ended;
         }
 
-        self.pump(cx, session_ctx);
+        self.deliver(cx, session_ctx);
         self.state
+    }
+
+    /// Queues the end of this client's stream and the status that explains it.
+    ///
+    /// Only queues: [`poll_progress`](Session::poll_progress) is what flushes it. That split is
+    /// what lets a broadcaster close all of its clients at once under one deadline instead of
+    /// waiting on each in turn.
+    pub(super) fn begin_finish(&mut self, rejected: &Rejected) {
+        if !self.state.is_ended() && !self.finishing {
+            self.finishing = true;
+            self.sink.begin_finish(rejected);
+        }
     }
 }

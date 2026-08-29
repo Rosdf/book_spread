@@ -1,40 +1,50 @@
-//! The fan-out itself: one task per `(venue, symbol)` that reads, encodes once, and writes
-//! the resulting bytes into every attached client socket.
+//! The fan-out itself: one task per `(venue, symbol)` that reads, encodes once, and offers the
+//! resulting bytes to every attached client.
 //!
-//! The broadcaster owns those sockets. There is no per-client task and no channel between the
-//! encoder and the kernel: a book is encoded once and then `try_write`-n into each session in
-//! turn, so the same `Bytes` reaches every client with no copy of its own. See
-//! [`crate::session`] for the write state machine and what backpressure does to it.
+//! The broadcaster owns those clients outright - their whole HTTP/2 connections, not just a
+//! handle onto them. There is no per-client task and no channel between the encoder and the
+//! wire: a book is encoded once and then offered to each session in turn, so the same `Bytes`
+//! reaches every client with no copy of its own. See [`super::session`] for the epoch
+//! bookkeeping and [`crate::client`] for what backpressure does to it.
 
 use super::session::{Session, SessionCtx};
 use crate::broadcast::queue::BroadcasterRx;
+use crate::client::{ClientHandshake, ClientSink};
 use crate::encode::{BookEncoder, BufferProvider};
 use crate::registry::events::{Claim, RegistryTx};
 use bytes::{Bytes, BytesMut};
 use core_lib::connector::book_publisher::BookReader;
 use core_lib::instrument::Instrument;
-use md_wire::framing::{self, RejectCode};
+use md_wire::grpc::{RejectCode, Rejected};
 use std::future::poll_fn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
 
 /// How often a broadcaster re-checks whether anyone is left.
 ///
 /// A client hanging up is noticed directly now - [`Session::poll_progress`] watches every
-/// socket for end-of-stream - so this is no longer the primary disconnect signal it was when
+/// client for end-of-stream - so this is no longer the primary disconnect signal it was when
 /// sessions were `watch` channels. What is left is a backstop: a client whose host vanished
 /// without a `FIN` never closes anything, and this bounds how long its symbol's connector
 /// subscription outlives it.
 pub(crate) const SESSION_SWEEP: Duration = Duration::from_secs(5);
 
-/// How long a refusal may take to write before the connection is simply dropped.
+/// How long *every* remaining client together gets to read the status that ends its stream.
 ///
-/// A client that will not read its own rejection does not get to hold a shutting-down
-/// broadcaster up; it sees a closed socket instead, which it has to handle anyway.
-const REJECT_TIMEOUT: Duration = Duration::from_secs(1);
+/// One budget for all of them rather than one each: the sessions are closed concurrently, from
+/// the same poll loop that drives them in the steady state, so a client that will not read its
+/// own trailers costs the deadline once rather than once per client. Past it, they see a closed
+/// connection instead, which they have to handle anyway.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Superseded buffers kept waiting for the last client holding one to let go.
+///
+/// The same bound as the pool they return to. Eight is far more than a healthy symbol needs -
+/// a buffer is normally free again by the next book - and it is a bound on how long a stalled
+/// client can pin memory rather than a target.
+const COOLING: usize = 8;
 
 #[derive(Debug)]
 struct BufferPool {
@@ -80,26 +90,27 @@ impl BufferProvider for BufferPool {
     }
 }
 
+/// The current book, its number, and the buffers it is cut from.
 #[derive(Debug)]
 struct Ctx {
     epoch: u64,
     payload: Bytes,
     pool: BufferPool,
+    /// Payloads a newer book has replaced, still held by at least one client.
+    ///
+    /// A session no longer reports when it is done with a buffer - it hands the `Bytes` to a
+    /// sink and never hears about it again - so reclaiming is driven from here instead: each
+    /// new book is a chance to check which of the old ones nothing is holding any more.
+    cooling: heapless::Vec<Bytes, COOLING>,
 }
 
 impl SessionCtx for Ctx {
-    fn payload_for_epoch(&self, epoch: u64) -> Option<&[u8]> {
-        (self.epoch >= epoch).then(|| self.payload.as_ref())
+    fn epoch(&self) -> u64 {
+        self.epoch
     }
 
-    fn current_payload(&self) -> Bytes {
-        self.payload.clone()
-    }
-
-    fn return_buffer(&mut self, buffer: Bytes) {
-        if let Ok(buf) = buffer.try_into_mut() {
-            self.pool.return_buffer(buf);
-        }
+    fn payload(&self) -> &Bytes {
+        &self.payload
     }
 }
 
@@ -109,57 +120,69 @@ impl Ctx {
             epoch: 0,
             payload,
             pool,
+            cooling: heapless::Vec::new(),
         }
     }
 
     fn new_framed(&mut self, payload: Bytes) {
         self.epoch += 1;
-        self.payload = payload;
+        let superseded = std::mem::replace(&mut self.payload, payload);
+        self.cool(superseded);
     }
 
-    fn epoch(&self) -> u64 {
-        self.epoch
+    /// Returns to the pool every superseded buffer nothing is holding any more, then starts
+    /// `superseded` cooling.
+    ///
+    /// `try_into_mut` succeeding *is* the test for "nothing is holding this": it only hands
+    /// back the buffer when this is the last handle onto it. So a client that is behind pins
+    /// exactly the buffer it is behind on, and no others.
+    fn cool(&mut self, superseded: Bytes) {
+        let mut still_held = heapless::Vec::<Bytes, COOLING>::new();
+        while let Some(cooling) = self.cooling.pop() {
+            match cooling.try_into_mut() {
+                Ok(buffer) => self.pool.return_buffer(buffer),
+                Err(pinned) => {
+                    let _ = still_held.push(pinned);
+                }
+            }
+        }
+        self.cooling = still_held;
+
+        // A full list means every slot is pinned by a client that has not drained. This
+        // buffer is then simply not recycled, which costs one allocation next time round -
+        // far better than letting a stalled client grow this without bound.
+        let _ = self.cooling.push(superseded);
     }
 }
 
-/// A client whose socket is waiting to be attached to a running broadcaster.
+/// A client waiting to be attached to a running broadcaster.
 #[derive(Debug)]
-pub(crate) struct Join<S> {
-    sock: S,
+pub(crate) struct Join<C> {
+    client: C,
 }
 
-impl<S> Join<S> {
-    pub(crate) fn new(sock: S) -> Self {
-        Self { sock }
+impl<C: ClientHandshake> Join<C> {
+    pub(crate) fn new(client: C) -> Self {
+        Self { client }
     }
 
-    /// Turns the socket into a session. The acceptance header is already in flight on it -
-    /// see [`Session::new`] - so nothing else needs writing before the first book.
-    fn into_session(self) -> Session<S> {
-        Session::new(self.sock)
+    /// Answers the client and turns it into a session. Its response headers go out ahead of
+    /// the opening snapshot the caller delivers immediately afterwards.
+    fn into_session(self) -> Session<C::Sink> {
+        Session::new(self.client.accept())
     }
 
-    /// Hands the socket back, for a join the registry declined to queue at all.
-    pub(crate) fn into_socket(self) -> S {
-        self.sock
+    /// Hands the client back, for a join the registry declined to queue at all.
+    pub(crate) fn into_client(self) -> C {
+        self.client
     }
 
     /// Tells the client no stream is coming, then drops the connection.
     ///
     /// Only ever reached off the hot path: a broadcaster whose own subscribe was refused, or
     /// one that is on its way out.
-    pub(super) async fn reject(mut self, code: RejectCode, why: &str)
-    where
-        S: AsyncWrite + Unpin,
-    {
-        let written = tokio::time::timeout(
-            REJECT_TIMEOUT,
-            framing::write_reject(&mut self.sock, code, why),
-        )
-        .await;
-        if !matches!(written, Ok(Ok(()))) {
-            tracing::debug!("could not tell a client why it was refused");
-        }
+    pub(super) async fn reject(self, rejected: Rejected) {
+        self.client.reject(rejected).await;
     }
 }
 
@@ -169,22 +192,22 @@ impl<S> Join<S> {
 /// futures still borrow `self` inside a handler body, and both `wait_update` and `get_last`
 /// need `&mut self.reader`.
 #[derive(Debug)]
-enum Wake<S> {
+enum Wake<C> {
     Book(Option<()>),
-    Join(Option<Join<S>>),
+    Join(Option<Join<C>>),
     /// At least one session finished - the peer hung up, or a write failed.
     Ended,
     Sweep,
 }
 
-/// Owns one symbol's [`BookReader`] and every client socket attached to it.
+/// Owns one symbol's [`BookReader`] and every client attached to it.
 #[derive(Debug)]
-pub(crate) struct Broadcaster<S> {
+pub(crate) struct Broadcaster<C: ClientHandshake> {
     instrument: Instrument,
     reader: BookReader,
-    /// One entry per attached client, written to in order on every update.
-    sessions: Vec<Session<S>>,
-    joins: BroadcasterRx<S>,
+    /// One entry per attached client, offered the book in order on every update.
+    sessions: Vec<Session<C::Sink>>,
+    joins: BroadcasterRx<C>,
     /// Joins the registry has queued but this task has not taken yet. Also this
     /// broadcaster's identity to the registry - see [`Claim`].
     pending_joins: Arc<AtomicUsize>,
@@ -192,10 +215,10 @@ pub(crate) struct Broadcaster<S> {
     /// book costs neither an allocation nor a re-encode of `venue`/`symbol`.
     encoder: BookEncoder,
     ctx: Ctx,
-    registry: RegistryTx<S>,
+    registry: RegistryTx<C>,
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcaster<S> {
+impl<C: ClientHandshake> Broadcaster<C> {
     /// Waits for the connector's answer to the subscribe the registry has already sent for
     /// this key, then runs the fan-out loop.
     ///
@@ -207,9 +230,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcaster<S> {
     /// This task's `RegistryTx` is also what keeps the registry task alive: it stops once the
     /// last of them is dropped, which is on the way out of this function.
     pub(crate) async fn start(
-        registry: RegistryTx<S>,
+        registry: RegistryTx<C>,
         instrument: Instrument,
-        joins: BroadcasterRx<S>,
+        joins: BroadcasterRx<C>,
         pending_joins: Arc<AtomicUsize>,
         mut reader: BookReader,
     ) {
@@ -245,7 +268,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcaster<S> {
                 biased;
                 update = self.reader.wait_update() => Wake::Book(update),
                 join = self.joins.recv() => Wake::Join(join),
-                () = poll_fn(|cx| poll_sessions(sessions, cx, &mut self.ctx)) => Wake::Ended,
+                () = poll_fn(|cx| poll_sessions(sessions, cx, &self.ctx)) => Wake::Ended,
                 _ = sweep.tick() => Wake::Sweep,
             };
 
@@ -287,9 +310,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcaster<S> {
         // A no-op when the loop exited through `retire_if_idle`, which already removed the
         // entry and issued the connector unsubscribe.
         self.registry.retire(self.claim());
-        self.joins.drain(RejectCode::StreamEnded, "stream ended").await;
-        // `sessions` drops with `self`, and dropping a session closes its socket - which is
-        // exactly how this protocol says a stream is over. There is nothing to drain.
+        // Said before the queue is drained, so a client that was already attached hears why
+        // ahead of one that never got that far.
+        let ended = Rejected::new(RejectCode::StreamEnded, Box::from("stream ended"));
+        close(&mut self.sessions, &self.ctx, &ended).await;
+        self.joins.drain(ended).await;
     }
 
     /// The serialize-once step: one book in, one encoding out, one refcount bump per session.
@@ -301,7 +326,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcaster<S> {
             let book = self.reader.get_last();
             // Encoded straight out of the slot - there is no intermediate `BookUpdate` to
             // copy the levels into. The guard pins a slot in the shared buffer, so it is
-            // dropped at the end of this block, before anything is written to a socket, and
+            // dropped at the end of this block, before anything is offered to a client, and
             // must never be held across an await.
             self.encoder
                 .encode(book.asks(), book.bids(), &mut self.ctx.pool)
@@ -309,11 +334,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcaster<S> {
 
         self.ctx.new_framed(frame);
 
+        let ctx = &self.ctx;
         let mut ended = false;
         for session in &mut self.sessions {
-            // A refcount bump and a `write`, not a re-encode and not a copy: every session on
-            // this symbol hands the kernel the same buffer.
-            session.deliver(self.ctx.epoch(), cx, &mut self.ctx);
+            // At most a refcount bump, never a re-encode and never a copy: every session on
+            // this symbol is offered the one buffer the encoder just produced.
+            session.deliver(cx, ctx);
             ended |= session.ended();
         }
         ended
@@ -321,14 +347,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcaster<S> {
 
     /// Attaches a client and gives it the current book straight away.
     ///
-    /// The first frame after the acceptance header is always the current snapshot -
+    /// The first message after the response headers is always the current snapshot -
     /// [`Ctx::new`] seeds it from `reader.get_last()` before any session exists, so a client
     /// that joins before anything has been published sees the empty book rather than nothing.
     /// No special case is needed: an empty book is already meaningful on this wire, as the
     /// resync signal (`SmallBook::is_empty`), so "nothing published yet" and "the connector is
     /// resyncing" look identical, which is correct - both mean the same thing to a client:
     /// there is no book right now.
-    fn attach(&mut self, join: Join<S>, cx: &mut Context<'_>) {
+    fn attach(&mut self, join: Join<C>, cx: &mut Context<'_>) {
         // Balances the increment the registry made before queuing this join. `Relaxed` is
         // enough: every increment and the decisive load happen on the registry task, in that
         // task's own program order, and this decrement can only make the load *smaller* -
@@ -336,7 +362,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Broadcaster<S> {
         self.pending_joins.fetch_sub(1, Ordering::Relaxed);
 
         let mut session = join.into_session();
-        session.deliver(self.ctx.epoch(), cx, &mut self.ctx);
+        session.deliver(cx, &self.ctx);
 
         if !session.ended() {
             self.sessions.push(session);
@@ -369,10 +395,10 @@ async fn with_context<T>(f: impl FnOnce(&mut Context<'_>) -> T) -> T {
 /// every session, writability interest on just the ones with something left over - normally
 /// none - and no allocation for either. It resolves only for a session that has *ended*,
 /// because a session that merely made progress has already had that progress made here.
-fn poll_sessions<S: AsyncRead + AsyncWrite + Unpin>(
-    sessions: &mut [Session<S>],
+fn poll_sessions<K: ClientSink>(
+    sessions: &mut [Session<K>],
     cx: &mut Context<'_>,
-    session_ctx: &mut Ctx,
+    session_ctx: &Ctx,
 ) -> Poll<()> {
     let mut ended = false;
     for session in sessions {
@@ -386,20 +412,53 @@ fn poll_sessions<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
+/// Ends every remaining client's stream with a status, and waits - once, for all of them - for
+/// those trailers to reach the wire.
+///
+/// The same poll loop the steady state uses, run to a different stopping condition: every
+/// session finished rather than any one of them. `begin_finish` only queues, which is what
+/// makes one deadline for the whole set possible; a client that will not read costs the
+/// deadline once, not once per client.
+async fn close<K: ClientSink>(sessions: &mut Vec<Session<K>>, session_ctx: &Ctx, rejected: &Rejected) {
+    if sessions.is_empty() {
+        return;
+    }
+
+    for session in &mut *sessions {
+        session.begin_finish(rejected);
+    }
+
+    let flushed = poll_fn(|cx| {
+        let mut all_ended = true;
+        for session in &mut *sessions {
+            all_ended &= session.poll_progress(cx, session_ctx).is_ended();
+        }
+        if all_ended {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    });
+    if tokio::time::timeout(TEARDOWN_TIMEOUT, flushed).await.is_err() {
+        tracing::debug!("gave up telling some clients why their stream ended");
+    }
+    // Dropping them closes what is left, which a client that stopped reading has to handle.
+    sessions.clear();
+}
+
 #[cfg(test)]
 mod test {
     use super::SESSION_SWEEP;
+    use crate::client::mock::{MockClient, MockPeer, connected};
     use crate::encode::BufferProvider;
-    use crate::peer::{Client, connected, connected_congested};
     use crate::registry::harness::{Harness, registry_for};
     use crate::test_util::{FakeSource, book};
-    use crate::transport::mock::{MockControl, MockStream};
     use crate::venue::Venue;
     use bytes::BytesMut;
     use core_lib::instrument::Instrument;
     use core_lib::venue::test_util::test_instrument_for;
     use md_proto::md::v1 as proto;
-    use md_wire::framing::LENGTH_PREFIX;
+    use md_wire::grpc::{MESSAGE_PREFIX, RejectCode};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -409,51 +468,30 @@ mod test {
         test_instrument_for(Venue::BinanceSpot, SYMBOL)
     }
 
-    /// Subscribes one client, reads its acceptance header and its opening snapshot, leaving it
-    /// ready for real books.
-    async fn attach(harness: &Harness) -> Client {
-        let mut client = attach_over(harness, connected()).await;
-        client.opening_snapshot().await;
-        client
+    /// Subscribes one client and reads its opening snapshot, leaving it ready for real books.
+    async fn attach(harness: &Harness) -> MockPeer {
+        let peer = attach_answered(harness).await;
+        peer.opening_snapshot().await;
+        peer
     }
 
-    /// The same, over a connection whose write queue is pinned small enough to back up.
-    async fn attach_congested(harness: &Harness) -> Client {
-        let mut client = attach_over(harness, connected_congested()).await;
-        client.opening_snapshot().await;
-        client
-    }
-
-    /// The same, but also hands back the [`MockControl`] so a test can watch
-    /// flushes on this connection.
-    async fn attach_congested_watched(harness: &Harness) -> (Client, MockControl) {
-        let (mut client, server) = connected_congested();
-        let control = server.control();
-        hand_over(harness, server).await;
-        client
-            .accepted()
+    /// The same, stopping at the answer - for a test that wants to see the opening snapshot
+    /// itself rather than have it consumed.
+    async fn attach_answered(harness: &Harness) -> MockPeer {
+        let (peer, client) = connected();
+        hand_over(harness, client).await;
+        peer.accepted()
             .await
             .expect("the fake source accepts every symbol");
-        client.opening_snapshot().await;
-        (client, control)
+        peer
     }
 
-    async fn attach_over(harness: &Harness, connection: (Client, MockStream)) -> Client {
-        let (mut client, server) = connection;
-        hand_over(harness, server).await;
-        client
-            .accepted()
-            .await
-            .expect("the fake source accepts every symbol");
-        client
-    }
-
-    /// Queues a socket on the registry and waits for it to be taken. Every attach in this
+    /// Queues a client on the registry and waits for it to be taken. Every attach in this
     /// module goes through here, so the double `expect` is written once.
-    async fn hand_over(harness: &Harness, server: MockStream) {
+    async fn hand_over(harness: &Harness, client: MockClient) {
         harness
             .registry
-            .subscribe(key(), server)
+            .subscribe(key(), client)
             .await
             .expect("the registry task is alive")
             .expect("the registry is still spawning");
@@ -477,21 +515,21 @@ mod test {
     }
 
     /// The claim the whole design rests on: one book in, one encoding out, and the same bytes
-    /// reaching every socket rather than an encoding per client.
+    /// reaching every client rather than an encoding per client.
     #[tokio::test]
     async fn one_book_is_encoded_once_and_shared_by_every_session() {
         let source = Arc::new(FakeSource::default());
         let harness = registry_for(&source);
 
-        let mut first = attach(&harness).await;
-        let mut second = attach(&harness).await;
+        let first = attach(&harness).await;
+        let second = attach(&harness).await;
 
         source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[(99.5, 2.0)]));
 
         let (left, right) = tokio::join!(first.next_frame(), second.next_frame());
         assert_eq!(
             left, right,
-            "the same buffer reached both sockets, so the bytes must match byte for byte"
+            "the same buffer reached both clients, so the bytes must match byte for byte"
         );
         assert_eq!(
             source.subscribed().len(),
@@ -504,7 +542,7 @@ mod test {
     async fn every_level_carries_the_venue_its_key_holds_and_the_spread_is_derived() {
         let source = Arc::new(FakeSource::default());
         let harness = registry_for(&source);
-        let mut client = attach(&harness).await;
+        let client = attach(&harness).await;
 
         source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[(99.5, 2.0), (99.0, 4.0)]));
         let update = client.next_book().await;
@@ -542,7 +580,7 @@ mod test {
     async fn an_empty_book_reaches_the_client_as_empty_sides() {
         let source = Arc::new(FakeSource::default());
         let harness = registry_for(&source);
-        let mut client = attach(&harness).await;
+        let client = attach(&harness).await;
 
         source.publish(SYMBOL, &book(&[(100.0, 1.0)], &[(99.0, 1.0)]));
         assert_eq!(
@@ -565,7 +603,7 @@ mod test {
     async fn a_client_joining_a_quiet_symbol_gets_the_current_book() {
         let source = Arc::new(FakeSource::default());
         let harness = registry_for(&source);
-        let mut first = attach(&harness).await;
+        let first = attach(&harness).await;
 
         source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[(99.5, 2.0)]));
         let seen = first.next_frame().await;
@@ -574,7 +612,7 @@ mod test {
         // the broadcaster's `latest`. Attached with `attach_over` directly, rather than
         // `attach`, so its opening snapshot - the current book - is not consumed before the
         // comparison below.
-        let mut second = attach_over(&harness, connected()).await;
+        let second = attach_answered(&harness).await;
         assert_eq!(
             second.next_frame().await,
             seen,
@@ -588,12 +626,13 @@ mod test {
     async fn a_session_that_never_reads_sees_only_the_newest_book() {
         let source = Arc::new(FakeSource::default());
         let harness = registry_for(&source);
-        let mut idle = attach(&harness).await;
-        let mut attentive = attach(&harness).await;
+        let idle = attach(&harness).await;
+        let attentive = attach(&harness).await;
+        idle.stall();
 
         for step in 1..=200 {
             source.publish(SYMBOL, &book(&[(f64::from(step), 1.0)], &[]));
-            // The attentive client keeps up throughout, which is what shows the idle one is
+            // The attentive client keeps up throughout, which is what shows the stalled one is
             // not holding the broadcaster back.
             assert_eq!(
                 attentive.next_book().await.asks[0].price,
@@ -602,79 +641,32 @@ mod test {
             );
         }
 
-        // Whatever the idle client has buffered, the last frame it can ever read is the
-        // newest book - the queue behind the one in flight only ever holds one. Compared by
-        // bit pattern rather than by `<`: every price here is an exact small integer, so this
-        // is an equality test that happens to be spelled without floats.
-        let newest = 200.0_f64;
-        let mut last = idle.next_book().await;
-        while last.asks[0].price.to_bits() != newest.to_bits() {
-            last = idle.next_book().await;
-        }
+        // Two hundred books went past while this client could take none of them. What it gets
+        // when its window reopens is the newest, once - not a backlog, and not the first of
+        // the two hundred.
+        idle.resume();
+        let caught_up = idle.next_book().await;
         assert_eq!(
-            last.asks[0].price, newest,
-            "the slot holds the newest book, not a backlog"
+            caught_up.asks[0].price, 200.0,
+            "a client whose window reopens is given the current book, not the one it missed"
         );
+        idle.assert_quiet().await;
     }
 
-    /// The splice hazard, and the reason `inflight` is not newest-only: a frame that was
-    /// half written has to be finished before a newer one starts, or the client reads two
-    /// messages run together. Every frame the client does read must decode on its own.
-    #[tokio::test]
-    async fn a_partly_written_frame_is_finished_before_a_newer_one_starts() {
-        let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
-        // Tiny kernel buffers, so a handful of books is enough to leave a frame part-written.
-        let mut client = attach_congested(&harness).await;
-
-        // Full depth, so every frame is as large as this protocol ever makes one: twenty of
-        // them is roughly twice what the send buffer holds, and only one is drained per lap,
-        // so the socket is full and a frame is left part-written on essentially every lap.
-        let deep: Vec<(f64, f64)> = (1..=10).map(|i| (f64::from(i), f64::from(i))).collect();
-        for _ in 0..100 {
-            for _ in 0..20 {
-                source.publish(SYMBOL, &book(&deep, &deep));
-                tokio::task::yield_now().await;
-            }
-
-            // Every frame that arrives is a whole `BookUpdate` at the announced length. A
-            // newer frame started on top of a half-written one would put the reader out of
-            // step with the length prefixes for good, so this fails on the very next lap.
-            let update = client.next_book().await;
-            assert_eq!(
-                update.asks.len(),
-                10,
-                "a spliced frame would not decode whole"
-            );
-            assert_eq!(update.bids.len(), 10);
-            assert_eq!(update.asks[0].venue, "binance_spot");
-        }
-    }
-
-    /// The other half of the splice hazard: a frame that finishes writing out of `inflight`
-    /// must settle `Session::epoch` exactly like one written straight from `Ctx::payload`, or
-    /// the next lap resends the very book that just finished.
+    /// The other half of newest-only: a book a client has already been given is not offered to
+    /// it again. Nothing tracks what was delivered except the epoch, so an epoch that failed
+    /// to settle would show up here as the same book arriving twice.
     #[tokio::test(start_paused = true)]
-    async fn a_finished_partial_write_is_not_repeated() {
+    async fn a_delivered_book_is_not_offered_again() {
         let source = Arc::new(FakeSource::default());
         let harness = registry_for(&source);
-        let (mut client, control) = attach_congested_watched(&harness).await;
+        let client = attach(&harness).await;
 
-        // Full depth on both sides, so the frame does not fit the 32-byte send buffer in one
-        // write and is left part-written at least once.
-        let deep: Vec<(f64, f64)> = (1..=10).map(|i| (f64::from(i), f64::from(i))).collect();
-        source.publish(SYMBOL, &book(&deep, &deep));
+        source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[(99.5, 2.0)]));
+        assert_eq!(client.next_book().await.asks[0].price, 100.5);
 
-        let update = client.next_book().await;
-        assert_eq!(update.asks.len(), 10);
-        assert_eq!(update.bids.len(), 10);
-        assert!(
-            control.flushes() > 0,
-            "a session flushes once a frame is fully written, not just when the socket backs up"
-        );
-
-        // Nothing else was ever published: a second identical frame here can only be the one
-        // that just finished being resent, because `Session::epoch` never advanced for it.
+        // Nothing else is ever published, so a second message here could only be the book that
+        // just went out being sent again.
         client.assert_quiet().await;
     }
 
@@ -684,8 +676,9 @@ mod test {
     async fn a_client_that_stops_reading_does_not_block_the_others() {
         let source = Arc::new(FakeSource::default());
         let harness = registry_for(&source);
-        let stalled = attach_congested(&harness).await;
-        let mut attentive = attach(&harness).await;
+        let stalled = attach(&harness).await;
+        let attentive = attach(&harness).await;
+        stalled.stall();
 
         let deep: Vec<(f64, f64)> = (1..=10).map(|i| (f64::from(i), f64::from(i))).collect();
         for step in 1..=200 {
@@ -700,16 +693,17 @@ mod test {
         drop(stalled);
     }
 
-    /// A frame is its length followed by exactly that many bytes of message - the framing is
-    /// not part of the protobuf.
+    /// A payload is one whole gRPC length-prefixed message: the five-byte header the encoder
+    /// wrote, then exactly the bytes it describes. The framing is not part of the protobuf,
+    /// and h2 puts this into DATA frames without touching it.
     #[tokio::test]
-    async fn a_frame_is_its_length_followed_by_the_message() {
+    async fn a_payload_is_one_whole_length_prefixed_message() {
         let source = Arc::new(FakeSource::default());
         let harness = registry_for(&source);
-        let mut client = attach(&harness).await;
+        let client = attach(&harness).await;
 
         source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[]));
-        let body = client.next_frame().await;
+        let frame = client.next_frame().await;
 
         let encoder = crate::encode::BookEncoder::new("binance_spot");
         let expected = encoder.encode(
@@ -721,9 +715,17 @@ mod test {
             &mut TestBufferProvider,
         );
         assert_eq!(
-            body.as_slice(),
-            &expected[LENGTH_PREFIX..],
-            "what arrives behind the prefix is exactly what the encoder produced"
+            frame, expected,
+            "what a client is given is exactly the buffer the encoder produced, header included"
+        );
+        assert_eq!(
+            md_wire::grpc::message_len(
+                &frame[..MESSAGE_PREFIX]
+                    .try_into()
+                    .expect("a frame carries a whole message header")
+            ),
+            Some(frame.len() - MESSAGE_PREFIX),
+            "the header must be uncompressed and describe the body that follows it"
         );
     }
 
@@ -731,7 +733,7 @@ mod test {
     async fn losing_the_publisher_ends_every_session() {
         let source = Arc::new(FakeSource::default());
         let harness = registry_for(&source);
-        let mut client = attach(&harness).await;
+        let client = attach(&harness).await;
 
         // What a connector shutting down, or a venue delisting the symbol, looks like.
         source.drop_stream(SYMBOL);
@@ -743,7 +745,11 @@ mod test {
             farewell.asks.is_empty() && farewell.bids.is_empty(),
             "the last thing a client sees is the connector saying it has no book"
         );
-        client.ended().await;
+        assert_eq!(
+            client.ended().await.code(),
+            RejectCode::StreamEnded,
+            "the stream ends with a status rather than a bare disconnect"
+        );
 
         assert!(
             !is_registered(&harness).await,
@@ -751,7 +757,7 @@ mod test {
         );
     }
 
-    /// The disconnect signal, which is now the socket itself rather than a channel: a client
+    /// The disconnect signal, which is the connection itself rather than a channel: a client
     /// hanging up has to release its symbol's connector subscription.
     #[tokio::test]
     async fn a_client_hanging_up_releases_the_symbol() {
@@ -771,15 +777,15 @@ mod test {
         assert!(!is_registered(&harness).await);
     }
 
-    /// A client sending anything after its request is violating the protocol, and is dropped
-    /// rather than tolerated - the same path a hang-up takes.
+    /// A client resetting its stream is done with it, and takes the same path a hang-up
+    /// takes: noticed on the broadcaster's own poll, without waiting for the sweep.
     #[tokio::test]
-    async fn a_client_that_talks_out_of_turn_is_dropped() {
+    async fn a_client_resetting_its_stream_releases_the_symbol() {
         let source = Arc::new(FakeSource::default());
         let harness = registry_for(&source);
-        let mut client = attach(&harness).await;
+        let client = attach(&harness).await;
 
-        client.misbehave().await;
+        client.reset();
 
         let released = tokio::time::timeout(Duration::from_secs(5), async {
             while source.unsubscribed().is_empty() {
@@ -787,7 +793,7 @@ mod test {
             }
         })
         .await;
-        assert!(released.is_ok(), "an unexpected byte must end the session");
+        assert!(released.is_ok(), "a reset stream must end the session");
     }
 
     /// A client whose host vanished sends no `FIN`, so nothing observes it leaving; the sweep
@@ -798,7 +804,11 @@ mod test {
         let harness = registry_for(&source);
         let client = attach(&harness).await;
 
-        drop(client);
+        // Vanishes rather than hangs up: the connection is gone, but nothing woke the
+        // broadcaster to tell it, so there is no next poll until something schedules one.
+        // That is exactly the case the sweep exists for - a plain `drop` wakes it and never
+        // reaches the sweep at all.
+        client.vanish();
         tokio::time::sleep(SESSION_SWEEP * 2).await;
 
         assert_eq!(
@@ -807,6 +817,82 @@ mod test {
             "the last client leaving releases the connector subscription"
         );
         assert!(!is_registered(&harness).await);
+    }
+
+    /// A book a client is still holding cannot be recycled - and must not be lost either. It
+    /// comes back to the pool as soon as that client lets go.
+    ///
+    /// This is the whole reason `Ctx::cooling` exists: a sink takes the `Bytes` and never
+    /// reports back, so "is anything still holding this" has to be asked again on each new
+    /// book rather than answered once when a write finishes.
+    #[test]
+    fn a_buffer_a_client_still_holds_is_reclaimed_once_it_lets_go() {
+        let mut ctx = super::Ctx::new(frame(b"first"), super::BufferPool::new());
+
+        // What a client that is behind holds: a handle onto the book it has not drained.
+        let behind = super::SessionCtx::payload(&ctx).clone();
+
+        ctx.new_framed(frame(b"second"));
+        assert!(
+            ctx.pool.unused.is_empty(),
+            "a buffer a client is still holding must not be handed out to be overwritten"
+        );
+        assert_eq!(ctx.cooling.len(), 1, "it waits instead");
+
+        drop(behind);
+        ctx.new_framed(frame(b"third"));
+        assert_eq!(
+            ctx.pool.unused.len(),
+            1,
+            "the moment the last handle goes, the buffer is reusable again"
+        );
+    }
+
+    /// The steady state, which is the point of the pool: with every client keeping up, each
+    /// new book hands the one before it back, so a long run allocates nothing.
+    ///
+    /// Two books of slack rather than none - a buffer is superseded on one book and found
+    /// unheld on the next - so three distinct allocations is the whole working set however
+    /// long this runs.
+    #[test]
+    fn a_long_run_of_books_cycles_a_fixed_set_of_buffers() {
+        let encoder = crate::encode::BookEncoder::new("binance_spot");
+        let asks = [level(100.5, 1.25)];
+        let bids = [level(99.5, 2.0)];
+
+        let mut pool = super::BufferPool::new();
+        let first = encoder.encode(&asks, &bids, &mut pool);
+        let mut ctx = super::Ctx::new(first, pool);
+
+        let mut allocations = std::collections::HashSet::new();
+        for _ in 0..1_000 {
+            let frame = encoder.encode(&asks, &bids, &mut ctx.pool);
+            allocations.insert(frame.as_ptr());
+            ctx.new_framed(frame);
+        }
+
+        assert!(
+            allocations.len() <= 3,
+            "a thousand books must cycle a handful of buffers rather than allocate per book, \
+             got {} distinct allocations",
+            allocations.len()
+        );
+    }
+
+    /// A book level, out of two prices a test spelled as plain floats.
+    fn level(price: f64, size: f64) -> core_lib::incremental_book::Level {
+        core_lib::incremental_book::Level::new(
+            core_lib::positive_f64::PositiveF64::new(price).expect("positive"),
+            core_lib::positive_f64::PositiveF64::new(size).expect("positive"),
+        )
+    }
+
+    /// One payload a test wrote by hand - frozen from a `BytesMut` so it is reclaimable, which
+    /// `Bytes::from_static` would not be.
+    fn frame(body: &[u8]) -> bytes::Bytes {
+        let mut buf = BytesMut::with_capacity(body.len());
+        buf.extend_from_slice(body);
+        buf.freeze()
     }
 
     /// A buffer that has been filled, frozen and returned comes back cleared and on the same

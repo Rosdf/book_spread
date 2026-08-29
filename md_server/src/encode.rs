@@ -36,7 +36,7 @@
 
 use bytes::{BufMut as _, Bytes, BytesMut};
 use core_lib::incremental_book::Level;
-use md_wire::framing::LENGTH_PREFIX;
+use md_wire::grpc::{MESSAGE_PREFIX, put_message_prefix};
 
 /// Levels a side, matching `SmallBook`'s depth. Bounds the size of the reusable buffer, and
 /// checked against in [`BookEncoder::encode`] - that bound is what the `expect` there relies
@@ -104,7 +104,8 @@ impl BookEncoder {
         }
     }
 
-    /// Encodes one book into a length-prefixed frame, best level first on each side.
+    /// Encodes one book into a whole gRPC length-prefixed message, best level first on each
+    /// side.
     ///
     /// Both sides empty is the resync signal, and encodes to a frame carrying nothing but a
     /// `NaN` spread - which is exactly what prost produces for a `BookUpdate` with two empty
@@ -125,7 +126,7 @@ impl BookEncoder {
         // locked book's elided spread, comes out shorter, and asking for a few bytes too many
         // is cheaper than a traversal to find out. The exact length is known once the body is
         // written, and patched in below.
-        let needed = LENGTH_PREFIX
+        let needed = MESSAGE_PREFIX
             + (2 + self.level_body_max as usize) * (asks.len() + bids.len())
             + SPREAD_LEN;
         let mut buf = buffers.get_buffer(needed);
@@ -134,7 +135,7 @@ impl BookEncoder {
             "a pooled buffer must be cleared before it is handed back, so a frame always starts at offset 0"
         );
 
-        buf.put_bytes(0, LENGTH_PREFIX);
+        buf.put_bytes(0, MESSAGE_PREFIX);
         self.put_side(&mut buf, ASKS_KEY, asks);
         self.put_side(&mut buf, BIDS_KEY, bids);
 
@@ -149,9 +150,9 @@ impl BookEncoder {
             buf.put_f64_le(spread);
         }
 
-        let body_len = u32::try_from(buf.len() - LENGTH_PREFIX)
-            .expect("a book is at most 20 levels, so a frame never approaches 4 GiB");
-        buf[..LENGTH_PREFIX].copy_from_slice(&body_len.to_le_bytes());
+        let body_len = u32::try_from(buf.len() - MESSAGE_PREFIX)
+            .expect("a book is at most 20 levels, so a message never approaches 4 GiB");
+        put_message_prefix(&mut buf[..MESSAGE_PREFIX], body_len);
 
         buf.freeze()
     }
@@ -189,7 +190,7 @@ impl BookEncoder {
     /// path needs to know, since a frame carries its own length.
     #[cfg(test)]
     fn max_frame_len(&self) -> usize {
-        LENGTH_PREFIX + (2 + self.level_body_max as usize) * 2 * MAX_DEPTH + SPREAD_LEN
+        MESSAGE_PREFIX + (2 + self.level_body_max as usize) * 2 * MAX_DEPTH + SPREAD_LEN
     }
 }
 
@@ -209,7 +210,7 @@ mod test {
     use core_lib::incremental_book::Level;
     use core_lib::positive_f64::PositiveF64;
     use md_proto::md::v1 as proto;
-    use md_wire::framing::LENGTH_PREFIX;
+    use md_wire::grpc::{MESSAGE_PREFIX, message_len};
     use prost::Message as _;
 
     struct TestBufferProvider;
@@ -294,18 +295,17 @@ mod test {
             let encoder = BookEncoder::new(venue);
             let frame = encoder.encode(&asks, &bids, &mut TestBufferProvider);
 
-            let declared = u32::from_le_bytes(
-                frame[..LENGTH_PREFIX]
-                    .try_into()
-                    .expect("the prefix is four bytes"),
+            let header = frame[..MESSAGE_PREFIX]
+                .try_into()
+                .expect("the header is five bytes");
+            assert_eq!(
+                message_len(&header),
+                Some(frame.len() - MESSAGE_PREFIX),
+                "the gRPC header must be uncompressed and describe the body that follows it \
+                 ({venue})"
             );
             assert_eq!(
-                usize::try_from(declared).expect("a frame length fits a usize"),
-                frame.len() - LENGTH_PREFIX,
-                "the length prefix must describe the body that follows it ({venue})"
-            );
-            assert_eq!(
-                &frame[LENGTH_PREFIX..],
+                &frame[MESSAGE_PREFIX..],
                 expected.as_slice(),
                 "the hand encoder must produce prost's bytes ({venue})"
             );

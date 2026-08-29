@@ -3,8 +3,8 @@
 //! Everything here is used by `tests/end_to_end.rs`, which is why it is `pub` and gated on
 //! the `test-util` feature as well as `cfg(test)`: that target builds this module from
 //! outside the crate. Doubles that only unit tests need live beside whatever they stand in
-//! for instead - the in-memory socket and listener in [`crate::transport`], the client peer
-//! in [`crate::session`], the registry harness in [`crate::registry`].
+//! for instead - the in-memory socket and listener in [`crate::transport`], the mock client
+//! in [`crate::client`], the registry harness in [`crate::registry`].
 //!
 //! `make_book_publisher_pair` is public, so a fake source can hand out a real [`BookReader`]
 //! and keep the matching [`BookPublisher`] for the test to drive - which is the whole reason
@@ -196,7 +196,7 @@ fn positive(value: f64) -> PositiveF64 {
 ///    entries. Clearing the entries drops the sending half of every broadcaster's join
 ///    channel, which each broadcaster's `recv` reports as `None` and takes as "stop". Nothing
 ///    has to be drained: a broadcaster drops its sessions on the way out, and dropping a
-///    session closes that client's socket, which is how this protocol ends a stream.
+///    broadcaster ends every one of its streams with a status on the way out.
 /// 3. The same call then drops the last `RegistryTx` outside the registry task, so the task's
 ///    own `recv` reports `None` the moment the last broadcaster has dropped its copy - and
 ///    hands the connectors back on its way out. They are reclaimed rather than dropped

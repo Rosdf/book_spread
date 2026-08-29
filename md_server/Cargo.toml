@@ -19,6 +19,8 @@ binance_spot = { path = "../venues/binance_spot" }
 bitstamp = { path = "../venues/bitstamp" }
 anyhow = "1.0.104"
 bytes = "1.12.1"
+h2 = "0.4.16"
+http = "1.5.0"
 oneshot = { version = "0.2.1", features = ["std", "async"] }
 prost = "0.14.4"
 tokio = { version = "1.53.1", features = [
@@ -37,6 +39,13 @@ heapless = "0.9.3"
 
 [dev-dependencies]
 md_server = { path = ".", features = ["test-util"] }
+# Where tonic lives. The end-to-end tests drive the hand-written server with a real gRPC
+# client generated from the same `.proto`, which is what proves it is gRPC rather than
+# something gRPC-shaped. No cycle: `md_client` does not depend on this crate.
+md_client = { path = "../md_client" }
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+http = "1.5.0"
 # The same crate as the dependency above, with the in-memory instrument registrar
 # (`core_lib::venue::test_util`) turned on - `#[cfg(test)]`-gated items in `core_lib` are not
 # visible from here, and this crate's own tests need to register instruments the way a

@@ -45,25 +45,25 @@ impl Claim {
     }
 }
 
-/// A client's socket, on its way to whichever broadcaster will serve `key`.
+/// A client, on its way to whichever broadcaster will serve `key`.
 ///
-/// The reply is only ever the socket coming back: everything else - the acceptance header,
-/// or the venue's own refusal - is written by the broadcaster on the socket itself.
+/// The reply is only ever the client coming back: every other answer - the response headers,
+/// or the venue's own refusal - is written by the broadcaster on the connection itself.
 #[derive(Debug)]
-pub(super) struct Subscribe<S> {
+pub(super) struct Subscribe<C> {
     key: Instrument,
-    sock: S,
-    reply: oneshot::Sender<Result<(), Refused<S>>>,
+    client: C,
+    reply: oneshot::Sender<Result<(), Refused<C>>>,
 }
 
-impl<S> Subscribe<S> {
-    fn new(key: Instrument, sock: S) -> (Self, oneshot::Receiver<Result<(), Refused<S>>>) {
+impl<C> Subscribe<C> {
+    fn new(key: Instrument, client: C) -> (Self, oneshot::Receiver<Result<(), Refused<C>>>) {
         let (reply, rx) = oneshot::channel();
-        (Self { key, sock, reply }, rx)
+        (Self { key, client, reply }, rx)
     }
 
-    pub(super) fn into_parts(self) -> (Instrument, S, oneshot::Sender<Result<(), Refused<S>>>) {
-        (self.key, self.sock, self.reply)
+    pub(super) fn into_parts(self) -> (Instrument, C, oneshot::Sender<Result<(), Refused<C>>>) {
+        (self.key, self.client, self.reply)
     }
 }
 
@@ -86,8 +86,8 @@ impl RetireIfIdle {
 }
 
 #[derive(Debug)]
-pub(super) enum RegistryEvent<S> {
-    Subscribe(Subscribe<S>),
+pub(super) enum RegistryEvent<C> {
+    Subscribe(Subscribe<C>),
     RetireIfIdle(RetireIfIdle),
     /// A broadcaster stopping for a reason other than an idle session list. Fire-and-forget:
     /// the sender has nothing left to decide, and the queue is what orders the connector
@@ -108,14 +108,14 @@ pub(super) enum RegistryEvent<S> {
 
 /// The receiving half, owned by the registry task.
 #[derive(Debug)]
-pub(super) struct RegistryRx<S> {
-    rx: mpsc::UnboundedReceiver<RegistryEvent<S>>,
+pub(super) struct RegistryRx<C> {
+    rx: mpsc::UnboundedReceiver<RegistryEvent<C>>,
 }
 
-impl<S> RegistryRx<S> {
+impl<C> RegistryRx<C> {
     /// `None` once every [`RegistryTx`] has been dropped, which is the registry task's
     /// signal that no broadcaster and no handshake is left to serve.
-    pub(super) async fn recv(&mut self) -> Option<RegistryEvent<S>> {
+    pub(super) async fn recv(&mut self) -> Option<RegistryEvent<C>> {
         self.rx.recv().await
     }
 }
@@ -128,13 +128,13 @@ impl<S> RegistryRx<S> {
 /// between them are guaranteed to reach the task's queue in that order with nothing
 /// interleaved, which is what several of the teardown-race invariants rest on.
 #[derive(Debug)]
-pub(crate) struct RegistryTx<S> {
-    tx: mpsc::UnboundedSender<RegistryEvent<S>>,
+pub(crate) struct RegistryTx<C> {
+    tx: mpsc::UnboundedSender<RegistryEvent<C>>,
 }
 
-// Hand-written rather than derived: `#[derive(Clone)]` would ask for `S: Clone`, and a socket
-// is the one thing that never is.
-impl<S> Clone for RegistryTx<S> {
+// Hand-written rather than derived: `#[derive(Clone)]` would ask for `C: Clone`, and a client
+// connection is the one thing that never is.
+impl<C> Clone for RegistryTx<C> {
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
@@ -142,18 +142,18 @@ impl<S> Clone for RegistryTx<S> {
     }
 }
 
-impl<S> RegistryTx<S> {
-    /// Hands `sock` to `key`'s broadcaster, starting one if this is the first client.
+impl<C> RegistryTx<C> {
+    /// Hands `client` to `key`'s broadcaster, starting one if this is the first client.
     ///
-    /// The reply carries the socket back only when the registry declined to take it at all.
+    /// The reply carries the client back only when the registry declined to take it at all.
     /// A reply of `Err` - the task gone, or a handler that panicked on the way - means the
     /// same thing to a caller as a refusal it could not write: drop the connection.
     pub(crate) fn subscribe(
         &self,
         key: Instrument,
-        sock: S,
-    ) -> oneshot::Receiver<Result<(), Refused<S>>> {
-        let (event, rx) = Subscribe::new(key, sock);
+        client: C,
+    ) -> oneshot::Receiver<Result<(), Refused<C>>> {
+        let (event, rx) = Subscribe::new(key, client);
         self.send(RegistryEvent::Subscribe(event));
         rx
     }
@@ -181,7 +181,7 @@ impl<S> RegistryTx<S> {
 
     /// A handle that does not keep the channel open, for the registry task's own copy - see
     /// [`RegistryWeakTx`].
-    pub(super) fn downgrade(&self) -> RegistryWeakTx<S> {
+    pub(super) fn downgrade(&self) -> RegistryWeakTx<C> {
         RegistryWeakTx {
             tx: self.tx.downgrade(),
         }
@@ -207,7 +207,7 @@ impl<S> RegistryTx<S> {
     /// A closed channel is not an error to report here: the task is gone, so whatever this
     /// event was going to decide is already decided. Callers that need an answer see it as
     /// their reply channel closing.
-    fn send(&self, event: RegistryEvent<S>) {
+    fn send(&self, event: RegistryEvent<C>) {
         let _ = self.tx.send(event);
     }
 }
@@ -219,19 +219,19 @@ impl<S> RegistryTx<S> {
 /// held by the task itself would mean that never happens. `upgrade` returning `None` says the
 /// last of them has gone, which is a refusal to start anything new rather than an error.
 #[derive(Debug)]
-pub(super) struct RegistryWeakTx<S> {
-    tx: mpsc::WeakUnboundedSender<RegistryEvent<S>>,
+pub(super) struct RegistryWeakTx<C> {
+    tx: mpsc::WeakUnboundedSender<RegistryEvent<C>>,
 }
 
-impl<S> RegistryWeakTx<S> {
-    pub(super) fn upgrade(&self) -> Option<RegistryTx<S>> {
+impl<C> RegistryWeakTx<C> {
+    pub(super) fn upgrade(&self) -> Option<RegistryTx<C>> {
         self.tx.upgrade().map(|tx| RegistryTx { tx })
     }
 }
 
 /// `(rx, tx)` rather than the usual order, matching `core_lib`'s `create_event_channel` -
 /// the receiver is the half that goes to the task being started.
-pub(super) fn create_event_channel<S>() -> (RegistryRx<S>, RegistryTx<S>) {
+pub(super) fn create_event_channel<C>() -> (RegistryRx<C>, RegistryTx<C>) {
     let (tx, rx) = mpsc::unbounded_channel();
     (RegistryRx { rx }, RegistryTx { tx })
 }

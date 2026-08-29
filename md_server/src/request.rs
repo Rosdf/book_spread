@@ -7,7 +7,7 @@
 use crate::venue::Venue;
 use core_lib::instrument::Instrument;
 use md_proto::md::v1::SubscribeBookRequest;
-use md_wire::framing::{RejectCode, Rejected};
+use md_wire::grpc::{RejectCode, Rejected};
 
 /// Longest symbol name a request may carry.
 ///
@@ -22,9 +22,9 @@ const MAX_SYMBOL_LEN: usize = 32;
 ///
 /// # Errors
 ///
-/// [`RejectCode::InvalidArgument`] for an empty pair list, an unknown venue, a symbol shaped
-/// wrong on its own terms, a symbol no venue lists as tradable, or a pair that duplicates one
-/// earlier in the list. The listing check is a plain registry lookup - no round trip to a
+/// One of the request-shaped [`RejectCode`]s for an empty pair list, an unknown venue, a
+/// symbol shaped wrong on its own terms, a symbol no venue lists as tradable, or a pair that
+/// duplicates one earlier in the list. The listing check is a plain registry lookup - no round trip to a
 /// connector - so an unlisted symbol is refused right here, in the handshake.
 pub(crate) fn key_of(request: &SubscribeBookRequest) -> Result<Instrument, Rejected> {
     if request.pairs.is_empty() {
@@ -93,7 +93,7 @@ mod test {
     use crate::venue::Venue;
     use core_lib::venue::test_util::test_instrument_for;
     use md_proto::md::v1::{Pair, SubscribeBookRequest};
-    use md_wire::framing::RejectCode;
+    use md_wire::grpc::RejectCode;
 
     fn pair(venue: &str, symbol: &str) -> Pair {
         Pair {

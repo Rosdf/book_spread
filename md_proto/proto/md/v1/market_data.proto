@@ -2,13 +2,21 @@ syntax = "proto3";
 
 package md.v1;
 
-// Top-of-book fan-out, over a plain TCP connection rather than gRPC. One book per
-// connection: the client sends one SubscribeBookRequest naming its pairs, the server
-// answers with a status header, and then streams BookUpdates until it closes the socket.
-// Every message on the wire is preceded by its length as a little-endian uint32; see
-// `md_server::framing` for the exact framing and status codes.
+// Top-of-book fan-out over gRPC. One book per connection: the client opens
+// SubscribeBook naming its pairs, and the server streams BookUpdates until it ends the
+// stream with a status.
 //
-// The server encodes each book once and hands the same bytes to every attached client.
+// The server encodes each book once - length prefix and all - and hands the same buffer
+// to every attached client. That is why it does not use tonic: a generated codec would
+// re-encode the message per client. See `md_wire::grpc` for the framing constants and the
+// refusal codes, and `md_server::client` for the fan-out itself.
+
+service MarketData {
+  // One book per stream. A refusal arrives as a Trailers-Only response whose
+  // `grpc-status` says what kind of problem it was, and whose `md-reject-code` metadata
+  // carries the exact reason - see `md_wire::grpc::RejectCode`.
+  rpc SubscribeBook(SubscribeBookRequest) returns (stream BookUpdate);
+}
 
 message Pair {
   // "binance_spot" or "bitstamp", case-insensitive.

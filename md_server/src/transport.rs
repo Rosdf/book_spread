@@ -54,12 +54,10 @@ pub(crate) async fn accept<L: Listener>(listener: &L) -> io::Result<(L::Stream, 
 
 /// In-memory sockets, and a listener with nothing behind it.
 ///
-/// A session is generic over its transport precisely so a test never has to be a client on a
-/// real loopback port to observe it: `Session<MockStream>` behaves exactly as
-/// `Session<TcpStream>` does, and the pipe below gives a test full control over what the
-/// kernel would otherwise decide - a partial write, a stalled peer, an exact byte-for-byte
-/// close - by capping each direction's queue where a real one is at the kernel's whim. [`MockListener`] does the same one layer out, for
-/// [`crate::framed::accept`].
+/// The whole stack is generic over its byte stream precisely so a test never has to be a
+/// client on a real loopback port: `h2` runs over `MockStream` exactly as it runs over
+/// `TcpStream`, which is what lets [`crate::grpc`]'s tests speak real HTTP/2 with no socket
+/// under them. [`MockListener`] does the same one layer out, for [`crate::framed::accept`].
 ///
 /// Here rather than in [`crate::test_util`] because these mock what this module defines. The
 /// doubles the end-to-end test needs are the ones that live in `test_util`; these are for
@@ -168,33 +166,12 @@ pub(crate) mod mock {
         }
     }
 
-    /// Counters and failure injection [`MockControl`] gives a test over one [`MockStream`].
-    #[derive(Debug, Default)]
-    struct Counters {
-        flushes: usize,
-    }
-
-    /// The server side of a mock connection - what a [`Session`](crate::session::Session) holds in
-    /// every real test, in place of a `TcpStream`.
+    /// The server side of a mock connection - what `h2` runs over in every transport test, in
+    /// place of a `TcpStream`.
     #[derive(Debug)]
     pub(crate) struct MockStream {
         read: Pipe,
         write: Pipe,
-        counters: Arc<Mutex<Counters>>,
-    }
-
-    impl MockStream {
-        fn counters(&self) -> MutexGuard<'_, Counters> {
-            self.counters.lock().unwrap_or_else(PoisonError::into_inner)
-        }
-
-        /// A handle onto this stream's counters, taken before the stream is handed away to
-        /// whatever will own it from here (a `Session`, or the registry).
-        pub(crate) fn control(&self) -> MockControl {
-            MockControl {
-                counters: Arc::clone(&self.counters),
-            }
-        }
     }
 
     impl AsyncRead for MockStream {
@@ -217,7 +194,6 @@ pub(crate) mod mock {
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            self.counters().flushes += 1;
             Poll::Ready(Ok(()))
         }
 
@@ -231,24 +207,6 @@ pub(crate) mod mock {
         fn drop(&mut self) {
             self.write.close_write();
             self.read.close_read();
-        }
-    }
-
-    /// A handle onto one [`MockStream`]'s behaviour, taken via [`MockStream::control`] before the
-    /// stream itself is handed away.
-    #[derive(Debug)]
-    pub(crate) struct MockControl {
-        counters: Arc<Mutex<Counters>>,
-    }
-
-    impl MockControl {
-        fn counters(&self) -> MutexGuard<'_, Counters> {
-            self.counters.lock().unwrap_or_else(PoisonError::into_inner)
-        }
-
-        /// How many times `poll_flush` has resolved.
-        pub(crate) fn flushes(&self) -> usize {
-            self.counters().flushes
         }
     }
 
@@ -301,7 +259,7 @@ pub(crate) mod mock {
     const UNBOUNDED: usize = usize::MAX;
 
     /// A connected in-memory pair: the client half a test drives, and the server half to hand to
-    /// the registry, or to wrap in a [`Session`](crate::session::Session) directly.
+    /// the registry, or to run an [`H2Handshaker`](crate::grpc::H2Handshaker) over directly.
     pub(crate) fn mock_pair() -> (MockClient, MockStream) {
         mock_pair_with_capacity(UNBOUNDED)
     }
@@ -322,7 +280,6 @@ pub(crate) mod mock {
             MockStream {
                 read: c2s,
                 write: s2c,
-                counters: Arc::new(Mutex::new(Counters::default())),
             },
         )
     }

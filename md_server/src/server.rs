@@ -1,14 +1,17 @@
 //! Wiring and shutdown ordering.
 //!
-//! One listener, one registry. A connection is accepted, handshaken onto a broadcaster by
-//! [`crate::framed`], and from then on written to by that broadcaster directly - see
-//! [`crate::session`].
+//! One listener, one registry, one handshaker. A connection is accepted, handshaken onto a
+//! broadcaster by [`crate::framed`], and from then on written to by that broadcaster directly
+//! - see [`crate::broadcast`].
 
+use crate::client::Handshaker;
+use crate::grpc::H2Handshaker;
 use crate::registry::RegistryHandle;
 use crate::transport::Listener;
 use crate::venue::{Connectors, LiveConnectors};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 
 /// Binds `addr` and serves the book feed until ctrl-c.
@@ -18,7 +21,7 @@ use tokio::net::TcpListener;
 /// Fails if `addr` cannot be bound.
 pub async fn run(addr: SocketAddr) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    tracing::info!(addr = %listener.local_addr()?, "serving md.v1");
+    tracing::info!(addr = %listener.local_addr()?, "serving md.v1.MarketData");
 
     serve(listener, LiveConnectors::spawn(), async {
         if let Err(err) = tokio::signal::ctrl_c().await {
@@ -40,8 +43,8 @@ pub async fn run(addr: SocketAddr) -> anyhow::Result<()> {
 /// 2. [`RegistryHandle::shutdown`] sends the registry its `ShutDown`, which clears its
 ///    entries. Clearing the entries drops the sending half of every broadcaster's join
 ///    channel, which each broadcaster's `recv` reports as `None` and takes as "stop". Nothing
-///    has to be drained: a broadcaster drops its sessions on the way out, and dropping a
-///    session closes that client's socket, which is how this protocol ends a stream.
+///    has to be drained: a broadcaster ends every one of its streams with a status on the way
+///    out, under one deadline for all of them, and drops what will not read it.
 /// 3. The same call then drops the last `RegistryTx` outside the registry task, so the task's
 ///    own `recv` reports `None` the moment the last broadcaster has dropped its copy - and
 ///    hands the connectors back on its way out. They are reclaimed rather than dropped
@@ -51,15 +54,23 @@ pub async fn run(addr: SocketAddr) -> anyhow::Result<()> {
 ///
 /// Never actually returns `Err` today; the `Result` is `anyhow`'s so a future transport error
 /// has somewhere to go without another signature change.
-pub(crate) async fn serve<C: Connectors, L: Listener>(
+pub(crate) async fn serve<V: Connectors, L: Listener>(
     listener: L,
-    connectors: C,
+    connectors: V,
     stop: impl Future<Output = ()> + Send,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    H2Handshaker: Handshaker<L::Stream>,
+{
     let registry = RegistryHandle::spawn(connectors);
 
     let (stop_accepting, stopped) = oneshot::channel();
-    let accepting = tokio::spawn(crate::framed::accept(registry.tx(), listener, stopped));
+    let accepting = tokio::spawn(crate::framed::accept(
+        registry.tx(),
+        listener,
+        Box::leak(Box::new(H2Handshaker::new())),
+        stopped,
+    ));
 
     stop.await;
     let _ = stop_accepting.send(());
