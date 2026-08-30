@@ -5,7 +5,13 @@ use std::mem::MaybeUninit;
 use std::slice;
 
 pub struct HeaplessLinearMap<K, V, const N: usize> {
-    len: usize,
+    /// Physical index of the best entry; entries occupy `[base, N)`, sorted ascending.
+    ///
+    /// The length is `N - base` rather than a field of its own. Right-alignment makes the
+    /// two redundant, and keeping only this one means no operation below can leave them
+    /// disagreeing - which, over `MaybeUninit` storage, is the difference between a bug and
+    /// a read of uninitialised memory.
+    base: usize,
     keys: [MaybeUninit<K>; N],
     values: [MaybeUninit<V>; N],
 }
@@ -22,7 +28,8 @@ impl<K: Clone, V: Clone, const N: usize> Clone for HeaplessLinearMap<K, V, N> {
 
         for (k, v) in self {
             // SAFETY:
-            // we're inserting in valid order
+            // we're inserting in valid order, and `res` cannot be full before the
+            // last of `self`'s `N - self.base <= N` entries has been written.
             unsafe {
                 res.insert_last_unchecked(k.clone(), v.clone());
             }
@@ -32,30 +39,39 @@ impl<K: Clone, V: Clone, const N: usize> Clone for HeaplessLinearMap<K, V, N> {
     }
 
     fn clone_from(&mut self, source: &Self) {
-        for (idx, (k, v)) in source.iter().take(self.len).enumerate() {
+        let held = self.len();
+        let incoming = source.len();
+        let base = self.base;
+
+        for (idx, (k, v)) in source.iter().take(held).enumerate() {
             // SAFETY:
-            // `idx < self.len` (bounded by `.take(self.len)`), so this slot is
-            // already initialized and safe to `assume_init_mut`/overwrite in place.
+            // `idx < held` (bounded by `.take(held)`), so `base + idx` is within the
+            // live range `[base, N)`: already initialized and safe to
+            // `assume_init_mut`/overwrite in place.
             unsafe {
                 self.keys
-                    .get_unchecked_mut(idx)
+                    .get_unchecked_mut(base + idx)
                     .assume_init_mut()
                     .clone_from(k);
                 self.values
-                    .get_unchecked_mut(idx)
+                    .get_unchecked_mut(base + idx)
                     .assume_init_mut()
                     .clone_from(v);
             }
         }
 
-        match self.len.cmp(&source.len) {
+        // Compared as lengths, not bases: `self.base > source.base` means `self` is the
+        // *shorter* of the two, and reading the comparison backwards here is exactly the
+        // kind of mistake that still compiles.
+        match held.cmp(&incoming) {
             Ordering::Less => {
-                for (k, v) in source.iter().skip(self.len) {
+                for (k, v) in source.iter().skip(held) {
                     // SAFETY:
                     // `source` is sorted ascending and these are its remaining
                     // (larger) entries, appended in order; the loop above already
-                    // matched `self`'s first `self.len` entries to `source`'s, so
+                    // matched `self`'s first `held` entries to `source`'s, so
                     // each of these is greater than everything currently in `self`.
+                    // `self` holds fewer entries than `source`, so it has room.
                     unsafe {
                         self.insert_last_unchecked(k.clone(), v.clone());
                     }
@@ -63,17 +79,15 @@ impl<K: Clone, V: Clone, const N: usize> Clone for HeaplessLinearMap<K, V, N> {
             }
             Ordering::Equal => {}
             Ordering::Greater => {
-                let old_len = self.len;
-                self.len = source.len();
-                for idx in self.len..old_len {
+                // Drop the entries `source` has no counterpart for, largest first. One
+                // eviction at a time rather than a bulk truncation, so that a panicking
+                // `K`/`V` destructor leaves behind a map whose `base` still describes
+                // exactly the entries that are still alive.
+                for _ in incoming..held {
                     // SAFETY:
-                    // these indices held valid entries before truncation (they were
-                    // part of the original `0..old_len`), and haven't been touched
-                    // since, so they're still initialized and safe to drop.
-                    unsafe {
-                        self.keys.get_unchecked_mut(idx).assume_init_drop();
-                        self.values.get_unchecked_mut(idx).assume_init_drop();
-                    }
+                    // the map still holds more than `incoming` entries at this point,
+                    // so it is non-empty.
+                    drop(unsafe { self.evict_last_unchecked() });
                 }
             }
         }
@@ -89,7 +103,7 @@ impl<K, V, const N: usize> HeaplessLinearMap<K, V, N> {
 
     pub const fn new() -> Self {
         Self {
-            len: 0,
+            base: N,
             keys: Self::KEYS,
             values: Self::VALUES,
         }
@@ -103,44 +117,128 @@ impl<K, V, const N: usize> HeaplessLinearMap<K, V, N> {
     }
 
     pub fn last(&self) -> Option<(&K, &V)> {
-        if self.len == 0 {
+        if self.is_empty() {
             None
         } else {
             // SAFETY:
-            // `self.len > 0` here, so index `self.len - 1` is initialized.
-            let key = unsafe { self.keys.get_unchecked(self.len - 1).assume_init_ref() };
+            // the map is non-empty, so its live range `[base, N)` ends at the
+            // initialized slot `N - 1`, which holds the largest entry.
+            let key = unsafe { self.keys.get_unchecked(N - 1).assume_init_ref() };
             // SAFETY: same as above.
-            let value = unsafe { self.values.get_unchecked(self.len - 1).assume_init_ref() };
+            let value = unsafe { self.values.get_unchecked(N - 1).assume_init_ref() };
             Some((key, value))
         }
     }
 
     pub const fn len(&self) -> usize {
-        self.len
+        N - self.base
     }
 
     pub const fn is_empty(&self) -> bool {
-        self.len == 0
+        self.base == N
     }
 
     pub const fn is_full(&self) -> bool {
-        self.len == N
+        self.base == 0
+    }
+
+    /// Physical index of the entry at logical position `i`.
+    const fn phys(&self, i: usize) -> usize {
+        self.base + i
     }
 
     /// # Safety
-    /// `key` should be grater then all elements in map and map should have capacity for at least 1 element
+    /// `key` should be grater then all elements in map and `self.base > 0`, so that there is
+    /// a free slot at the front for the live range to grow into
     pub unsafe fn insert_last_unchecked(&mut self, key: K, value: V) {
         // SAFETY:
-        // caller guarantees spare capacity (per fn-level `# Safety`), so index
-        // `self.len` is in bounds and not currently initialized.
+        // `self.len() <= self.len()` trivially, and the caller guarantees the free slot
+        // the shift needs (per fn-level `# Safety`).
         unsafe {
-            self.keys.get_unchecked_mut(self.len).write(key);
+            self.shift_left_and_insert(self.len(), key, value);
         }
-        // SAFETY: same as above.
+    }
+
+    /// Shifts the elements in `[base, base + pos)` one slot to the left - down into the
+    /// free slot at the front - and writes `key`/`value` into the slot at logical `pos`
+    /// that this opens up.
+    ///
+    /// # Safety
+    /// `pos <= self.len()` and `self.base > 0`.
+    unsafe fn shift_left_and_insert(&mut self, pos: usize, key: K, value: V) {
+        debug_assert!(pos <= self.len(), "insertion position must be within bounds");
+        debug_assert!(self.base > 0, "caller must ensure there is spare capacity");
+
+        let base = self.base;
+        // SAFETY: `base >= 1` and `base + pos <= N`, so both the source range
+        // `[base, base + pos)` and the destination `[base - 1, base - 1 + pos)` lie
+        // within the arrays' bounds. The ranges overlap, hence `ptr::copy` (not
+        // `copy_nonoverlapping`). The slot the copy vacates - `base - 1 + pos` - is
+        // treated as logically moved-out and is immediately reinitialized below.
         unsafe {
-            self.values.get_unchecked_mut(self.len).write(value);
+            let keys_ptr = self.keys.as_mut_ptr();
+            std::ptr::copy(keys_ptr.add(base), keys_ptr.add(base - 1), pos);
+
+            let values_ptr = self.values.as_mut_ptr();
+            std::ptr::copy(values_ptr.add(base), values_ptr.add(base - 1), pos);
         }
-        self.len += 1;
+
+        self.base -= 1;
+
+        let slot = self.phys(pos);
+        // SAFETY:
+        // `slot < N` (as `pos < self.len()` after the decrement above) and the copy
+        // just vacated it.
+        unsafe {
+            self.keys.get_unchecked_mut(slot).write(key);
+            self.values.get_unchecked_mut(slot).write(value);
+        }
+    }
+
+    /// Removes and returns the entry at logical position `pos`, shifting everything
+    /// smaller than it one slot to the right so the live range stays right-aligned.
+    ///
+    /// # Safety
+    /// `pos < self.len()`.
+    unsafe fn remove_at_unchecked(&mut self, pos: usize) -> (K, V) {
+        debug_assert!(pos < self.len(), "removal position must be within bounds");
+
+        let base = self.base;
+        let slot = self.phys(pos);
+        // SAFETY: `slot` is within the live range `[base, N)`, so it is initialized;
+        // it is considered removed from here on, so this is the only read of it.
+        let removed = unsafe {
+            let key = self.keys.get_unchecked(slot).assume_init_read();
+            let value = self.values.get_unchecked(slot).assume_init_read();
+            (key, value)
+        };
+
+        // SAFETY: the source range `[base, slot)` and the destination
+        // `[base + 1, slot + 1)` both lie within the arrays, and they overlap, hence
+        // `ptr::copy`. The slot at `base` is left logically moved-out, which the
+        // `base` bump below excludes from the live range.
+        unsafe {
+            let keys_ptr = self.keys.as_mut_ptr();
+            std::ptr::copy(keys_ptr.add(base), keys_ptr.add(base + 1), pos);
+
+            let values_ptr = self.values.as_mut_ptr();
+            std::ptr::copy(values_ptr.add(base), values_ptr.add(base + 1), pos);
+        }
+
+        self.base += 1;
+
+        removed
+    }
+
+    /// Removes and returns the last (largest) entry.
+    ///
+    /// # Safety
+    /// `!self.is_empty()`.
+    unsafe fn evict_last_unchecked(&mut self) -> (K, V) {
+        debug_assert!(!self.is_empty(), "caller must ensure the map is non-empty");
+        // SAFETY: the map is non-empty (per fn-level `# Safety`), so `len() - 1` is a
+        // valid logical position.
+        unsafe { self.remove_at_unchecked(self.len() - 1) }
     }
 
     /// The value under `key`, or `None` when nothing is filed there.
@@ -163,25 +261,25 @@ impl<K, V, const N: usize> HeaplessLinearMap<K, V, N> {
     {
         let pos = self.keys().iter().position(|k| k.borrow() == key)?;
         // SAFETY:
-        // `pos` came from searching `self.keys()`, a `self.len`-long slice, so the value at
-        // `pos` is initialized.
-        Some(unsafe { self.values.get_unchecked(pos).assume_init_ref() })
+        // `pos` came from searching `self.keys()`, the live range seen as a slice, so
+        // the value at the matching physical slot is initialized.
+        Some(unsafe { self.values.get_unchecked(self.phys(pos)).assume_init_ref() })
     }
 
     fn keys(&self) -> &[K] {
         // SAFETY:
-        // self.len elements are active
-        unsafe { slice::from_raw_parts(self.keys.as_ptr().cast(), self.len) }
+        // the `N - base` elements starting at `base` are active
+        unsafe { slice::from_raw_parts(self.keys.as_ptr().add(self.base).cast(), self.len()) }
     }
 
     pub fn clear(&mut self) {
-        let len = self.len;
-        self.len = 0;
+        let base = self.base;
+        self.base = N;
 
-        for idx in 0..len {
+        for idx in base..N {
             // SAFETY:
-            // `idx < len == self.len` (before we zeroed it above), so every
-            // index in this range is initialized.
+            // `idx` was within the live range `[base, N)` (before we emptied it above),
+            // so every index in this range is initialized.
             unsafe {
                 self.keys.get_unchecked_mut(idx).assume_init_drop();
                 self.values.get_unchecked_mut(idx).assume_init_drop();
@@ -205,42 +303,35 @@ impl<K: Ord, V, const N: usize> HeaplessLinearMap<K, V, N> {
     /// The pair back, when the map is already full and `key` is not in it - there is nowhere
     /// to put it and no heap to grow into.
     pub fn insert(&mut self, key: K, value: V) -> Result<Option<(K, V)>, (K, V)> {
-        // Position of the first existing key that is >= `key` (or `self.len` if
-        // every existing key is smaller).
-        let pos = self.keys().partition_point(|k| *k < key);
+        let (pos, existing) = self.locate(&key);
 
-        if pos < self.len {
+        if existing {
             // SAFETY:
-            // `pos < self.len`, so this slot is initialized.
-            let existing_equal = *unsafe { self.keys.get_unchecked(pos).assume_init_ref() } == key;
-
-            if existing_equal {
-                // SAFETY:
-                // `pos < self.len`, so this slot is initialized.
-                let v = unsafe { self.values.get_unchecked_mut(pos) };
-                // SAFETY:
-                // `v` was just read as initialized above, and is about to be
-                // overwritten with a freshly written value below.
-                unsafe {
-                    v.assume_init_drop();
-                }
-                v.write(value);
-
-                return Ok(None);
+            // `locate` reports `existing` only for a `pos` it found a key at, so
+            // `pos < self.len()` and this slot is initialized.
+            let v = unsafe { self.values.get_unchecked_mut(self.base + pos) };
+            // SAFETY:
+            // `v` is initialized, as above, and is about to be overwritten with a
+            // freshly written value below.
+            unsafe {
+                v.assume_init_drop();
             }
+            v.write(value);
+
+            return Ok(None);
         }
 
         // `key` is not present yet, it needs to be inserted at `pos`, keeping
         // the array sorted ascending.
-        if self.len < N {
+        if !self.is_full() {
             // SAFETY:
-            // `pos <= self.len` (it's a `partition_point` over a `self.len`-long
-            // slice) and `self.len < N` was just checked above.
+            // `pos <= self.len()` (`locate` scans the live range) and the map is not
+            // full, so `self.base > 0`.
             unsafe {
-                self.shift_right_and_insert(pos, key, value);
+                self.shift_left_and_insert(pos, key, value);
             }
             Ok(None)
-        } else if pos == self.len {
+        } else if pos == self.len() {
             // `key` is larger than every stored key, so it would become the
             // new largest entry: there is nothing smaller to evict for it.
             Err((key, value))
@@ -252,76 +343,43 @@ impl<K: Ord, V, const N: usize> HeaplessLinearMap<K, V, N> {
             // if self was empty, we would have entered first branch
             let evicted = unsafe { self.evict_last_unchecked() };
             // SAFETY:
-            // we would have entered prev branch if pos == self.len
+            // we would have entered prev branch if pos == self.len(), so `pos` is still
+            // within the shortened range; the eviction freed the slot the shift needs.
             unsafe {
-                self.shift_right_and_insert(pos, key, value);
+                self.shift_left_and_insert(pos, key, value);
             }
             Ok(Some(evicted))
         }
     }
 
-    /// Shifts the elements in `[pos, self.len)` one slot to the right and
-    /// writes `key`/`value` into the now-empty slot at `pos`.
+    /// The position `key` belongs at, and whether the key already sitting there is `key`
+    /// itself. `(self.len(), false)` when every stored key is smaller.
     ///
-    /// # Safety
-    /// `pos <= self.len`.
-    unsafe fn shift_right_and_insert(&mut self, pos: usize, key: K, value: V) {
-        debug_assert!(pos <= self.len, "insertion position must be within bounds");
-        debug_assert!(self.len < N, "caller must ensure there is spare capacity");
-
-        let count = self.len - pos;
-        // SAFETY: `pos + count == self.len < N` and `pos + 1 + count == self.len + 1 <= N`,
-        // so both the source and destination ranges lie within the arrays'
-        // bounds. The ranges may overlap, hence `ptr::copy` (not
-        // `copy_nonoverlapping`). The slot at `pos` is treated as logically
-        // moved-out afterwards and immediately reinitialized below.
-        unsafe {
-            let keys_ptr = self.keys.as_mut_ptr();
-            std::ptr::copy(keys_ptr.add(pos), keys_ptr.add(pos + 1), count);
-
-            let values_ptr = self.values.as_mut_ptr();
-            std::ptr::copy(values_ptr.add(pos), values_ptr.add(pos + 1), count);
-
-            self.keys.get_unchecked_mut(pos).as_mut_ptr().write(key);
-            self.values.get_unchecked_mut(pos).as_mut_ptr().write(value);
+    /// A forward scan rather than the binary search the sorted keys would allow. Over a
+    /// map this small the binary search's ~log2(N) comparisons are a fixed cost paid on
+    /// every call, while the scan stops at the first key that is not smaller: one or two
+    /// comparisons for the near-best insertions that dominate, degrading a step at a time
+    /// towards the worst case instead of cliffing to it. The same argument `remove` and
+    /// [`Self::get`] already make one function up.
+    fn locate(&self, key: &K) -> (usize, bool) {
+        for (pos, k) in self.keys().iter().enumerate() {
+            match k.cmp(key) {
+                Ordering::Less => {}
+                Ordering::Equal => return (pos, true),
+                Ordering::Greater => return (pos, false),
+            }
         }
-        self.len += 1;
-    }
 
-    /// Removes and returns the last (largest) entry.
-    ///
-    /// # Safety
-    /// `self.len > 0`.
-    unsafe fn evict_last_unchecked(&mut self) -> (K, V) {
-        debug_assert!(self.len > 0, "caller must ensure the map is non-empty");
-        self.len -= 1;
-        // SAFETY: index `self.len` (post-decrement) was initialized and is
-        // now considered removed, so reading it out here is the only read.
-        unsafe {
-            let key = self.keys.get_unchecked(self.len).assume_init_read();
-            let value = self.values.get_unchecked(self.len).assume_init_read();
-            (key, value)
-        }
+        (self.len(), false)
     }
 
     pub fn remove(&mut self, key: &K) -> Option<V> {
-        if let Some(pos) = self.keys().iter().position(|k| *k == *key) {
-            // SAFETY:
-            // `pos` came from searching `self.keys()`, a `self.len`-long slice,
-            // so `pos..self.len` is in bounds. Rotating left moves the removed
-            // entry to the end (index `self.len - 1`), where `evict_last_unchecked`
-            // below reads it out.
-            unsafe { self.keys.get_unchecked_mut(pos..self.len) }.rotate_left(1);
-            // SAFETY: same as above.
-            unsafe { self.values.get_unchecked_mut(pos..self.len) }.rotate_left(1);
-
-            // SAFETY:
-            // we found an element, so it is not empty
-            let (_, value) = unsafe { self.evict_last_unchecked() };
-            Some(value)
-        } else {
-            None
-        }
+        let pos = self.keys().iter().position(|k| *k == *key)?;
+        // SAFETY:
+        // `pos` came from searching `self.keys()`, the live range seen as a slice, so
+        // `pos < self.len()`.
+        let (_, value) = unsafe { self.remove_at_unchecked(pos) };
+        Some(value)
     }
 }
 
@@ -329,12 +387,7 @@ impl<K: Debug, V: Debug, const N: usize> Debug for HeaplessLinearMap<K, V, N> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut map = f.debug_map();
 
-        for idx in 0..self.len {
-            // SAFETY:
-            // `idx < self.len`, so this slot is initialized.
-            let key = unsafe { self.keys.get_unchecked(idx).assume_init_ref() };
-            // SAFETY: same as above.
-            let value = unsafe { self.values.get_unchecked(idx).assume_init_ref() };
+        for (key, value) in self {
             map.entry(key, value);
         }
 
@@ -352,15 +405,17 @@ impl<'a, K, V, const N: usize> Iterator for Iter<'a, K, V, N> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.parent.len {
+        if self.pos >= self.parent.len() {
             return None;
         }
 
+        let slot = self.parent.phys(self.pos);
         // SAFETY:
-        // `self.pos < self.parent.len`, checked just above, so this slot is initialized.
-        let key = unsafe { self.parent.keys.get_unchecked(self.pos).assume_init_ref() };
+        // `self.pos < self.parent.len()`, checked just above, so `slot` is inside the
+        // live range and initialized.
+        let key = unsafe { self.parent.keys.get_unchecked(slot).assume_init_ref() };
         // SAFETY: same as above.
-        let value = unsafe { self.parent.values.get_unchecked(self.pos).assume_init_ref() };
+        let value = unsafe { self.parent.values.get_unchecked(slot).assume_init_ref() };
         self.pos += 1;
 
         Some((key, value))
@@ -374,7 +429,7 @@ impl<'a, K, V, const N: usize> Iterator for Iter<'a, K, V, N> {
 
 impl<K, V, const N: usize> ExactSizeIterator for Iter<'_, K, V, N> {
     fn len(&self) -> usize {
-        self.parent.len.saturating_sub(self.pos)
+        self.parent.len().saturating_sub(self.pos)
     }
 }
 
@@ -391,23 +446,14 @@ impl<'a, K, V, const N: usize> IntoIterator for &'a HeaplessLinearMap<K, V, N> {
 mod test {
     use super::HeaplessLinearMap;
     use std::cell::Cell;
-    use std::mem::MaybeUninit;
     use std::rc::Rc;
 
     fn empty<const N: usize>() -> HeaplessLinearMap<i32, i32, N> {
-        HeaplessLinearMap {
-            len: 0,
-            keys: [const { MaybeUninit::uninit() }; N],
-            values: [const { MaybeUninit::uninit() }; N],
-        }
+        HeaplessLinearMap::new()
     }
 
     fn empty_tracked<const N: usize>() -> HeaplessLinearMap<i32, DropTracker, N> {
-        HeaplessLinearMap {
-            len: 0,
-            keys: [const { MaybeUninit::uninit() }; N],
-            values: [const { MaybeUninit::uninit() }; N],
-        }
+        HeaplessLinearMap::new()
     }
 
     /// A value that records how many times it has been dropped, so
