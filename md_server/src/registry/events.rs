@@ -8,11 +8,12 @@
 //! and are still ordered against everything else by the queue.
 
 use crate::registry::Refused;
-use core_lib::instrument::{Instrument, InstrumentId};
+use core_lib::instrument::InstrumentId;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tokio::sync::mpsc;
 use core_lib::Venue;
+use md_wire::grpc::CatalogueIdx;
 
 /// One generation of broadcaster for one key.
 ///
@@ -45,25 +46,31 @@ impl Claim {
     }
 }
 
-/// A client, on its way to whichever broadcaster will serve `key`.
+/// A client, on its way to whichever broadcaster will serve `idx`.
+///
+/// The instrument is named by its catalogue index rather than as an [`Instrument`]: resolving
+/// one to the other is the registry's own job, because the resolution state - and the backoff
+/// that paces it - lives there.
 ///
 /// The reply is only ever the client coming back: every other answer - the response headers,
 /// or the venue's own refusal - is written by the broadcaster on the connection itself.
+///
+/// [`Instrument`]: core_lib::instrument::Instrument
 #[derive(Debug)]
 pub(super) struct Subscribe<C> {
-    key: Instrument,
+    idx: CatalogueIdx,
     client: C,
     reply: oneshot::Sender<Result<(), Refused<C>>>,
 }
 
 impl<C> Subscribe<C> {
-    fn new(key: Instrument, client: C) -> (Self, oneshot::Receiver<Result<(), Refused<C>>>) {
+    fn new(idx: CatalogueIdx, client: C) -> (Self, oneshot::Receiver<Result<(), Refused<C>>>) {
         let (reply, rx) = oneshot::channel();
-        (Self { key, client, reply }, rx)
+        (Self { idx, client, reply }, rx)
     }
 
-    pub(super) fn into_parts(self) -> (Instrument, C, oneshot::Sender<Result<(), Refused<C>>>) {
-        (self.key, self.client, self.reply)
+    pub(super) fn into_parts(self) -> (CatalogueIdx, C, oneshot::Sender<Result<(), Refused<C>>>) {
+        (self.idx, self.client, self.reply)
     }
 }
 
@@ -143,17 +150,20 @@ impl<C> Clone for RegistryTx<C> {
 }
 
 impl<C> RegistryTx<C> {
-    /// Hands `client` to `key`'s broadcaster, starting one if this is the first client.
+    /// Hands `client` to the broadcaster for catalogue instrument `idx`, starting one if this
+    /// is the first client.
     ///
-    /// The reply carries the client back only when the registry declined to take it at all.
-    /// A reply of `Err` - the task gone, or a handler that panicked on the way - means the
-    /// same thing to a caller as a refusal it could not write: drop the connection.
+    /// The reply carries the client back only when the registry declined to take it at all -
+    /// which now includes an index the catalogue does not carry, and one whose venue has not
+    /// interned its symbol yet. A reply of `Err` - the task gone, or a handler that panicked
+    /// on the way - means the same thing to a caller as a refusal it could not write: drop the
+    /// connection.
     pub(crate) fn subscribe(
         &self,
-        key: Instrument,
+        idx: CatalogueIdx,
         client: C,
     ) -> oneshot::Receiver<Result<(), Refused<C>>> {
-        let (event, rx) = Subscribe::new(key, client);
+        let (event, rx) = Subscribe::new(idx, client);
         self.send(RegistryEvent::Subscribe(event));
         rx
     }

@@ -4,33 +4,60 @@
 //! broadcaster by [`crate::framed`], and from then on written to by that broadcaster directly
 //! - see [`crate::broadcast`].
 
+use crate::catalogue::Catalogue;
+use crate::catalogue::source::{CatalogueSource as _, FileCatalogue};
 use crate::client::Handshaker;
+use crate::config::ServerConfig;
 use crate::grpc::H2Handshaker;
 use crate::registry::RegistryHandle;
 use crate::transport::Listener;
 use crate::venue::{Connectors, LiveConnectors};
+use core_lib::venue::ConnectorConfig;
 use std::future::Future;
-use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
-/// Binds `addr` and serves the book feed until ctrl-c.
+/// Loads the catalogue, binds the configured address, and serves the book feed until ctrl-c.
+///
+/// The catalogue is loaded *before* the listener is bound, because a failure to load it is a
+/// failure to start: there is nothing to fall back to, and a server with an empty catalogue
+/// can serve nobody.
 ///
 /// # Errors
 ///
-/// Fails if `addr` cannot be bound.
-pub async fn run(addr: SocketAddr) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+/// Fails if the catalogue cannot be loaded, or if the configured address cannot be bound.
+pub async fn run(
+    config: ServerConfig,
+    binance_spot: ConnectorConfig<binance_spot::Config>,
+    bitstamp: ConnectorConfig<bitstamp::Config>,
+) -> anyhow::Result<()> {
+    let catalogue = FileCatalogue::new(config.catalogue().path()).load().await?;
+    tracing::info!(
+        instruments = catalogue.instruments().len(),
+        venues = catalogue.venues().len(),
+        "loaded the catalogue"
+    );
+
+    let listener = TcpListener::bind(config.addr()).await?;
     tracing::info!(addr = %listener.local_addr()?, "serving md.v1.MarketData");
 
-    serve(listener, LiveConnectors::spawn(), async {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            tracing::error!(%err, "failed to listen for ctrl-c");
-        }
-    })
+    serve(
+        listener,
+        LiveConnectors::spawn(binance_spot, bitstamp),
+        catalogue,
+        async {
+            if let Err(err) = tokio::signal::ctrl_c().await {
+                tracing::error!(%err, "failed to listen for ctrl-c");
+            }
+        },
+    )
     .await
 }
 
 /// Serves the book feed on `listener` until `stop` resolves, then stops the connectors.
+///
+/// `catalogue` is taken by value: it is loaded once and never republished, so there is no
+/// catalogue task to order against the shutdown below and nothing here holds a subscription
+/// to it.
 ///
 /// # Shutdown ordering
 ///
@@ -56,18 +83,25 @@ pub async fn run(addr: SocketAddr) -> anyhow::Result<()> {
 pub(crate) async fn serve<V: Connectors, L: Listener>(
     listener: L,
     connectors: V,
+    catalogue: Catalogue,
     stop: impl Future<Output = ()> + Send,
 ) -> anyhow::Result<()>
 where
     H2Handshaker: Handshaker<L::Stream>,
 {
-    let registry = RegistryHandle::spawn(connectors);
+    // The one place both halves of the catalogue are in scope at once: the venue table is read
+    // by the encoder here, and each instrument's pairs carry the venue index the registry
+    // stamps on a broadcaster's books - so the response is encoded first and the entries are
+    // then moved into the registry.
+    let encoded = crate::catalogue::encode::encode(&catalogue);
+    let registry = RegistryHandle::spawn(connectors, catalogue.into_instruments());
 
     let (stop_accepting, stopped) = oneshot::channel();
     let accepting = tokio::spawn(crate::framed::accept(
         registry.tx(),
         listener,
         Box::leak(Box::new(H2Handshaker::new())),
+        encoded,
         stopped,
     ));
 

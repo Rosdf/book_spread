@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::fmt::{Debug, Formatter};
 use std::mem::MaybeUninit;
@@ -142,6 +143,37 @@ impl<K, V, const N: usize> HeaplessLinearMap<K, V, N> {
         self.len += 1;
     }
 
+    /// The value under `key`, or `None` when nothing is filed there.
+    ///
+    /// Borrowed the way [`std::collections::HashMap::get`] is, so a map keyed on `String` is
+    /// searched with a `&str` and one keyed on a newtype with whatever that newtype borrows
+    /// as - no key has to be built to ask a question about one.
+    ///
+    /// A linear scan rather than the binary search the sorted keys would allow, because `Q`
+    /// is only [`Eq`]: ordering a borrowed form against the owned one would need
+    /// `K: Borrow<Q>` *and* the two orderings to agree, which is a heavier promise than this
+    /// map - a handful of entries, where the scan is free - has any reason to ask for.
+    ///
+    /// No `K` bound at all, for the same reason: nothing about looking a key up needs the
+    /// [`Ord`] that keeping them sorted does.
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        let pos = self.keys().iter().position(|k| k.borrow() == key)?;
+        // SAFETY:
+        // `pos` came from searching `self.keys()`, a `self.len`-long slice, so the value at
+        // `pos` is initialized.
+        Some(unsafe { self.values.get_unchecked(pos).assume_init_ref() })
+    }
+
+    fn keys(&self) -> &[K] {
+        // SAFETY:
+        // self.len elements are active
+        unsafe { slice::from_raw_parts(self.keys.as_ptr().cast(), self.len) }
+    }
+
     pub fn clear(&mut self) {
         let len = self.len;
         self.len = 0;
@@ -270,12 +302,6 @@ impl<K: Ord, V, const N: usize> HeaplessLinearMap<K, V, N> {
             let value = self.values.get_unchecked(self.len).assume_init_read();
             (key, value)
         }
-    }
-
-    fn keys(&self) -> &[K] {
-        // SAFETY:
-        // self.len elements are active
-        unsafe { slice::from_raw_parts(self.keys.as_ptr().cast(), self.len) }
     }
 
     pub fn remove(&mut self, key: &K) -> Option<V> {
@@ -439,6 +465,44 @@ mod test {
         assert_eq!(r, None);
         assert_eq!(m.keys(), &[1, 2]);
         assert_eq!(m.last(), Some((&2, &20)));
+    }
+
+    #[test]
+    fn get_finds_a_value_by_its_key_and_nothing_else() {
+        let mut m = empty::<3>();
+        assert_eq!(m.get(&1), None, "an empty map has nothing under any key");
+
+        assert_eq!(m.insert(5, 50), Ok(None));
+        assert_eq!(m.insert(1, 10), Ok(None));
+        assert_eq!(m.insert(3, 30), Ok(None));
+
+        assert_eq!(m.get(&1), Some(&10), "the first key");
+        assert_eq!(m.get(&3), Some(&30), "a middle key");
+        assert_eq!(m.get(&5), Some(&50), "the last key");
+        assert_eq!(m.get(&4), None, "a key between two that are present");
+        assert_eq!(m.get(&9), None, "a key past the largest present");
+
+        // The entries shift on a remove, so what `get` reads has to follow them rather than
+        // the position the key went in at.
+        assert_eq!(m.remove(&1), Some(10));
+        assert_eq!(m.get(&1), None);
+        assert_eq!(m.get(&3), Some(&30));
+        assert_eq!(m.get(&5), Some(&50));
+    }
+
+    /// The point of the `Borrow` bound: a map keyed on an owned type is searched with the
+    /// borrowed one, so a lookup allocates nothing.
+    #[test]
+    fn get_takes_a_borrowed_key() {
+        let mut m: HeaplessLinearMap<String, i32, 2> = HeaplessLinearMap::new();
+        assert_eq!(m.insert("btcusdt".to_owned(), 1), Ok(None));
+        assert_eq!(m.insert("ethusdt".to_owned(), 2), Ok(None));
+
+        assert_eq!(m.get("btcusdt"), Some(&1));
+        assert_eq!(m.get("ethusdt"), Some(&2));
+        assert_eq!(m.get("solusdt"), None);
+        // The owned form still works, since `String: Borrow<String>`.
+        assert_eq!(m.get(&"btcusdt".to_owned()), Some(&1));
     }
 
     #[test]

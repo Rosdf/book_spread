@@ -18,6 +18,75 @@
 use serde::Deserialize;
 use std::time::Duration;
 
+/// Reads a [`Duration`] written the way a human writes one: `"30s"`, `"500ms"`, `"2m"`.
+///
+/// serde's own `Duration` impl spells a duration as a struct - `{ secs = 30, nanos = 0 }` in
+/// TOML - which is a poor thing to ask of a config file for values that are all plainly "a few
+/// seconds". Used through `#[serde(with = "duration_str")]` on the fields below, and through
+/// [`duration_str::option`] for the one that is optional.
+pub mod duration_str {
+    use serde::de::Unexpected;
+    use serde::{Deserialize as _, Deserializer};
+    use std::borrow::Cow;
+    use std::time::Duration;
+
+    /// Suffix, and how many nanoseconds one of it is. Longest first, so `ms` is matched
+    /// before `s` would take its `s`.
+    const UNITS: [(&str, u64); 4] = [
+        ("ms", 1_000_000),
+        ("s", 1_000_000_000),
+        ("m", 60 * 1_000_000_000),
+        ("h", 3_600 * 1_000_000_000),
+    ];
+
+    /// # Errors
+    ///
+    /// A string with no unit suffix this understands, or a count that is not a whole number,
+    /// or one whose nanoseconds overflow a `u64` - about 584 years.
+    pub fn parse<E: serde::de::Error>(raw: &str) -> Result<Duration, E> {
+        let invalid = || E::invalid_value(Unexpected::Str(raw), &"a duration like \"30s\", \"500ms\" or \"2m\"");
+
+        let (written, nanos_per) = UNITS
+            .iter()
+            .find_map(|&(suffix, nanos)| raw.strip_suffix(suffix).map(|count| (count, nanos)))
+            .ok_or_else(invalid)?;
+        let count: u64 = written.trim().parse().map_err(|_| invalid())?;
+        count
+            .checked_mul(nanos_per)
+            .map(Duration::from_nanos)
+            .ok_or_else(invalid)
+    }
+
+    /// # Errors
+    ///
+    /// Whatever `deserializer` reports, or [`parse`]'s own rejection of the string it read.
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
+        // `Cow` rather than `&str`: a format that unescapes, or one that buffers the document
+        // (which is what `#[serde(flatten)]` does to everything under it), hands over an owned
+        // string, and refusing that would make `"30s"` valid in one place and not another.
+        let raw = <Cow<'_, str>>::deserialize(deserializer)?;
+        parse(&raw)
+    }
+
+    /// The same, for a field that may be absent. `#[serde(with)]` names the module, so an
+    /// `Option<Duration>` needs one of its own rather than the `deserialize` above.
+    pub mod option {
+        use serde::{Deserialize as _, Deserializer};
+        use std::borrow::Cow;
+        use std::time::Duration;
+
+        /// # Errors
+        ///
+        /// Whatever `deserializer` reports, or [`super::parse`]'s rejection of the string.
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Duration>, D::Error> {
+            let raw = <Option<Cow<'_, str>>>::deserialize(deserializer)?;
+            raw.as_deref().map(super::parse).transpose()
+        }
+    }
+}
+
 /// Tuning every venue connector needs, regardless of wire format.
 ///
 /// Private fields behind getters, and built by overriding [`Default`] one named field at a
@@ -35,13 +104,15 @@ pub struct CoreConfig {
     max_concurrent_snapshots: usize,
     /// How many frames a symbol may buffer while waiting for its snapshot.
     max_pending_frames: usize,
-    /// Deserialized through serde's own `Duration` impl, so a config file spells this
-    /// `{ "secs": 30, "nanos": 0 }`.
+    /// Spelled the way a human writes a duration - `"30s"` - see [`duration_str`].
+    #[serde(with = "duration_str")]
     max_backoff: Duration,
     /// A symbol with no frame for this long is resynced on its own, without touching the
     /// socket or its neighbours. `None` disables the sweep entirely.
+    #[serde(with = "duration_str::option")]
     idle_symbol_timeout: Option<Duration>,
     /// How often the idle sweep runs. Irrelevant when `idle_symbol_timeout` is `None`.
+    #[serde(with = "duration_str")]
     idle_scan_interval: Duration,
 }
 

@@ -15,7 +15,7 @@ use crate::registry::events::{Claim, RegistryTx};
 use bytes::{Bytes, BytesMut};
 use core_lib::connector::book_publisher::BookReader;
 use core_lib::instrument::Instrument;
-use md_wire::grpc::{RejectCode, Rejected};
+use md_wire::grpc::{RejectCode, Rejected, VenueIdx};
 use std::future::poll_fn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -232,12 +232,15 @@ impl<C: ClientHandshake> Broadcaster<C> {
     pub(crate) async fn start(
         registry: RegistryTx<C>,
         instrument: Instrument,
+        venue_idx: VenueIdx,
         joins: BroadcasterRx<C>,
         pending_joins: Arc<AtomicUsize>,
         mut reader: BookReader,
     ) {
         let mut pool = BufferPool::new();
-        let encoder = BookEncoder::new(instrument.venue().as_str());
+        // The venue index comes from the registry rather than from `instrument`: it is the
+        // catalogue's numbering, and an `Instrument` knows only which `Venue` it belongs to.
+        let encoder = BookEncoder::new(venue_idx);
         let latest = {
             let book = reader.get_last();
             encoder.encode(book.asks(), book.bids(), &mut pool)
@@ -451,14 +454,14 @@ mod test {
     use super::SESSION_SWEEP;
     use crate::client::mock::{MockClient, MockPeer, connected};
     use crate::encode::BufferProvider;
-    use crate::registry::harness::{Harness, registry_for};
+    use crate::registry::harness::{FIRST, Harness, registry_for};
     use crate::test_util::{FakeSource, book};
     use crate::venue::Venue;
     use bytes::BytesMut;
     use core_lib::instrument::Instrument;
     use core_lib::venue::test_util::test_instrument_for;
     use md_proto::md::v1 as proto;
-    use md_wire::grpc::{MESSAGE_PREFIX, RejectCode};
+    use md_wire::grpc::{MESSAGE_PREFIX, RejectCode, VenueIdx};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -491,7 +494,7 @@ mod test {
     async fn hand_over(harness: &Harness, client: MockClient) {
         harness
             .registry
-            .subscribe(key(), client)
+            .subscribe(FIRST, client)
             .await
             .expect("the registry task is alive")
             .expect("the registry is still spawning");
@@ -519,7 +522,7 @@ mod test {
     #[tokio::test]
     async fn one_book_is_encoded_once_and_shared_by_every_session() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
 
         let first = attach(&harness).await;
         let second = attach(&harness).await;
@@ -541,7 +544,7 @@ mod test {
     #[tokio::test]
     async fn every_level_carries_the_venue_its_key_holds_and_the_spread_is_derived() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
         let client = attach(&harness).await;
 
         source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[(99.5, 2.0), (99.0, 4.0)]));
@@ -552,7 +555,7 @@ mod test {
             vec![proto::Level {
                 price: 100.5,
                 size: 1.25,
-                venue: "binance_spot".to_owned(),
+                venue_idx: 0,
             }],
             "asks travel best first"
         );
@@ -562,12 +565,12 @@ mod test {
                 proto::Level {
                     price: 99.5,
                     size: 2.0,
-                    venue: "binance_spot".to_owned(),
+                    venue_idx: 0,
                 },
                 proto::Level {
                     price: 99.0,
                     size: 4.0,
-                    venue: "binance_spot".to_owned(),
+                    venue_idx: 0,
                 },
             ],
             "bids travel best first"
@@ -579,7 +582,7 @@ mod test {
     #[tokio::test]
     async fn an_empty_book_reaches_the_client_as_empty_sides() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
         let client = attach(&harness).await;
 
         source.publish(SYMBOL, &book(&[(100.0, 1.0)], &[(99.0, 1.0)]));
@@ -602,7 +605,7 @@ mod test {
     #[tokio::test]
     async fn a_client_joining_a_quiet_symbol_gets_the_current_book() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
         let first = attach(&harness).await;
 
         source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[(99.5, 2.0)]));
@@ -625,7 +628,7 @@ mod test {
     #[tokio::test]
     async fn a_session_that_never_reads_sees_only_the_newest_book() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
         let idle = attach(&harness).await;
         let attentive = attach(&harness).await;
         idle.stall();
@@ -659,7 +662,7 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn a_delivered_book_is_not_offered_again() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
         let client = attach(&harness).await;
 
         source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[(99.5, 2.0)]));
@@ -675,7 +678,7 @@ mod test {
     #[tokio::test]
     async fn a_client_that_stops_reading_does_not_block_the_others() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
         let stalled = attach(&harness).await;
         let attentive = attach(&harness).await;
         stalled.stall();
@@ -699,13 +702,13 @@ mod test {
     #[tokio::test]
     async fn a_payload_is_one_whole_length_prefixed_message() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
         let client = attach(&harness).await;
 
         source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[]));
         let frame = client.next_frame().await;
 
-        let encoder = crate::encode::BookEncoder::new("binance_spot");
+        let encoder = crate::encode::BookEncoder::new(VenueIdx::new(0));
         let expected = encoder.encode(
             &[core_lib::incremental_book::Level::new(
                 core_lib::positive_f64::PositiveF64::new(100.5).expect("positive"),
@@ -732,7 +735,7 @@ mod test {
     #[tokio::test]
     async fn losing_the_publisher_ends_every_session() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
         let client = attach(&harness).await;
 
         // What a connector shutting down, or a venue delisting the symbol, looks like.
@@ -762,7 +765,7 @@ mod test {
     #[tokio::test]
     async fn a_client_hanging_up_releases_the_symbol() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
         let client = attach(&harness).await;
 
         drop(client);
@@ -782,7 +785,7 @@ mod test {
     #[tokio::test]
     async fn a_client_resetting_its_stream_releases_the_symbol() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
         let client = attach(&harness).await;
 
         client.reset();
@@ -801,7 +804,7 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn the_sweep_retires_a_symbol_no_one_is_left_reading() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
         let client = attach(&harness).await;
 
         // Vanishes rather than hangs up: the connection is gone, but nothing woke the
@@ -856,7 +859,7 @@ mod test {
     /// long this runs.
     #[test]
     fn a_long_run_of_books_cycles_a_fixed_set_of_buffers() {
-        let encoder = crate::encode::BookEncoder::new("binance_spot");
+        let encoder = crate::encode::BookEncoder::new(VenueIdx::new(0));
         let asks = [level(100.5, 1.25)];
         let bids = [level(99.5, 2.0)];
 

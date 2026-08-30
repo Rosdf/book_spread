@@ -25,6 +25,9 @@
 //!
 //! Symbols are subscribed on demand: the first client for a symbol subscribes it on its
 //! venue's connector, and the last client to leave unsubscribes it again.
+//!
+//! What a client may ask for at all is [`crate::catalogue`]: a file read once at startup,
+//! which is where the instrument and venue indices a request travels as come from.
 
 // Used by the `md_server` binary, which compiles as a crate of its own. Naming them here is
 // what keeps `unused_crate_dependencies` quiet for this, the library target.
@@ -39,12 +42,13 @@ use tracing_subscriber as _;
 use {md_client as _, md_server as _, tonic as _, tonic_prost as _};
 
 pub(crate) mod broadcast;
+pub(crate) mod catalogue;
 pub(crate) mod client;
+pub mod config;
 pub(crate) mod encode;
 pub(crate) mod framed;
 pub(crate) mod grpc;
 pub(crate) mod registry;
-pub(crate) mod request;
 pub mod server;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;

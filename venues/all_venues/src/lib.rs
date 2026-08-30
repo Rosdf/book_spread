@@ -21,6 +21,17 @@ pub enum Venue {
 }
 
 impl Venue {
+    /// Every venue this build carries.
+    ///
+    /// Written out exhaustively rather than derived, so adding a variant stops this compiling
+    /// the same way it stops [`Venue::as_str`]'s `match` compiling. What it buys is
+    /// [`Venue::COUNT`]: a caller that wants at most one entry per venue - a server's venue
+    /// index table, say - can size an array at compile time and hash nothing.
+    pub const ALL: [Self; 2] = [Self::BinanceSpot, Self::Bitstamp];
+
+    /// How many venues this build carries.
+    pub const COUNT: usize = Self::ALL.len();
+
     /// The name a client puts in a subscribe request, and the one echoed back on every update.
     #[must_use]
     pub fn as_str(self) -> &'static str {

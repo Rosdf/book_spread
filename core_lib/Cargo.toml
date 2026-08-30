@@ -12,7 +12,10 @@ crossbeam-utils = {version = "0.8.22"}
 hashbrown = "0.17.1"
 triomphe = "0.1.16"
 tokio = {version = "1.53.1", features = ["sync", "rt", "time", "macros"]}
-serde = "1.0.229"
+# `derive` is stated here rather than relied on: `venue::config` derives `Deserialize`, and
+# the feature only reached this crate because the venue crates enable it and Cargo unifies
+# features across the graph - which would stop being true the day nothing else did.
+serde = { version = "1.0.229", features = ["derive"] }
 oneshot = { version = "0.2.1", features = ["std", "async"] }
 anyhow = "1.0.104"
 tracing.workspace = true

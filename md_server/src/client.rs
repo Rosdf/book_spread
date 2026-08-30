@@ -5,8 +5,10 @@
 //! between the accept loop and `TcpListener`: a test that wants to watch one book reach three
 //! clients should not have to run three HPACK handshakes to see it.
 //!
-//! - [`Handshaker`] turns an accepted byte stream into a client that has asked for a symbol.
-//! - [`ClientHandshake`] answers that request - with a stream, or with a refusal.
+//! - [`Handshaker`] turns an accepted byte stream into a [`Route`]: a client that has asked
+//!   for a symbol, or one asking what this server carries.
+//! - [`ClientHandshake`] answers that request - with a stream, with one message, or with a
+//!   refusal.
 //! - [`ClientSink`] is the answered client: the thing a broadcaster writes books into.
 //!
 //! The generic parameter that already threads through `RegistryTx`, `Join`, `Refused`,
@@ -114,6 +116,32 @@ pub(crate) trait ClientHandshake: Debug + Send + 'static {
     /// hold a shutting-down broadcaster up. It sees a closed connection instead, which it has
     /// to handle anyway.
     fn reject(self, rejected: Rejected) -> impl Future<Output = ()> + Send;
+
+    /// Answers a unary call: headers, `body` as the one message, then `grpc-status: 0`
+    /// trailers.
+    ///
+    /// `body` is a whole gRPC length-prefixed message, and is the same buffer for every
+    /// caller - the catalogue is encoded once at startup - so this costs a refcount bump and
+    /// no encode, exactly as a book does.
+    ///
+    /// Bounded the same way [`reject`](ClientHandshake::reject) is: this is the only thing
+    /// that will ever drive the connection, and a peer that will not read its own answer does
+    /// not get to hold a task open indefinitely.
+    fn respond_unary(self, body: Bytes) -> impl Future<Output = ()> + Send;
+}
+
+/// What one accepted connection turned out to be asking for.
+///
+/// A catalogue call never reaches the registry task: it is answered from a value the accept
+/// loop holds, so it cannot be delayed behind a subscribe or a teardown, and the queue that
+/// orders those against each other is not lengthened by a call that has nothing to do with
+/// either.
+#[derive(Debug)]
+pub(crate) enum Route<C> {
+    /// A stream: this instrument's book, from now on.
+    Subscribe(SubscribeBookRequest, C),
+    /// One message: what this server carries.
+    Catalogue(C),
 }
 
 /// Turns an accepted byte stream into a client waiting for an answer.
@@ -136,8 +164,7 @@ pub(crate) trait Handshaker<S>: Debug + Send + Sync + 'static {
     fn handshake(
         &self,
         sock: S,
-    ) -> impl Future<Output = Result<(SubscribeBookRequest, Self::Client), HandshakeError<Self::Client>>>
-    + Send;
+    ) -> impl Future<Output = Result<Route<Self::Client>, HandshakeError<Self::Client>>> + Send;
 }
 
 /// Why a handshake produced no request to serve.
@@ -164,10 +191,10 @@ pub(crate) enum HandshakeError<C> {
 /// same way [`crate::transport::mock`] mocks what `transport` defines.
 #[cfg(test)]
 pub(crate) mod mock {
-    use super::{ClientHandshake, ClientSink, HandshakeError, Handshaker, Sent, State};
+    use super::{ClientHandshake, ClientSink, HandshakeError, Handshaker, Route, Sent, State};
     use bytes::Bytes;
     use md_proto::md::v1::SubscribeBookRequest;
-    use md_wire::grpc::Rejected;
+    use md_wire::grpc::{CatalogueIdx, Rejected};
     use std::collections::VecDeque;
     use std::future::{Future, pending, poll_fn};
     use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -240,6 +267,14 @@ pub(crate) mod mock {
         async fn reject(self, rejected: Rejected) {
             let mut shared = self.0.lock();
             shared.answer = Some(Err(rejected));
+            shared.gone = true;
+            shared.wake_client();
+        }
+
+        async fn respond_unary(self, body: Bytes) {
+            let mut shared = self.0.lock();
+            shared.answer = Some(Ok(()));
+            shared.sent.push_back(body);
             shared.gone = true;
             shared.wake_client();
         }
@@ -469,7 +504,7 @@ pub(crate) mod mock {
     /// handshake at all.
     #[derive(Debug, Default)]
     pub(crate) struct Script {
-        answers: VecDeque<Option<SubscribeBookRequest>>,
+        answers: VecDeque<Option<Asked>>,
         peers: VecDeque<MockPeer>,
         waiting: Option<Waker>,
     }
@@ -479,15 +514,26 @@ pub(crate) mod mock {
     #[derive(Debug, Clone)]
     pub(crate) struct ScriptControl(Arc<Mutex<Script>>);
 
+    /// One scripted connection's request.
+    #[derive(Debug)]
+    enum Asked {
+        Subscribe(SubscribeBookRequest),
+        Catalogue,
+    }
+
     impl ScriptControl {
-        /// The next connection accepted asks for this pair.
-        pub(crate) fn asks_for(&self, venue: &str, symbol: &str) {
-            self.lock().answers.push_back(Some(SubscribeBookRequest {
-                pairs: vec![md_proto::md::v1::Pair {
-                    venue: venue.to_owned(),
-                    symbol: symbol.to_owned(),
-                }],
-            }));
+        /// The next connection accepted subscribes to this catalogue index.
+        pub(crate) fn asks_for(&self, instrument: CatalogueIdx) {
+            self.lock()
+                .answers
+                .push_back(Some(Asked::Subscribe(SubscribeBookRequest {
+                    instrument_idx: instrument.get(),
+                })));
+        }
+
+        /// The next connection accepted asks what this server carries.
+        pub(crate) fn asks_for_the_catalogue(&self) {
+            self.lock().answers.push_back(Some(Asked::Catalogue));
         }
 
         /// The next connection accepted connects and then says nothing, ever.
@@ -525,14 +571,14 @@ pub(crate) mod mock {
         async fn handshake(
             &self,
             sock: S,
-        ) -> Result<(SubscribeBookRequest, Self::Client), HandshakeError<Self::Client>> {
+        ) -> Result<Route<Self::Client>, HandshakeError<Self::Client>> {
             // Held for the life of the handshake, the way a real one holds the connection.
             let held = sock;
             let scripted = {
                 let mut script = self.0.lock().unwrap_or_else(PoisonError::into_inner);
                 script.answers.pop_front().flatten()
             };
-            let Some(request) = scripted else {
+            let Some(asked) = scripted else {
                 // A client that connected and then said nothing. The accept loop's timeout,
                 // or its shutdown, is what ends this.
                 pending::<()>().await;
@@ -547,7 +593,10 @@ pub(crate) mod mock {
             }
             drop(script);
             drop(held);
-            Ok((request, client))
+            Ok(match asked {
+                Asked::Subscribe(request) => Route::Subscribe(request, client),
+                Asked::Catalogue => Route::Catalogue(client),
+            })
         }
     }
 }

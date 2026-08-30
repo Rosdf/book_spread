@@ -1,5 +1,7 @@
-//! Which symbols are being broadcast, and the two races around starting and stopping one.
+//! Which symbols are being broadcast, the two races around starting and stopping one, and
+//! turning a catalogue index into the instrument a broadcaster is filed under.
 
+use crate::catalogue::CataloguePair;
 use crate::registry::events::{
     Claim, RegistryEvent, RegistryRx, RegistryTx, RegistryWeakTx, create_event_channel,
 };
@@ -8,15 +10,35 @@ use core_lib::Venue;
 use core_lib::instrument::{Instrument, InstrumentId};
 use core_lib::map::{InternalHashMap, new_internal_map};
 use core_lib::panic::panic_message;
+use core_lib::venue::backoff::Backoff;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use tokio::time::Instant;
 use crate::broadcast::broadcaster::{Broadcaster, Join};
 use crate::broadcast::queue::{make_broadcaster_channel, BroadcasterTx};
 use crate::client::ClientHandshake;
-use md_wire::grpc::{RejectCode, Rejected};
+use md_wire::grpc::{CatalogueIdx, RejectCode, Rejected, VenueIdx};
 
 pub(crate) mod events;
+
+/// The longest gap between two resolution sweeps.
+///
+/// The same order as the connectors' own hourly listing refresh is *not* what is wanted here:
+/// a sweep is how a catalogue entry becomes servable at all, so a minute is the longest a
+/// client that is retrying should have to wait after its venue has caught up. [`Backoff`]
+/// starts at 250ms and jitters, so a cold start converges in well under a second and a name
+/// that is never listed costs one sweep a minute.
+const RESOLVE_SWEEP_MAX: Duration = Duration::from_secs(60);
+
+/// A catalogue entry that has become servable: its venue's connector has interned the symbol,
+/// and the index the encoder will stamp on every level of its book.
+#[derive(Debug, Clone, Copy)]
+struct Resolved {
+    instrument: Instrument,
+    venue_idx: VenueIdx,
+}
 
 /// The registry's half of one running broadcaster.
 #[derive(Debug)]
@@ -66,12 +88,26 @@ pub(crate) struct RegistryHandle<V, C> {
 }
 
 impl<V: Connectors, C: ClientHandshake> RegistryHandle<V, C> {
-    /// Spawns the registry task and gives it `connectors` to own.
-    pub(crate) fn spawn(connectors: V) -> Self {
+    /// Spawns the registry task and gives it `connectors` and the catalogue's instruments to
+    /// own.
+    ///
+    /// Every instrument starts unresolved, however long its venue has been running: resolving
+    /// one is a lookup in the process-global instrument registry, and doing all of them here
+    /// would be a lock acquisition per entry before the first client has asked for anything.
+    /// The first subscribe is due a sweep immediately - `next_sweep` is now - so a cold start
+    /// costs exactly one.
+    pub(crate) fn spawn(
+        connectors: V,
+        instruments: InternalHashMap<CatalogueIdx, Box<[CataloguePair]>>,
+    ) -> Self {
         let (rx, tx) = create_event_channel();
         let registry = Registry {
             entries: new_internal_map(),
             connectors,
+            resolved: new_internal_map(),
+            unresolved: instruments,
+            resolve_backoff: Backoff::new(RESOLVE_SWEEP_MAX),
+            next_sweep: Instant::now(),
             shutting_down: false,
             tx: tx.downgrade(),
         };
@@ -137,6 +173,20 @@ impl<V: Connectors, C: ClientHandshake> RegistryHandle<V, C> {
 struct Registry<V, C> {
     entries: InternalHashMap<InstrumentId, Entry<C>>,
     connectors: V,
+    /// Catalogue entries whose venue has interned their symbol. Nothing ever leaves this map:
+    /// an `Instrument` handle stays valid for the life of the process.
+    resolved: InternalHashMap<CatalogueIdx, Resolved>,
+    /// Catalogue entries not interned as of the last sweep. Emptied into `resolved` as the
+    /// connectors catch up.
+    unresolved: InternalHashMap<CatalogueIdx, Box<[CataloguePair]>>,
+    /// One backoff for the whole sweep rather than one per entry: a sweep is a single pass of
+    /// read-locked lookups over every unresolved name, so pacing it once is both cheaper and
+    /// the thing that actually bounds how much traffic a hammering client can put on the
+    /// process-global instrument lock.
+    resolve_backoff: Backoff,
+    /// When the next sweep becomes due. Until then an unresolved index is refused without any
+    /// lookup at all.
+    next_sweep: Instant,
     /// Set by [`RegistryEvent::ShutDown`]. "Do not start anything new" - an entry that is
     /// still being torn down is still served.
     shutting_down: bool,
@@ -175,11 +225,11 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     fn handle(&mut self, event: RegistryEvent<C>) {
         match event {
             RegistryEvent::Subscribe(joining) => {
-                let (key, sock, reply) = joining.into_parts();
+                let (idx, sock, reply) = joining.into_parts();
                 // A dropped receiver just means the handshake gave up; the client in a
                 // `Refused` goes with it, which closes the connection - the same answer,
                 // unwritten.
-                let _ = reply.send(self.subscribe(key, sock));
+                let _ = reply.send(self.subscribe(idx, sock));
             }
             RegistryEvent::RetireIfIdle(retiring) => {
                 let (claim, reply) = retiring.into_parts();
@@ -208,7 +258,99 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
         }
     }
 
-    /// Hands `client` to `key`'s broadcaster, starting one if this is the first client.
+    /// Hands `client` to the broadcaster for catalogue instrument `idx`, starting one if this
+    /// is the first client.
+    ///
+    /// An index the catalogue does not carry, or one whose venue has not interned its symbol
+    /// yet, is refused here - before any broadcaster exists - which is what keeps an
+    /// unservable subscribe from costing a connector round trip.
+    fn subscribe(&mut self, idx: CatalogueIdx, client: C) -> Result<(), Refused<C>> {
+        match self.resolve(idx) {
+            Ok(resolved) => self.subscribe_resolved(resolved, client),
+            Err(rejected) => Err(Refused { client, rejected }),
+        }
+    }
+
+    /// The catalogue entry `idx` names, if it can be served right now.
+    ///
+    /// Ordered so that the common case - an index already resolved - is one hash lookup, and
+    /// so that a client retrying in a tight loop on an unresolved one costs nothing but two:
+    /// the sweep is what touches the process-global instrument lock, and it happens at most
+    /// once per [`Backoff`] step however many requests arrive in between.
+    ///
+    /// # Errors
+    ///
+    /// [`RejectCode::UnknownInstrument`] for an index this server does not carry at all -
+    /// permanent, since the catalogue is loaded once - and [`RejectCode::UnlistedSymbol`] for
+    /// one whose venue has not interned its symbol yet, which is worth retrying.
+    fn resolve(&mut self, idx: CatalogueIdx) -> Result<Resolved, Rejected> {
+        if let Some(resolved) = self.resolved.get(&idx) {
+            return Ok(*resolved);
+        }
+        if !self.unresolved.contains_key(&idx) {
+            return Err(Rejected::new(
+                RejectCode::UnknownInstrument,
+                format!("this server does not carry instrument {}", idx.get()).into_boxed_str(),
+            ));
+        }
+
+        let unlisted = || {
+            Rejected::new(
+                RejectCode::UnlistedSymbol,
+                format!(
+                    "instrument {} is not listed by its venue yet",
+                    idx.get()
+                )
+                .into_boxed_str(),
+            )
+        };
+        if Instant::now() < self.next_sweep {
+            return Err(unlisted());
+        }
+
+        self.sweep();
+        self.resolved.get(&idx).copied().ok_or_else(unlisted)
+    }
+
+    /// Moves every catalogue entry whose venue has now interned its symbol into `resolved`.
+    ///
+    /// One pass over everything still unresolved rather than a lookup for the one index that
+    /// was asked for: the lookups share a sweep, so the cost of answering the *next* request
+    /// for a different index has already been paid, and the backoff below bounds how often
+    /// this happens at all.
+    ///
+    /// An entry resolves on its first pair, which is the one that will be served. An entry
+    /// with no pairs at all never resolves - it names nothing to subscribe to - and simply
+    /// stays here.
+    fn sweep(&mut self) {
+        let before = self.unresolved.len();
+        let resolved = &mut self.resolved;
+        self.unresolved.retain(|idx, pairs| {
+            let Some(first) = pairs.first() else {
+                return true;
+            };
+            // `true` keeps the entry here: it is still unresolved.
+            Instrument::lookup(first.venue(), first.symbol()).is_none_or(|instrument| {
+                resolved.insert(
+                    *idx,
+                    Resolved {
+                        instrument,
+                        venue_idx: first.venue_idx(),
+                    },
+                );
+                false
+            })
+        });
+
+        // Progress means the connectors are still catching up, so the next sweep is worth
+        // making soon; no progress lets the interval grow towards `RESOLVE_SWEEP_MAX`.
+        if self.unresolved.len() < before {
+            self.resolve_backoff.reset();
+        }
+        self.next_sweep = Instant::now() + self.resolve_backoff.next_delay();
+    }
+
+    /// Hands `client` to `resolved`'s broadcaster, starting one if this is the first client.
     ///
     /// The broadcaster answers on the connection itself - response headers, or a refusal
     /// carrying the venue's own reason - so a symbol the venue does not list ends the
@@ -220,7 +362,11 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     /// occupied and queue a join. Exactly one `BookSource::subscribe` is ever issued per key -
     /// which is an invariant, not a nicety: the connector hard-errors a duplicate subscribe,
     /// and `BookReader` is not `Clone`, so a symbol has exactly one reader.
-    fn subscribe(&mut self, instrument: Instrument, client: C) -> Result<(), Refused<C>> {
+    fn subscribe_resolved(&mut self, resolved: Resolved, client: C) -> Result<(), Refused<C>> {
+        let Resolved {
+            instrument,
+            venue_idx,
+        } = resolved;
         let mut join = Join::new(client);
 
         if let Some(entry) = self.entries.get(&instrument.id()) {
@@ -307,7 +453,7 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
                 }
             };
 
-            Broadcaster::start(tx, instrument, queued, pending_joins, reader).await;
+            Broadcaster::start(tx, instrument, venue_idx, queued, pending_joins, reader).await;
         });
         Ok(())
     }
@@ -372,13 +518,13 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
 mod test {
     use super::events::Claim;
     use crate::broadcast::broadcaster::SESSION_SWEEP;
-    use crate::registry::harness::{Harness, registry_for};
+    use crate::registry::harness::{FIRST, Harness, registry_for, registry_unlisted};
     use crate::client::mock::{MockClient, MockPeer, connected};
     use crate::test_util::FakeSource;
     use crate::venue::Venue;
     use core_lib::instrument::Instrument;
     use core_lib::venue::test_util::test_instrument_for;
-    use md_wire::grpc::RejectCode;
+    use md_wire::grpc::{CatalogueIdx, RejectCode};
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -401,7 +547,7 @@ mod test {
         oneshot::Receiver<Result<(), super::Refused<MockClient>>>,
     ) {
         let (peer, client) = connected();
-        let queued = harness.registry.subscribe(key(), client);
+        let queued = harness.registry.subscribe(FIRST, client);
         (peer, queued)
     }
 
@@ -438,7 +584,7 @@ mod test {
     #[tokio::test]
     async fn concurrent_first_clients_produce_one_connector_subscribe() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
 
         // Every send happens before any reply is awaited, so all eight events are on the
         // registry's queue in a row and the entry the first one inserts is what the other
@@ -470,7 +616,7 @@ mod test {
     #[tokio::test]
     async fn a_join_queued_before_the_zero_check_keeps_the_broadcaster_alive() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
         let first = subscribed(&harness).await;
         first
             .accepted()
@@ -516,7 +662,7 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn a_retired_symbol_is_subscribed_again_for_the_next_client() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
 
         let first = subscribed(&harness).await;
         first
@@ -555,7 +701,7 @@ mod test {
     #[tokio::test]
     async fn a_rejected_subscribe_reaches_the_client_and_leaves_no_entry() {
         let source = Arc::new(FakeSource::rejecting("nosuch is not listed as tradable"));
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
 
         let client = subscribed(&harness).await;
         let rejected = client
@@ -579,7 +725,7 @@ mod test {
     #[tokio::test]
     async fn every_queued_client_hears_a_rejection() {
         let source = Arc::new(FakeSource::rejecting("nope"));
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
 
         let mut clients = Vec::new();
         for _ in 0..4 {
@@ -599,13 +745,13 @@ mod test {
     #[tokio::test]
     async fn subscribing_after_shutdown_is_refused() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
         harness.registry.shut_down();
 
         let (_peer, client) = connected();
         let refused = harness
             .registry
-            .subscribe(key(), client)
+            .subscribe(FIRST, client)
             .await
             .expect("the registry task is alive")
             .expect_err("nothing is spawned after shutdown");
@@ -623,7 +769,7 @@ mod test {
     #[tokio::test]
     async fn shutting_down_ends_a_running_broadcaster() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
         let client = subscribed(&harness).await;
         client
             .accepted()
@@ -640,6 +786,121 @@ mod test {
         );
     }
 
+    /// An index the catalogue does not carry at all is a different answer from one whose venue
+    /// has not listed its symbol yet - the catalogue is loaded once, so the first can never
+    /// become servable and the second may at any moment. Only the reject code says which.
+    #[tokio::test]
+    async fn an_index_the_catalogue_does_not_carry_is_refused_as_unknown() {
+        let source = Arc::new(FakeSource::default());
+        let harness = registry_for(&source, &[SYMBOL]);
+
+        let (_peer, client) = connected();
+        let refused = harness
+            .registry
+            .subscribe(CatalogueIdx::new(99), client)
+            .await
+            .expect("the registry task is alive")
+            .expect_err("nothing is carried at that index");
+
+        assert_eq!(refused.code(), RejectCode::UnknownInstrument);
+        assert!(
+            source.subscribed().is_empty(),
+            "an index this server does not carry must not reach a connector"
+        );
+    }
+
+    /// The pacing that keeps a client retrying in a tight loop off the process-global
+    /// instrument lock: between sweeps, an unresolved index is refused without a lookup.
+    ///
+    /// Observable because the symbol is interned *between* the two attempts. The second is
+    /// still refused - which it could only be if nothing probed - and the third, after the
+    /// clock has moved past the next sweep, succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_request_inside_the_sweep_window_does_not_probe_again() {
+        const UNLISTED: &str = "sweepwindow-btcusdt";
+
+        let source = Arc::new(FakeSource::default());
+        let harness = registry_unlisted(&source, &[UNLISTED]);
+
+        let (_first, first_reply) = subscribe(&harness);
+        assert_eq!(
+            first_reply
+                .await
+                .expect("the registry task is alive")
+                .expect_err("nothing has interned the symbol yet")
+                .code(),
+            RejectCode::UnlistedSymbol
+        );
+
+        let _ = test_instrument_for(Venue::BinanceSpot, UNLISTED);
+
+        let (_second, second_reply) = subscribe(&harness);
+        assert_eq!(
+            second_reply
+                .await
+                .expect("the registry task is alive")
+                .expect_err("the next sweep is not due yet")
+                .code(),
+            RejectCode::UnlistedSymbol,
+            "an unresolved index inside the sweep window is refused without a lookup"
+        );
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let third = subscribed(&harness).await;
+        third
+            .accepted()
+            .await
+            .expect("the fake source accepts every symbol");
+        assert_eq!(
+            source.subscribed(),
+            vec![UNLISTED],
+            "the sweep that came due is what made the instrument servable"
+        );
+    }
+
+    /// A sweep is one pass over everything unresolved, so it resolves what it can and leaves
+    /// the rest - it is not all-or-nothing, and a name no venue has listed does not hold back
+    /// the ones that have been.
+    #[tokio::test]
+    async fn one_sweep_resolves_what_it_can_and_leaves_the_rest() {
+        const LISTED: &str = "partialsweep-listed";
+        const UNLISTED: &str = "partialsweep-unlisted";
+
+        let source = Arc::new(FakeSource::default());
+        let harness = registry_unlisted(&source, &[LISTED, UNLISTED]);
+        let _ = test_instrument_for(Venue::BinanceSpot, LISTED);
+
+        let (peer, listed) = connected();
+        listed_reply(&harness, listed, CatalogueIdx::new(0)).await;
+        peer.accepted()
+            .await
+            .expect("the fake source accepts every symbol");
+
+        let (_peer, unlisted) = connected();
+        let refused = harness
+            .registry
+            .subscribe(CatalogueIdx::new(1), unlisted)
+            .await
+            .expect("the registry task is alive")
+            .expect_err("nothing has interned the second symbol");
+        assert_eq!(refused.code(), RejectCode::UnlistedSymbol);
+        assert_eq!(
+            source.subscribed(),
+            vec![LISTED],
+            "the entry that resolved was served, and the one that did not was not"
+        );
+    }
+
+    /// Queues `client` on `idx` and expects the registry to take it.
+    async fn listed_reply(harness: &Harness, client: MockClient, idx: CatalogueIdx) {
+        harness
+            .registry
+            .subscribe(idx, client)
+            .await
+            .expect("the registry task is alive")
+            .expect("the instrument resolves");
+    }
+
     /// A panicking event handler must not take the registry down with it - the map, the
     /// connectors and every running broadcaster's only way in all hang off this one task.
     ///
@@ -650,7 +911,7 @@ mod test {
     #[tokio::test]
     async fn a_panicking_handler_does_not_end_the_registry() {
         let source = Arc::new(FakeSource::panicking_unsubscribe());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &[SYMBOL]);
         let client = subscribed(&harness).await;
         client
             .accepted()
@@ -684,7 +945,7 @@ mod test {
     }
 }
 
-/// The registry task a unit test drives, over fake connectors.
+/// The registry task a unit test drives, over fake connectors and a catalogue built in place.
 ///
 /// Here rather than in [`crate::test_util`] because it wraps this module's own task. The
 /// end-to-end test stands a whole server up through [`crate::server::serve`] instead, so it
@@ -693,20 +954,47 @@ mod test {
 pub(crate) mod harness {
     use super::RegistryHandle;
     use super::events::RegistryTx;
+    use crate::catalogue::Catalogue;
     use crate::test_util::{FakeConnectors, FakeSource};
     use crate::client::mock::MockClient;
+    use crate::venue::Venue;
+    use core_lib::venue::test_util::test_instrument_for;
+    use md_wire::grpc::CatalogueIdx;
     use std::sync::Arc;
 
-    /// A registry task over one Binance-side source, and the way in that a test drives it
-    /// through.
-    ///
-    /// The [`super::RegistryHandle`] is dropped rather than kept: dropping its `JoinHandle` only
-    /// detaches the task, and the `RegistryTx` in the harness is what keeps it running - for
-    /// exactly as long as the test holds the harness. A test that wants the connectors back
-    /// stands its own handle up instead.
-    pub(crate) fn registry_for(source: &Arc<FakeSource>) -> Harness {
+    /// The index of the first symbol a harness carries. Tests that name one instrument name
+    /// this one.
+    pub(crate) const FIRST: CatalogueIdx = CatalogueIdx::new(0);
+
+    /// A registry over one Binance-side source, carrying `symbols` at their position in the
+    /// slice - and with each of them interned, the way a connector's listing refresh would
+    /// have, so every one resolves on the first sweep.
+    pub(crate) fn registry_for(source: &Arc<FakeSource>, symbols: &[&str]) -> Harness {
+        for symbol in symbols {
+            let _ = test_instrument_for(Venue::BinanceSpot, symbol);
+        }
+        registry_unlisted(source, symbols)
+    }
+
+    /// The same, without interning anything: the catalogue names the symbols and whether
+    /// their venue has listed them is the test's to arrange.
+    pub(crate) fn registry_unlisted(source: &Arc<FakeSource>, symbols: &[&str]) -> Harness {
+        let entries: Vec<(u32, [(Venue, &str); 1])> = symbols
+            .iter()
+            .enumerate()
+            .map(|(position, symbol)| {
+                let idx = u32::try_from(position).expect("a test carries a handful of symbols");
+                (idx, [(Venue::BinanceSpot, *symbol)])
+            })
+            .collect();
+        let carried: Vec<(u32, &[(Venue, &str)])> = entries
+            .iter()
+            .map(|(idx, pairs)| (*idx, pairs.as_slice()))
+            .collect();
+
         let connectors = FakeConnectors::new(Arc::clone(source), FakeSource::default());
-        let handle = RegistryHandle::spawn(connectors);
+        let catalogue = Catalogue::for_test(&carried);
+        let handle = RegistryHandle::spawn(connectors, catalogue.into_instruments());
 
         Harness {
             registry: handle.tx(),
@@ -715,6 +1003,11 @@ pub(crate) mod harness {
 
     /// What [`registry_for`] hands back: the registry under test, reached the same way a
     /// broadcaster reaches it.
+    ///
+    /// The [`super::RegistryHandle`] is dropped rather than kept: dropping its `JoinHandle`
+    /// only detaches the task, and the `RegistryTx` here is what keeps it running - for
+    /// exactly as long as the test holds the harness. A test that wants the connectors back
+    /// stands its own handle up instead.
     #[derive(Debug)]
     pub(crate) struct Harness {
         pub(crate) registry: RegistryTx<MockClient>,

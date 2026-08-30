@@ -6,28 +6,80 @@
 //! and tonic on the client side own the frames. What this module holds is the handful of
 //! constants and mappings both ends have to agree on:
 //!
-//! - **Path**: [`SERVICE_PATH`], `POST`, with a `content-type` starting [`CONTENT_TYPE_PREFIX`].
-//! - **Request**: one length-prefixed `md.v1.SubscribeBookRequest`, then `END_STREAM`.
-//! - **Stream**: one length-prefixed `BookUpdate` per DATA payload, repeating.
+//! - **Paths**: [`SUBSCRIBE_PATH`] and [`CATALOGUE_PATH`], `POST`, with a `content-type`
+//!   starting [`CONTENT_TYPE_PREFIX`].
+//! - **Request**: one length-prefixed `md.v1.SubscribeBookRequest` - or
+//!   `md.v1.CatalogueRequest`, which is empty - then `END_STREAM`.
+//! - **Stream**: one length-prefixed `BookUpdate` per DATA payload, repeating. A catalogue is
+//!   a single message, followed by `grpc-status: 0` trailers.
 //! - **End of stream**: trailers carrying `grpc-status`.
 //! - **Refusal**: a Trailers-Only response - `grpc-status`, `grpc-message`, and the exact
 //!   [`RejectCode`] in [`REJECT_CODE_HEADER`].
 //!
+//! # Identity is numeric
+//!
+//! A client asks [`CATALOGUE_PATH`] what this server carries and gets back two tables: venue
+//! index -> venue name, and instrument index -> the pairs under it. Everything after that
+//! travels as an index - a [`CatalogueIdx`] on a subscribe, a [`VenueIdx`] on every level -
+//! so no venue name and no symbol is spelled out on the hot path.
+//!
 //! # One book per stream
 //!
-//! A request names its pairs, and today only the first is served; a client that wants three
-//! symbols opens three streams. HTTP/2 would happily multiplex them onto one connection, but
-//! the server keeps one stream per connection so that a broadcaster owns its clients outright,
-//! with no mutex, no interleaving between symbols and no head-of-line blocking between them -
-//! which is the point of the whole exercise. It is also ordinary for a market-data feed.
+//! A request names one instrument, and every pair under it is validated while only the first
+//! is served; a client that wants three symbols opens three streams. HTTP/2 would happily
+//! multiplex them onto one connection, but the server keeps one stream per connection so that
+//! a broadcaster owns its clients outright, with no mutex, no interleaving between symbols and
+//! no head-of-line blocking between them - which is the point of the whole exercise. It is
+//! also ordinary for a market-data feed.
 //!
 //! # Why the reject codes are not just gRPC status codes
 //!
-//! The nine [`RejectCode`]s say more than the canonical status codes do - in particular
+//! The eight [`RejectCode`]s say more than the canonical status codes do - in particular
 //! [`RejectCode::retryable`] is not derivable from the status alone, since `NOT_FOUND` for an
-//! unlisted symbol is permanent while `UNAVAILABLE` for a connector that went away is not. So
-//! both travel: the canonical code in `grpc-status`, for clients that only understand gRPC,
-//! and the exact one in [`REJECT_CODE_HEADER`], for clients that want the detail.
+//! instrument this server does not carry is permanent while `NOT_FOUND` for one whose venue
+//! has not listed its symbol yet is not. So both travel: the canonical code in `grpc-status`,
+//! for clients that only understand gRPC, and the exact one in [`REJECT_CODE_HEADER`], for
+//! clients that want the detail.
+
+/// An instrument's index in the catalogue.
+///
+/// Assigned by the server's catalogue - a config file, not this process - and unrelated to
+/// `core_lib`'s `InstrumentId`, which is issued by the instrument registry as symbols are
+/// interned. A type of its own rather than a bare `u32` so it cannot be swapped with a
+/// [`VenueIdx`] at a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CatalogueIdx(u32);
+
+impl CatalogueIdx {
+    #[must_use]
+    pub const fn new(idx: u32) -> Self {
+        Self(idx)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// A venue's index in the catalogue's venue table.
+///
+/// What a `Level` carries instead of a venue name, and what a catalogue pair names its venue
+/// by. See [`CatalogueIdx`] for why this is a type rather than a `u32`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VenueIdx(u32);
+
+impl VenueIdx {
+    #[must_use]
+    pub const fn new(idx: u32) -> Self {
+        Self(idx)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
 
 /// Bytes of gRPC message header in front of every message: one compression flag, then a
 /// big-endian `u32` length.
@@ -44,13 +96,17 @@ pub const UNCOMPRESSED: u8 = 0;
 
 /// The largest message either side will read.
 ///
-/// Every message this protocol carries is tiny - a request is a venue name and a symbol, a
-/// book is at most twenty levels - so this is not a capacity limit but a bound on what a
-/// hostile peer can make the other end allocate off a five-byte header.
+/// A request is one index and a book is at most twenty levels, so this is not a capacity limit
+/// but a bound on what a hostile peer can make the other end allocate off a five-byte header.
+/// A catalogue is the one message that can approach it, since it spells out every instrument
+/// this server carries.
 pub const MAX_MESSAGE_LEN: usize = 4 * 1024;
 
-/// The one method this service has.
-pub const SERVICE_PATH: &str = "/md.v1.MarketData/SubscribeBook";
+/// The streaming method: one book per stream.
+pub const SUBSCRIBE_PATH: &str = "/md.v1.MarketData/SubscribeBook";
+
+/// The unary method: what this server carries.
+pub const CATALOGUE_PATH: &str = "/md.v1.MarketData/GetCatalogue";
 
 /// What the server sends back. Clients may send this or the bare `application/grpc`, or
 /// either with parameters after it, so requests are matched against
@@ -90,28 +146,25 @@ impl Status {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RejectCode {
-    /// The request named no pairs.
-    EmptyRequest = 1,
-    /// The request named a venue this server does not carry.
-    UnknownVenue = 2,
-    /// The symbol is empty, over `MAX_SYMBOL_LEN`, or not ASCII alphanumeric.
-    MalformedSymbol = 3,
-    /// Well-formed, but the venue does not list it as tradable.
-    UnlistedSymbol = 4,
-    /// The same pair appears twice in one request.
-    DuplicatePair = 5,
+    /// The request named an instrument index the catalogue does not carry. Nothing about it
+    /// will change: the catalogue is loaded once, at startup.
+    UnknownInstrument = 1,
+    /// The catalogue carries the instrument, but the venue's connector has not interned its
+    /// symbol yet - so there is nothing to subscribe on. A connector that has not caught up,
+    /// rather than a symbol that does not exist.
+    UnlistedSymbol = 2,
     /// The server is shutting down.
-    ShuttingDown = 6,
+    ShuttingDown = 3,
     /// The connector answered the subscribe with a refusal.
-    ConnectorRefused = 7,
+    ConnectorRefused = 4,
     /// The connector went away before it could answer.
-    ConnectorGone = 8,
+    ConnectorGone = 5,
     /// The broadcaster's book stream ended while joins were still queued.
-    StreamEnded = 9,
-    /// The request was not this service's method, or not gRPC at all.
-    NotThisService = 10,
-    /// The request body was not a well-formed `SubscribeBookRequest`.
-    MalformedRequest = 11,
+    StreamEnded = 6,
+    /// The request was not one of this service's methods, or not gRPC at all.
+    NotThisService = 7,
+    /// The request body was not a well-formed message of the method's type.
+    MalformedRequest = 8,
 }
 
 impl RejectCode {
@@ -121,17 +174,14 @@ impl RejectCode {
 
     pub fn from_byte(byte: u8) -> Option<Self> {
         match byte {
-            1 => Some(Self::EmptyRequest),
-            2 => Some(Self::UnknownVenue),
-            3 => Some(Self::MalformedSymbol),
-            4 => Some(Self::UnlistedSymbol),
-            5 => Some(Self::DuplicatePair),
-            6 => Some(Self::ShuttingDown),
-            7 => Some(Self::ConnectorRefused),
-            8 => Some(Self::ConnectorGone),
-            9 => Some(Self::StreamEnded),
-            10 => Some(Self::NotThisService),
-            11 => Some(Self::MalformedRequest),
+            1 => Some(Self::UnknownInstrument),
+            2 => Some(Self::UnlistedSymbol),
+            3 => Some(Self::ShuttingDown),
+            4 => Some(Self::ConnectorRefused),
+            5 => Some(Self::ConnectorGone),
+            6 => Some(Self::StreamEnded),
+            7 => Some(Self::NotThisService),
+            8 => Some(Self::MalformedRequest),
             _ => None,
         }
     }
@@ -140,18 +190,19 @@ impl RejectCode {
     pub fn retryable(self) -> bool {
         matches!(
             self,
-            Self::ShuttingDown | Self::ConnectorRefused | Self::ConnectorGone | Self::StreamEnded
+            Self::UnlistedSymbol
+                | Self::ShuttingDown
+                | Self::ConnectorRefused
+                | Self::ConnectorGone
+                | Self::StreamEnded
         )
     }
 
     /// The canonical gRPC status a client that knows nothing of [`REJECT_CODE_HEADER`] sees.
     pub fn status(self) -> Status {
         match self {
-            Self::EmptyRequest
-            | Self::MalformedSymbol
-            | Self::DuplicatePair
-            | Self::MalformedRequest => Status::InvalidArgument,
-            Self::UnknownVenue | Self::UnlistedSymbol => Status::NotFound,
+            Self::MalformedRequest => Status::InvalidArgument,
+            Self::UnknownInstrument | Self::UnlistedSymbol => Status::NotFound,
             Self::ConnectorRefused => Status::FailedPrecondition,
             Self::ShuttingDown | Self::ConnectorGone | Self::StreamEnded => Status::Unavailable,
             Self::NotThisService => Status::Unimplemented,
@@ -220,15 +271,13 @@ pub fn message_len(header: &[u8; MESSAGE_PREFIX]) -> Option<usize> {
 #[cfg(test)]
 mod test {
     use super::{
-        MAX_MESSAGE_LEN, MESSAGE_PREFIX, RejectCode, Status, message_len, put_message_prefix,
+        CatalogueIdx, MAX_MESSAGE_LEN, MESSAGE_PREFIX, RejectCode, Status, VenueIdx, message_len,
+        put_message_prefix,
     };
 
-    const ALL_CODES: [RejectCode; 11] = [
-        RejectCode::EmptyRequest,
-        RejectCode::UnknownVenue,
-        RejectCode::MalformedSymbol,
+    const ALL_CODES: [RejectCode; 8] = [
+        RejectCode::UnknownInstrument,
         RejectCode::UnlistedSymbol,
-        RejectCode::DuplicatePair,
         RejectCode::ShuttingDown,
         RejectCode::ConnectorRefused,
         RejectCode::ConnectorGone,
@@ -246,7 +295,7 @@ mod test {
             assert_eq!(RejectCode::from_byte(code.as_byte()), Some(code));
         }
         assert_eq!(RejectCode::from_byte(0), None);
-        assert_eq!(RejectCode::from_byte(12), None);
+        assert_eq!(RejectCode::from_byte(9), None);
     }
 
     /// A refusal is never `Ok`: a client that only reads `grpc-status` must not see a
@@ -259,18 +308,18 @@ mod test {
     }
 
     /// Retryability is the part `grpc-status` cannot express on its own, which is why
-    /// [`REJECT_CODE_HEADER`] exists at all - `FAILED_PRECONDITION` for a connector that was
-    /// not ready is worth retrying and `NOT_FOUND` for an unlisted symbol never is.
+    /// [`super::REJECT_CODE_HEADER`] exists at all - `FAILED_PRECONDITION` for a connector
+    /// that was not ready is worth retrying and `INVALID_ARGUMENT` for a body that is not a
+    /// message of this method's type never is.
     ///
     /// What must still hold is that the two never contradict each other: a code worth
-    /// retrying must not arrive as a status every gRPC client reads as permanent.
+    /// retrying must not arrive as a status every gRPC client reads as permanent. `NOT_FOUND`
+    /// is deliberately not on that list: the two codes carrying it - an instrument the
+    /// catalogue does not have and one whose symbol its venue has not listed yet - differ in
+    /// exactly this, which is the case that makes the metadata worth carrying.
     #[test]
     fn no_retryable_code_arrives_as_a_permanent_status() {
-        const PERMANENT: [Status; 3] = [
-            Status::InvalidArgument,
-            Status::NotFound,
-            Status::Unimplemented,
-        ];
+        const PERMANENT: [Status; 2] = [Status::InvalidArgument, Status::Unimplemented];
 
         for code in ALL_CODES {
             assert!(
@@ -303,5 +352,14 @@ mod test {
         let over = u32::try_from(MAX_MESSAGE_LEN + 1).expect("the bound fits a u32");
         put_message_prefix(&mut header, over);
         assert_eq!(message_len(&header), None, "over the length bound");
+    }
+
+    /// Both indices are `u32` on the wire and mean entirely different things. This is what
+    /// they are for: the value goes in and comes back, and the two types never mix.
+    #[test]
+    fn an_index_carries_its_value_and_nothing_else() {
+        assert_eq!(CatalogueIdx::new(7).get(), 7);
+        assert_eq!(VenueIdx::new(0).get(), 0);
+        assert_ne!(CatalogueIdx::new(1), CatalogueIdx::new(2));
     }
 }

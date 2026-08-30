@@ -9,7 +9,9 @@
 //! `make_book_publisher_pair` is public, so a fake source can hand out a real [`BookReader`]
 //! and keep the matching [`BookPublisher`] for the test to drive - which is the whole reason
 //! [`BookSource`] exists as a trait.
+use crate::catalogue::Catalogue;
 use crate::venue::{BookSource, Connectors, Venue};
+use md_wire::grpc::{CatalogueIdx, VenueIdx};
 use core_lib::connector::book_publisher::{BookPublisher, BookReader, make_book_publisher_pair};
 use core_lib::incremental_book::IncrementalBook;
 use core_lib::instrument::{Instrument, InstrumentId};
@@ -183,6 +185,89 @@ fn positive(value: f64) -> PositiveF64 {
     PositiveF64::new(value).expect("test prices and sizes are positive")
 }
 
+/// The catalogue a test serves, built pair by pair.
+///
+/// A wrapper rather than the crate's own `Catalogue`, which is private: what a test needs is
+/// a way to say "index 3 is `binance_spot/BTCUSDT`" and then name index 3 on the wire. The venue
+/// table is every venue this build carries, at its position in `Venue::ALL`, so
+/// [`TestCatalogue::venue_idx`] is what a test asserts a level's `venue_idx` against without
+/// either side spelling the numbering out.
+#[derive(Debug, Default)]
+pub struct TestCatalogue {
+    instruments: Vec<(u32, Vec<(Venue, String)>)>,
+}
+
+impl TestCatalogue {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Carries `symbol` on `venue` at instrument index `idx`.
+    #[must_use]
+    pub fn with(mut self, idx: u32, venue: Venue, symbol: &str) -> Self {
+        self.instruments
+            .push((idx, vec![(venue, symbol.to_owned())]));
+        self
+    }
+
+    /// Carries one instrument spelled differently on each of `pairs`. Only the first is served
+    /// today; the rest are validated and advertised.
+    #[must_use]
+    pub fn with_pairs(mut self, idx: u32, pairs: &[(Venue, &str)]) -> Self {
+        self.instruments.push((
+            idx,
+            pairs
+                .iter()
+                .map(|&(venue, symbol)| (venue, symbol.to_owned()))
+                .collect(),
+        ));
+        self
+    }
+
+    /// The index a level quoted by `venue` carries.
+    ///
+    /// # Panics
+    ///
+    /// Never: every [`Venue`] is in [`Venue::ALL`], which is what this searches.
+    #[must_use]
+    pub fn venue_idx(venue: Venue) -> VenueIdx {
+        let idx = Venue::ALL
+            .iter()
+            .position(|known| *known == venue)
+            .expect("every venue this build carries is in `Venue::ALL`");
+        VenueIdx::new(u32::try_from(idx).expect("this build carries a handful of venues"))
+    }
+
+    /// The index a subscribe names for the instrument at `idx`. Trivial today - it is `idx` -
+    /// and here so a test says what it means rather than casting.
+    #[must_use]
+    pub fn instrument_idx(idx: u32) -> CatalogueIdx {
+        CatalogueIdx::new(idx)
+    }
+
+    fn build(&self) -> Catalogue {
+        let borrowed: Vec<(u32, Vec<(Venue, &str)>)> = self
+            .instruments
+            .iter()
+            .map(|(idx, pairs)| {
+                (
+                    *idx,
+                    pairs
+                        .iter()
+                        .map(|(venue, symbol)| (*venue, symbol.as_str()))
+                        .collect(),
+                )
+            })
+            .collect();
+        let entries: Vec<(u32, &[(Venue, &str)])> = borrowed
+            .iter()
+            .map(|(idx, pairs)| (*idx, pairs.as_slice()))
+            .collect();
+        Catalogue::for_test(&entries)
+    }
+}
+
 /// Serves the book feed on `listener` until `stop` resolves, then stops the connectors.
 ///
 /// # Shutdown ordering
@@ -209,7 +294,8 @@ fn positive(value: f64) -> PositiveF64 {
 pub async fn serve(
     listener: TcpListener,
     connectors: FakeConnectors,
+    catalogue: &TestCatalogue,
     stop: impl Future<Output = ()> + Send,
 ) -> anyhow::Result<()> {
-    crate::server::serve(listener, connectors, stop).await
+    crate::server::serve(listener, connectors, catalogue.build(), stop).await
 }

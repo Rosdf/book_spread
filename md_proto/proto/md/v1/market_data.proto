@@ -2,42 +2,71 @@ syntax = "proto3";
 
 package md.v1;
 
-// Top-of-book fan-out over gRPC. One book per connection: the client opens
-// SubscribeBook naming its pairs, and the server streams BookUpdates until it ends the
-// stream with a status.
+// Top-of-book fan-out over gRPC. One book per connection: the client asks the server what it
+// carries with GetCatalogue, then opens SubscribeBook naming one of the instrument indices
+// that answer gave it, and the server streams BookUpdates until it ends the stream with a
+// status.
 //
 // The server encodes each book once - length prefix and all - and hands the same buffer
 // to every attached client. That is why it does not use tonic: a generated codec would
 // re-encode the message per client. See `md_wire::grpc` for the framing constants and the
 // refusal codes, and `md_server::client` for the fan-out itself.
+//
+// Identity on this wire is numeric. A `Level` carries the index of the venue that quoted it
+// rather than that venue's name, and a subscribe names an instrument index rather than a
+// `(venue, symbol)` pair - both resolved through the catalogue, which is the only message
+// that spells either out.
 
 service MarketData {
   // One book per stream. A refusal arrives as a Trailers-Only response whose
   // `grpc-status` says what kind of problem it was, and whose `md-reject-code` metadata
   // carries the exact reason - see `md_wire::grpc::RejectCode`.
   rpc SubscribeBook(SubscribeBookRequest) returns (stream BookUpdate);
+  // What this server carries: the venue index table, and every instrument it will serve.
+  rpc GetCatalogue(CatalogueRequest) returns (CatalogueResponse);
+}
+
+message CatalogueRequest {}
+
+message CatalogueResponse {
+  repeated VenueEntry      venues      = 1;
+  repeated InstrumentEntry instruments = 2;
+}
+
+// Indices are explicit fields rather than positions in the list, so the server's own
+// numbering is what travels and this response can be hand-encoded without building a map
+// first.
+message VenueEntry {
+  uint32 idx  = 1;
+  // "binance_spot", "bitstamp".
+  string name = 2;
+}
+
+message InstrumentEntry {
+  uint32 idx          = 1;
+  repeated Pair pairs = 2;
 }
 
 message Pair {
-  // "binance_spot" or "bitstamp", case-insensitive.
-  string venue = 1;
-  // The venue's own symbol, spelled exactly as that venue lists it - case-sensitive:
-  // "BTCUSDT" on binance_spot, "btcusd" on bitstamp. Non-empty ASCII alphanumerics.
-  string symbol = 2;
+  uint32 venue_idx = 1;
+  // The venue's own spelling, case-sensitive: "BTCUSDT" on binance_spot, "btcusd" on
+  // bitstamp.
+  string symbol    = 2;
 }
 
 message SubscribeBookRequest {
-  // At least one, no duplicates. Every pair is validated, but only the first is
-  // served today - merging the rest into one book is the next stage.
-  repeated Pair pairs = 1;
+  // An idx from CatalogueResponse.instruments. Every pair under it is validated; only the
+  // first is served today - merging the rest into one book is the next stage.
+  uint32 instrument_idx = 1;
 }
 
 message Level {
   double price = 1;
   double size  = 2;
-  // Which venue quoted this level. One value across a whole book today; once books
-  // are merged, levels on one side will carry different venues.
-  string venue = 3;
+  // Which venue quoted this level, as an index into CatalogueResponse.venues. One value
+  // across a whole book today; once books are merged, levels on one side will carry
+  // different venues.
+  uint32 venue_idx = 3;
 }
 
 // Every field tag here is <= 15, so each key costs a single byte. A scalar field

@@ -73,14 +73,17 @@ pub(crate) struct LiveConnectors {
 }
 
 impl LiveConnectors {
-    /// Spawns both connectors on that venue's own default configuration.
+    /// Spawns both connectors on the configuration each was given.
     ///
     /// Neither is subscribed to anything yet: symbols are subscribed on demand, by the first
     /// client that asks for one.
-    pub(crate) fn spawn() -> Self {
+    pub(crate) fn spawn(
+        binance_spot: ConnectorConfig<binance_spot::Config>,
+        bitstamp: ConnectorConfig<bitstamp::Config>,
+    ) -> Self {
         Self {
-            binance_spot: ConnectorHandle::new::<BinanceSpot>(ConnectorConfig::default()),
-            bitstamp: ConnectorHandle::new::<Bitstamp>(ConnectorConfig::default()),
+            binance_spot: ConnectorHandle::new::<BinanceSpot>(binance_spot),
+            bitstamp: ConnectorHandle::new::<Bitstamp>(bitstamp),
         }
     }
 }

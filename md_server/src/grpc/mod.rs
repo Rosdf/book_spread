@@ -25,18 +25,17 @@
 
 mod sink;
 
-use crate::client::{ClientHandshake, HandshakeError, Handshaker};
+use crate::client::{ClientHandshake, HandshakeError, Handshaker, Route};
 use bytes::{Bytes, BytesMut};
 use h2::RecvStream;
 use h2::server::{Connection, SendResponse};
 use http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use http::{HeaderMap, Method, Response, StatusCode};
-use md_proto::md::v1::SubscribeBookRequest;
+use md_proto::md::v1::{CatalogueRequest, SubscribeBookRequest};
 use md_wire::grpc::{
-    CONTENT_TYPE as GRPC_CONTENT_TYPE, CONTENT_TYPE_PREFIX, MAX_MESSAGE_LEN, MESSAGE_PREFIX,
-    REJECT_CODE_HEADER, RejectCode, Rejected, SERVICE_PATH, message_len,
+    CATALOGUE_PATH, CONTENT_TYPE as GRPC_CONTENT_TYPE, CONTENT_TYPE_PREFIX, MAX_MESSAGE_LEN,
+    MESSAGE_PREFIX, REJECT_CODE_HEADER, RejectCode, Rejected, SUBSCRIBE_PATH, Status, message_len,
 };
-use prost::Message as _;
 use sink::H2Sink;
 use std::fmt;
 use std::future::poll_fn;
@@ -97,7 +96,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Handshaker<S> for H2Han
     async fn handshake(
         &self,
         sock: S,
-    ) -> Result<(SubscribeBookRequest, Self::Client), HandshakeError<Self::Client>> {
+    ) -> Result<Route<Self::Client>, HandshakeError<Self::Client>> {
         let mut conn: Connection<S, Bytes> = self
             .builder
             .handshake(sock)
@@ -115,12 +114,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Handshaker<S> for H2Han
         let (head, mut body) = request.into_parts();
         // Checked before the body is read: a peer that is not speaking this service at all
         // should not get to stream bytes at us first.
-        if let Err(rejected) = check_route(&head) {
-            return Err(HandshakeError::Refused(H2Client { conn, respond }, rejected));
-        }
+        let call = match check_route(&head) {
+            Ok(call) => call,
+            Err(rejected) => {
+                return Err(HandshakeError::Refused(H2Client { conn, respond }, rejected));
+            }
+        };
 
-        match read_request(&mut conn, &mut body).await {
-            Ok(request) => Ok((request, H2Client { conn, respond })),
+        // Both calls read their one message the same way, and a `CatalogueRequest` is empty -
+        // so a catalogue call still reads a five-byte header and an empty body, which is what
+        // drains the request to END_STREAM before the answer goes out.
+        let asked = match call {
+            Call::Subscribe => read_request::<S, SubscribeBookRequest>(&mut conn, &mut body)
+                .await
+                .map(Asked::Subscribe),
+            Call::Catalogue => read_request::<S, CatalogueRequest>(&mut conn, &mut body)
+                .await
+                .map(|CatalogueRequest {}| Asked::Catalogue),
+        };
+
+        match asked {
+            Ok(Asked::Subscribe(request)) => {
+                Ok(Route::Subscribe(request, H2Client { conn, respond }))
+            }
+            Ok(Asked::Catalogue) => Ok(Route::Catalogue(H2Client { conn, respond })),
             Err(Some(rejected)) => {
                 Err(HandshakeError::Refused(H2Client { conn, respond }, rejected))
             }
@@ -129,14 +146,37 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Handshaker<S> for H2Han
     }
 }
 
-/// Checks the request is this service's method, spoken as gRPC.
-fn check_route(head: &http::request::Parts) -> Result<(), Rejected> {
-    if head.method != Method::POST || head.uri.path() != SERVICE_PATH {
-        return Err(Rejected::new(
+/// One request, decoded. The same two cases as [`Route`], before there is a client to attach
+/// to them - which there is not until the body has been read off `conn`.
+#[derive(Debug)]
+enum Asked {
+    Subscribe(SubscribeBookRequest),
+    Catalogue,
+}
+
+/// Which of this service's two methods a request is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Call {
+    Subscribe,
+    Catalogue,
+}
+
+/// Checks the request is one of this service's methods, spoken as gRPC.
+fn check_route(head: &http::request::Parts) -> Result<Call, Rejected> {
+    let unknown = || {
+        Rejected::new(
             RejectCode::NotThisService,
             format!("unknown method {} {}", head.method, head.uri.path()).into_boxed_str(),
-        ));
+        )
+    };
+    if head.method != Method::POST {
+        return Err(unknown());
     }
+    let call = match head.uri.path() {
+        SUBSCRIBE_PATH => Call::Subscribe,
+        CATALOGUE_PATH => Call::Catalogue,
+        _ => return Err(unknown()),
+    };
 
     // A `content-type` of `application/grpc` may carry a sub-type (`+proto`, `+json`) and
     // parameters after it, so this is a prefix test rather than an equality one. Only proto is
@@ -148,7 +188,7 @@ fn check_route(head: &http::request::Parts) -> Result<(), Rejected> {
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with(CONTENT_TYPE_PREFIX));
     if grpc {
-        Ok(())
+        Ok(call)
     } else {
         Err(Rejected::new(
             RejectCode::NotThisService,
@@ -157,7 +197,7 @@ fn check_route(head: &http::request::Parts) -> Result<(), Rejected> {
     }
 }
 
-/// Reads the one length-prefixed `SubscribeBookRequest` the client sends.
+/// Reads the one length-prefixed message the client sends.
 ///
 /// `conn` is polled alongside the body because [`RecvStream::poll_data`] does not drive the
 /// connection - h2 expects a task to be doing that, and here there is none. Polling the body
@@ -167,10 +207,10 @@ fn check_route(head: &http::request::Parts) -> Result<(), Rejected> {
 ///
 /// `Err(Some(_))` for a request that arrived and cannot be served, which is still answerable;
 /// `Err(None)` for a connection that ended with nothing to answer on.
-async fn read_request<S: AsyncRead + AsyncWrite + Unpin>(
+async fn read_request<S: AsyncRead + AsyncWrite + Unpin, M: prost::Message + Default>(
     conn: &mut Connection<S, Bytes>,
     body: &mut RecvStream,
-) -> Result<SubscribeBookRequest, Option<Rejected>> {
+) -> Result<M, Option<Rejected>> {
     let malformed = |why: &str| Some(Rejected::new(RejectCode::MalformedRequest, Box::from(why)));
 
     let mut buf = BytesMut::new();
@@ -191,8 +231,8 @@ async fn read_request<S: AsyncRead + AsyncWrite + Unpin>(
         if let Some(body_len) = announced
             && buf.len() >= MESSAGE_PREFIX + body_len
         {
-            return SubscribeBookRequest::decode(&buf[MESSAGE_PREFIX..MESSAGE_PREFIX + body_len])
-                .map_err(|_| malformed("the body is not a SubscribeBookRequest"));
+            return M::decode(&buf[MESSAGE_PREFIX..MESSAGE_PREFIX + body_len])
+                .map_err(|_| malformed("the body is not a message of this method's type"));
         }
 
         let received = poll_fn(|cx| match body.poll_data(cx) {
@@ -274,6 +314,39 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> ClientHandshake for H2C
             tracing::debug!("could not tell a client why it was refused");
         }
     }
+
+    async fn respond_unary(mut self, body: Bytes) {
+        let mut response = Response::new(());
+        *response.status_mut() = StatusCode::OK;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static(GRPC_CONTENT_TYPE));
+
+        let Ok(mut send) = self.respond.send_response(response, false) else {
+            return;
+        };
+        // No reservation dance: one message, sent whole. A caller's initial window is far
+        // larger than a catalogue, and one that shrinks it below that is a peer this server
+        // owes nothing beyond the timeout below.
+        if send.send_data(body, false).is_err() {
+            return;
+        }
+        let mut trailers = HeaderMap::new();
+        trailers.insert(
+            grpc_status(),
+            HeaderValue::from(u16::from(Status::Ok.as_code())),
+        );
+        if send.send_trailers(trailers).is_err() {
+            return;
+        }
+
+        // Queued, not sent - the same as a refusal: nothing else will ever drive this
+        // connection, so this is what puts the answer on the wire.
+        let flushed = tokio::time::timeout(REJECT_TIMEOUT, poll_fn(|cx| self.conn.poll_closed(cx)));
+        if flushed.await.is_err() {
+            tracing::debug!("could not hand a client the catalogue it asked for");
+        }
+    }
 }
 
 /// Writes a status - and, when it is a refusal, the exact reason - into `headers`.
@@ -328,9 +401,10 @@ mod test {
     use h2::client::SendRequest;
     use http::header::CONTENT_TYPE;
     use http::{HeaderMap, Method, Request};
-    use md_proto::md::v1::{Pair, SubscribeBookRequest};
+    use md_proto::md::v1::SubscribeBookRequest;
     use md_wire::grpc::{
-        MESSAGE_PREFIX, REJECT_CODE_HEADER, RejectCode, SERVICE_PATH, put_message_prefix,
+        CATALOGUE_PATH, MESSAGE_PREFIX, REJECT_CODE_HEADER, RejectCode, SUBSCRIBE_PATH,
+        put_message_prefix,
     };
     use std::future::{Future, poll_fn};
     use std::task::Poll;
@@ -345,12 +419,7 @@ mod test {
     const TINY_WINDOW: u32 = 40;
 
     fn request() -> SubscribeBookRequest {
-        SubscribeBookRequest {
-            pairs: vec![Pair {
-                venue: "binance_spot".to_owned(),
-                symbol: "BTCUSDT".to_owned(),
-            }],
-        }
+        SubscribeBookRequest { instrument_idx: 7 }
     }
 
     /// One gRPC length-prefixed message, the way the encoder produces one.
@@ -407,10 +476,23 @@ mod test {
         ask(
             send_request,
             Method::POST,
-            SERVICE_PATH,
+            SUBSCRIBE_PATH,
             "application/grpc+proto",
             framed(&request()),
         )
+    }
+
+    /// The subscribe half of a handshake's answer, for a test that expects one.
+    fn subscribed(
+        handshaken: Result<
+            super::Route<super::H2Client<MockStream>>,
+            HandshakeError<super::H2Client<MockStream>>,
+        >,
+    ) -> (SubscribeBookRequest, super::H2Client<MockStream>) {
+        match handshaken.expect("the request is well formed") {
+            super::Route::Subscribe(request, client) => (request, client),
+            super::Route::Catalogue(_) => panic!("this request named the streaming method"),
+        }
     }
 
     /// Runs the server's handshake on `server` while `work` drives the client half.
@@ -422,7 +504,7 @@ mod test {
         work: impl Future<Output = T>,
     ) -> (
         Result<
-            (SubscribeBookRequest, super::H2Client<MockStream>),
+            super::Route<super::H2Client<MockStream>>,
             HandshakeError<super::H2Client<MockStream>>,
         >,
         T,
@@ -472,7 +554,7 @@ mod test {
         }))
         .await;
 
-        let (asked, client) = handshaken.expect("the request is well formed");
+        let (asked, client) = subscribed(handshaken);
         assert_eq!(asked, request(), "the request survives the wire intact");
 
         let mut sink = client.accept();
@@ -494,6 +576,58 @@ mod test {
         );
     }
 
+    /// The unary half of this service: one message, then `grpc-status: 0` trailers, on a
+    /// connection nothing but `respond_unary` will ever drive.
+    // The request future is deliberately *not* awaited inside the block: the response only
+    // arrives once the server side is being driven, which is what happens after this
+    // returns.
+    #[expect(
+        clippy::async_yields_async,
+        reason = "the response future is handed back unawaited on purpose - see above"
+    )]
+    #[tokio::test]
+    async fn a_catalogue_call_is_answered_with_one_message_and_an_ok_status() {
+        let (io, server) = mock_pair();
+        let (handshaken, response) = deadline(handshaking(server, async {
+            let mut send_request = client_on(io, 65_535).await;
+            ask(
+                &mut send_request,
+                Method::POST,
+                CATALOGUE_PATH,
+                "application/grpc+proto",
+                framed(&md_proto::md::v1::CatalogueRequest {}),
+            )
+        }))
+        .await;
+
+        let client = match handshaken.expect("the request is well formed") {
+            super::Route::Catalogue(client) => client,
+            super::Route::Subscribe(..) => panic!("this request named the unary method"),
+        };
+
+        let body = Bytes::from_static(b"\x00\x00\x00\x00\x03abc");
+        let (answered, ()) = tokio::join!(deadline(response), client.respond_unary(body.clone()));
+        let mut answer = answered.expect("the response headers arrive").into_body();
+
+        assert_eq!(
+            deadline(answer.data())
+                .await
+                .expect("a message arrives")
+                .expect("the stream is healthy"),
+            body,
+            "the caller is given the buffer it was answered with, byte for byte"
+        );
+        let trailers = deadline(answer.trailers())
+            .await
+            .expect("the trailers arrive")
+            .expect("a unary call ends with a status");
+        assert_eq!(
+            trailers.get("grpc-status").and_then(|v| v.to_str().ok()),
+            Some("0"),
+            "a successful unary call ends OK, not merely by closing"
+        );
+    }
+
     /// A peer speaking HTTP/2 to the wrong method, or not speaking gRPC at all, is turned away
     /// before it gets to send a body.
     // The request future is deliberately *not* awaited inside the block: the response only
@@ -507,8 +641,9 @@ mod test {
     async fn a_request_this_service_does_not_serve_is_refused() {
         for (method, path, content_type) in [
             (Method::POST, "/md.v1.MarketData/NoSuchMethod", "application/grpc"),
-            (Method::GET, SERVICE_PATH, "application/grpc"),
-            (Method::POST, SERVICE_PATH, "text/plain"),
+            (Method::GET, SUBSCRIBE_PATH, "application/grpc"),
+            (Method::POST, SUBSCRIBE_PATH, "text/plain"),
+            (Method::GET, CATALOGUE_PATH, "application/grpc"),
         ] {
             let (io, server) = mock_pair();
             let (handshaken, response) = deadline(handshaking(server, async {
@@ -565,7 +700,7 @@ mod test {
             ask(
                 &mut send_request,
                 Method::POST,
-                SERVICE_PATH,
+                SUBSCRIBE_PATH,
                 "application/grpc",
                 body.freeze(),
             )
@@ -623,7 +758,7 @@ mod test {
         }))
         .await;
 
-        let (_, client) = handshaken.expect("the request is well formed");
+        let (_, client) = subscribed(handshaken);
         let mut sink = client.accept();
 
         // Fills the window exactly, so the next offer has nowhere to go.
@@ -703,7 +838,7 @@ mod test {
         }))
         .await;
 
-        let (_, client) = handshaken.expect("the request is well formed");
+        let (_, client) = subscribed(handshaken);
         let mut sink = client.accept();
         let mut body = while_driving(&mut sink, deadline(response))
             .await

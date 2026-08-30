@@ -4,12 +4,12 @@
 //! The obvious way to produce an `md.v1.BookUpdate` is to fill a [`BookUpdate`] and
 //! call `encode_to_vec`. That costs a malloc/free pair per book, two traversals (one for
 //! `encoded_len`, one for the encode), a copy of every level out of the reader's slot into
-//! the scratch, and a re-encode of the `venue` string on every level, which never changes for
+//! the scratch, and a re-encode of the level's venue on every level, which never changes for
 //! the life of a broadcaster.
 //!
 //! None of that is necessary, because the message is completely deterministic. Every field
 //! tag is `<= 15`, so every key is a single byte; a book carries at most [`MAX_DEPTH`] levels
-//! a side; and this broadcaster's venue never changes, so its encoded `Level.venue` suffix can
+//! a side; and this broadcaster's venue never changes, so its encoded `Level.venue_idx` suffix can
 //! be built once and appended after each level's two doubles. So the encoder holds that suffix
 //! once and appends the levels straight out of the reader's slot into storage it already owns.
 //!
@@ -34,9 +34,9 @@
 //! [`BookUpdate`]: md_proto::md::v1::BookUpdate
 //! [`PositiveF64`]: core_lib::positive_f64::PositiveF64
 
-use bytes::{BufMut as _, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use core_lib::incremental_book::Level;
-use md_wire::grpc::{MESSAGE_PREFIX, put_message_prefix};
+use md_wire::grpc::{MESSAGE_PREFIX, VenueIdx, put_message_prefix};
 
 /// Levels a side, matching `SmallBook`'s depth. Bounds the size of the reusable buffer, and
 /// checked against in [`BookEncoder::encode`] - that bound is what the `expect` there relies
@@ -53,7 +53,7 @@ const SPREAD_KEY: u8 = 0x19;
 const PRICE_KEY: u8 = 0x09;
 /// `Level.size`, field 2, wire type 1 (64-bit): `(2 << 3) | 1`.
 const SIZE_KEY: u8 = 0x11;
-/// `Level.venue`, field 3, wire type 2.
+/// `Level.venue_idx`, field 3, wire type 0 (varint).
 const LEVEL_VENUE_FIELD: u32 = 3;
 
 /// `spread`'s key plus its eight little-endian bytes.
@@ -69,9 +69,11 @@ pub(crate) trait BufferProvider {
 /// cannot be shared between venues.
 #[derive(Debug)]
 pub(crate) struct BookEncoder {
-    /// The encoded `Level.venue` field - key, length varint, bytes - appended after every
-    /// level's price and size. The same suffix for every level this broadcaster ever sends,
-    /// since a book carries one venue today.
+    /// The encoded `Level.venue_idx` field - key, then the index as a varint - appended after
+    /// every level's price and size. The same suffix for every level this broadcaster ever
+    /// sends, since a book carries one venue today, and *empty* for venue index zero: proto3
+    /// elides a scalar equal to its default, so writing anything there would stop these bytes
+    /// being prost's.
     venue_suffix: Box<[u8]>,
     /// The largest a level's body (`price` + `size` + `venue_suffix`) can be. Bounds the
     /// one-byte length varint every level's key is followed by - see the `debug_assert!` in
@@ -80,21 +82,21 @@ pub(crate) struct BookEncoder {
 }
 
 impl BookEncoder {
-    /// `venue` is the identity every level from this broadcaster carries; it comes from its
-    /// [`Instrument`](core_lib::instrument::Instrument), since a book carries no identity
-    /// itself.
-    pub(crate) fn new(venue: &str) -> Self {
+    /// `venue_idx` is the identity every level from this broadcaster carries; it is the
+    /// venue's index in the catalogue, which is the only thing that knows it - a book carries
+    /// no identity itself, and neither does an `Instrument`.
+    pub(crate) fn new(venue_idx: VenueIdx) -> Self {
         // Built with prost rather than by hand: this runs once per broadcaster, so there is
-        // nothing to win by open-coding it, and borrowing prost's own varint keeps the
-        // length prefix of a long venue name correct by construction.
+        // nothing to win by open-coding it, and borrowing prost's own varint keeps a large
+        // index correct by construction - including the elided zero.
         let mut venue_suffix = Vec::new();
-        put_string(&mut venue_suffix, LEVEL_VENUE_FIELD, venue);
+        put_uint32(&mut venue_suffix, LEVEL_VENUE_FIELD, venue_idx.get());
 
         let level_body_max = 18 + venue_suffix.len();
         debug_assert!(
             level_body_max < 0x80,
-            "a level's body must stay a one-byte length varint - Venue::as_str is a closed \
-             set of short names, so this holds for every venue this server carries"
+            "a level's body must stay a one-byte length varint - a venue index is at most a \
+             five-byte varint, so this holds for every catalogue this server can load"
         );
 
         Self {
@@ -196,11 +198,31 @@ impl BookEncoder {
 
 /// Appends one `string` field, skipping it entirely when empty - which is what prost's
 /// generated code does for a proto3 scalar holding its default.
-fn put_string(out: &mut Vec<u8>, field: u32, value: &str) {
+pub(crate) fn put_string(out: &mut Vec<u8>, field: u32, value: &str) {
     if value.is_empty() {
         return;
     }
     prost::encoding::string::encode(field, &value.to_owned(), out);
+}
+
+/// Appends one `uint32` field, skipping it entirely when zero - the same proto3 default
+/// elision [`put_string`] applies to an empty string.
+pub(crate) fn put_uint32(out: &mut Vec<u8>, field: u32, value: u32) {
+    if value == 0 {
+        return;
+    }
+    prost::encoding::uint32::encode(field, &value, out);
+}
+
+/// Appends one length-delimited submessage field, whose body is already encoded.
+///
+/// Unlike the scalars above, a repeated message entry is written even when its body is empty:
+/// proto3's default elision is about scalars, and an empty entry in a `repeated` field is a
+/// present entry.
+pub(crate) fn put_message(out: &mut impl BufMut, field: u32, body: &[u8]) {
+    prost::encoding::encode_key(field, prost::encoding::WireType::LengthDelimited, out);
+    prost::encoding::encode_varint(body.len() as u64, out);
+    out.put_slice(body);
 }
 
 #[cfg(test)]
@@ -210,7 +232,7 @@ mod test {
     use core_lib::incremental_book::Level;
     use core_lib::positive_f64::PositiveF64;
     use md_proto::md::v1 as proto;
-    use md_wire::grpc::{MESSAGE_PREFIX, message_len};
+    use md_wire::grpc::{MESSAGE_PREFIX, VenueIdx, message_len};
     use prost::Message as _;
 
     struct TestBufferProvider;
@@ -228,13 +250,13 @@ mod test {
         )
     }
 
-    fn as_proto(levels: &[Level], venue: &str) -> Vec<proto::Level> {
+    fn as_proto(levels: &[Level], venue_idx: u32) -> Vec<proto::Level> {
         levels
             .iter()
             .map(|l| proto::Level {
                 price: l.price().get(),
                 size: l.size().get(),
-                venue: venue.to_owned(),
+                venue_idx,
             })
             .collect()
     }
@@ -252,47 +274,40 @@ mod test {
         let deep: Vec<Level> = (1..=10)
             .map(|i| level(f64::from(i) * 1.5, f64::from(i) / 8.0))
             .collect();
-        let cases: Vec<(&str, Vec<Level>, Vec<Level>)> = vec![
+        // Venue index zero is the elision case - proto3 writes nothing for a scalar equal to
+        // its default - and 300 is the one that needs a two-byte varint, which a venue name
+        // never did.
+        let cases: Vec<(u32, Vec<Level>, Vec<Level>)> = vec![
             // The resync signal: both sides empty. NaN spread, always written.
-            ("binance_spot", Vec::new(), Vec::new()),
+            (0, Vec::new(), Vec::new()),
             // One side only: the other side's absence also makes the spread NaN.
-            ("binance_spot", vec![level(100.5, 1.25)], Vec::new()),
-            (
-                "bitstamp",
-                Vec::new(),
-                vec![level(99.5, 2.0), level(99.0, 4.0)],
-            ),
+            (0, vec![level(100.5, 1.25)], Vec::new()),
+            (1, Vec::new(), vec![level(99.5, 2.0), level(99.0, 4.0)]),
             // Full depth both sides: the largest frame.
-            ("bitstamp", deep.clone(), deep),
+            (1, deep.clone(), deep),
+            // An index past one byte of varint, which the length prefix has to account for.
+            (300, vec![level(100.5, 1.25)], vec![level(99.5, 2.0)]),
             // `PositiveF64` permits `+0.0`, so prost's default elision is reachable.
             (
-                "binance_spot",
+                0,
                 vec![level(0.0, 1.0), level(1.0, 0.0), level(0.0, 0.0)],
                 vec![level(f64::MIN_POSITIVE, f64::MAX)],
             ),
             // A locked book: best ask equals best bid, so the spread is 0.0 and prost elides it.
-            (
-                "binance_spot",
-                vec![level(100.0, 1.0)],
-                vec![level(100.0, 1.0)],
-            ),
+            (0, vec![level(100.0, 1.0)], vec![level(100.0, 1.0)]),
             // A crossed book: a negative spread, which is never elided.
-            (
-                "binance_spot",
-                vec![level(99.0, 1.0)],
-                vec![level(100.0, 1.0)],
-            ),
+            (1, vec![level(99.0, 1.0)], vec![level(100.0, 1.0)]),
         ];
 
-        for (venue, asks, bids) in cases {
+        for (venue_idx, asks, bids) in cases {
             let expected = proto::BookUpdate {
-                asks: as_proto(&asks, venue),
-                bids: as_proto(&bids, venue),
+                asks: as_proto(&asks, venue_idx),
+                bids: as_proto(&bids, venue_idx),
                 spread: spread_of(&asks, &bids),
             }
             .encode_to_vec();
 
-            let encoder = BookEncoder::new(venue);
+            let encoder = BookEncoder::new(VenueIdx::new(venue_idx));
             let frame = encoder.encode(&asks, &bids, &mut TestBufferProvider);
 
             let header = frame[..MESSAGE_PREFIX]
@@ -302,12 +317,12 @@ mod test {
                 message_len(&header),
                 Some(frame.len() - MESSAGE_PREFIX),
                 "the gRPC header must be uncompressed and describe the body that follows it \
-                 ({venue})"
+                 (venue idx {venue_idx})"
             );
             assert_eq!(
                 &frame[MESSAGE_PREFIX..],
                 expected.as_slice(),
-                "the hand encoder must produce prost's bytes ({venue})"
+                "the hand encoder must produce prost's bytes (venue idx {venue_idx})"
             );
         }
     }
@@ -316,7 +331,7 @@ mod test {
     /// the same as if it were the first.
     #[test]
     fn a_reused_encoder_keeps_producing_whole_frames() {
-        let encoder = BookEncoder::new("binance_spot");
+        let encoder = BookEncoder::new(VenueIdx::new(0));
         let asks = [level(100.5, 1.25)];
         let bids = [level(99.5, 2.0)];
 

@@ -31,7 +31,11 @@ tokio = { version = "1.53.1", features = [
     "time",
     "net",
     "io-util",
+    "fs",
 ] }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "0.9.8"
+thiserror = "2"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tikv-jemallocator = "0.7.0"

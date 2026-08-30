@@ -10,9 +10,11 @@
 //! accept loop nor anything below it names HTTP/2 - see [`crate::grpc`] for the one place that
 //! does.
 
-use crate::client::{ClientHandshake as _, HandshakeError, Handshaker};
+use crate::client::{ClientHandshake as _, HandshakeError, Handshaker, Route};
 use crate::registry::events::RegistryTx;
 use crate::transport::{self, Listener};
+use bytes::Bytes;
+use md_wire::grpc::CatalogueIdx;
 use std::fmt::Debug;
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -31,10 +33,16 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Reaching the end of this function matters for more than tidiness: each handshake task holds
 /// a `RegistryTx`, and the registry task only stops - and only then hands the connectors back
 /// to [`crate::server::serve`] - once every one of them is gone.
+///
+/// `catalogue` is the encoded `GetCatalogue` response body. It is loaded once, before the
+/// server starts serving, so it is a value this loop holds rather than anything it subscribes
+/// to - and the clone handed to each connection is a refcount bump, the same fan-out
+/// discipline a book gets.
 pub(crate) async fn accept<L: Listener, H: Handshaker<L::Stream>>(
     registry: RegistryTx<H::Client>,
     listener: L,
     handshaker: &'static H,
+    catalogue: Bytes,
     stop: oneshot::Receiver<()>,
 ) {
     let mut in_flight = JoinSet::new();
@@ -51,6 +59,7 @@ pub(crate) async fn accept<L: Listener, H: Handshaker<L::Stream>>(
                     in_flight.spawn(handshake(
                         registry.clone(),
                         handshaker,
+                        catalogue.clone(),
                         sock,
                         peer,
                     ));
@@ -77,20 +86,23 @@ pub(crate) async fn accept<L: Listener, H: Handshaker<L::Stream>>(
     in_flight.shutdown().await;
 }
 
-/// Reads one connection's request and hands it to the broadcaster that will serve it.
+/// Reads one connection's request and answers it - with the catalogue, or by handing the
+/// client to the broadcaster that will serve its instrument.
 ///
-/// The connection leaves this function in one of three ways: attached to a broadcaster,
-/// refused with a reason, or simply dropped because the client never said anything usable.
+/// The connection leaves this function in one of four ways: answered with the catalogue,
+/// attached to a broadcaster, refused with a reason, or simply dropped because the client
+/// never said anything usable.
 async fn handshake<S: Send + 'static, H: Handshaker<S>, P: Debug>(
     registry: RegistryTx<H::Client>,
     handshaker: &H,
+    catalogue: Bytes,
     sock: S,
     peer: P,
 ) {
     let asked = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshaker.handshake(sock)).await;
 
-    let (request, client) = match asked {
-        Ok(Ok(subscription)) => subscription,
+    let route = match asked {
+        Ok(Ok(route)) => route,
         Ok(Err(HandshakeError::Refused(client, rejected))) => {
             tracing::debug!(?peer, %rejected, "refusing a request this server will not serve");
             client.reject(rejected).await;
@@ -106,10 +118,13 @@ async fn handshake<S: Send + 'static, H: Handshaker<S>, P: Debug>(
         }
     };
 
-    let key = match crate::request::key_of(&request) {
-        Ok(key) => key,
-        Err(rejected) => {
-            client.reject(rejected).await;
+    let (request, client) = match route {
+        Route::Subscribe(request, client) => (request, client),
+        // Answered from here rather than through the registry: the catalogue never changes, so
+        // there is nothing to ask the registry task about, and this call cannot queue behind a
+        // subscribe or a teardown.
+        Route::Catalogue(client) => {
+            client.respond_unary(catalogue).await;
             return;
         }
     };
@@ -122,7 +137,10 @@ async fn handshake<S: Send + 'static, H: Handshaker<S>, P: Debug>(
     // having panicked - with this client in hand. There is nothing to answer on, because
     // there is nothing left to answer *with*; it went with the reply, and dropping it is what
     // closes the connection.
-    match registry.subscribe(key, client).await {
+    match registry
+        .subscribe(CatalogueIdx::new(request.instrument_idx), client)
+        .await
+    {
         Ok(Ok(())) => {}
         Ok(Err(refused)) => {
             let (declined, rejected) = refused.into_parts();
@@ -138,9 +156,19 @@ mod test {
     use crate::registry::harness::registry_for;
     use crate::test_util::FakeSource;
     use crate::transport::mock::MockListener;
-    use crate::venue::Venue;
-    use core_lib::venue::test_util::test_instrument_for;
+    use bytes::Bytes;
+    use md_wire::grpc::CatalogueIdx;
     use std::sync::Arc;
+
+    /// The two symbols the catalogue in these tests carries, at indices 0 and 1.
+    const SYMBOLS: [&str; 2] = ["FRAMEDBTCUSDT", "FRAMEDETHUSDT"];
+
+    /// Stands in for the encoded `GetCatalogue` body. What it contains is
+    /// [`crate::catalogue::encode`]'s business; what matters here is that the accept loop
+    /// hands the same buffer to every connection that asks.
+    fn catalogue() -> Bytes {
+        Bytes::from_static(b"catalogue")
+    }
 
     /// The accept path end to end, with no transport under it: a connection is accepted, its
     /// request read, and its client handed to the broadcaster that answers on it.
@@ -150,7 +178,7 @@ mod test {
     #[tokio::test]
     async fn a_connection_is_accepted_handshaken_and_answered() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &SYMBOLS);
         let (listener, connector) = MockListener::new();
         let (handshaker, script) = scripted();
         let (stop_accepting, stopped) = oneshot::channel();
@@ -158,12 +186,12 @@ mod test {
             harness.registry.clone(),
             listener,
             Box::leak(Box::new(handshaker)),
+            catalogue(),
             stopped,
         ));
 
-        for symbol in ["FRAMEDBTCUSDT", "FRAMEDETHUSDT"] {
-            let _ = test_instrument_for(Venue::BinanceSpot, symbol);
-            script.asks_for("binance_spot", symbol);
+        for idx in 0..2 {
+            script.asks_for(CatalogueIdx::new(idx));
             let _connection = connector.connect();
             let peer = script.next_peer().await;
             peer.accepted()
@@ -174,9 +202,44 @@ mod test {
 
         assert_eq!(
             source.subscribed(),
-            vec!["FRAMEDBTCUSDT", "FRAMEDETHUSDT"],
-            "each accepted connection reached the registry, under the wire's own casing - the \
-             contract is case-sensitive now, so nothing normalises it"
+            SYMBOLS.to_vec(),
+            "each accepted connection reached the registry, under the venue's own casing - the \
+             catalogue is what spells a symbol, and nothing normalises it"
+        );
+
+        let _ = stop_accepting.send(());
+        accepting.await.expect("the accept loop does not panic");
+    }
+
+    /// A catalogue call is answered from the buffer the accept loop holds, and never reaches
+    /// the registry - which is why it cannot queue behind a subscribe or a teardown.
+    #[tokio::test]
+    async fn a_catalogue_call_is_answered_without_touching_the_registry() {
+        let source = Arc::new(FakeSource::default());
+        let harness = registry_for(&source, &SYMBOLS);
+        let (listener, connector) = MockListener::new();
+        let (handshaker, script) = scripted();
+        let (stop_accepting, stopped) = oneshot::channel();
+        let accepting = tokio::spawn(super::accept(
+            harness.registry.clone(),
+            listener,
+            Box::leak(Box::new(handshaker)),
+            catalogue(),
+            stopped,
+        ));
+
+        script.asks_for_the_catalogue();
+        let _connection = connector.connect();
+        let peer = script.next_peer().await;
+        peer.accepted().await.expect("a catalogue call is answered");
+        assert_eq!(
+            peer.next_frame().await,
+            catalogue(),
+            "the caller is given the buffer the accept loop holds, not a re-encode"
+        );
+        assert!(
+            source.subscribed().is_empty(),
+            "asking what the server carries must not subscribe anything"
         );
 
         let _ = stop_accepting.send(());
@@ -193,7 +256,7 @@ mod test {
     #[tokio::test]
     async fn stopping_abandons_a_handshake_still_in_flight() {
         let source = Arc::new(FakeSource::default());
-        let harness = registry_for(&source);
+        let harness = registry_for(&source, &["STILLINFLIGHTBTCUSDT"]);
         let (listener, connector) = MockListener::new();
         let (handshaker, script) = scripted();
         let (stop_accepting, stopped) = oneshot::channel();
@@ -201,12 +264,12 @@ mod test {
             harness.registry.clone(),
             listener,
             Box::leak(Box::new(handshaker)),
+            catalogue(),
             stopped,
         ));
 
-        let _ = test_instrument_for(Venue::BinanceSpot, "STILLINFLIGHTBTCUSDT");
         script.says_nothing();
-        script.asks_for("binance_spot", "STILLINFLIGHTBTCUSDT");
+        script.asks_for(CatalogueIdx::new(0));
         let _silent = connector.connect();
         let _talkative = connector.connect();
 
