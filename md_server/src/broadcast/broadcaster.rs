@@ -11,7 +11,7 @@ use super::session::{Session, SessionCtx};
 use crate::broadcast::book_merger::MergedBook;
 use crate::broadcast::queue::BroadcasterRx;
 use crate::client::{ClientHandshake, ClientSink};
-use crate::encode::{BookEncoder, BufferProvider};
+use crate::broadcast::book_encoder::{BookEncoder, BufferProvider};
 use crate::registry::events::{Claim, RegistryTx};
 use bytes::{Bytes, BytesMut};
 use core_lib::connector::book_publisher::BookReader;
@@ -489,7 +489,7 @@ async fn close<K: ClientSink>(sessions: &mut Vec<Session<K>>, session_ctx: &Ctx,
 mod test {
     use super::SESSION_SWEEP;
     use crate::client::mock::{MockClient, MockPeer, connected};
-    use crate::encode::BufferProvider;
+    use crate::broadcast::book_encoder::BufferProvider;
     use crate::registry::harness::{FIRST, Harness, registry_for};
     use crate::test_util::{FakeSource, book};
     use crate::venue::Venue;
@@ -744,7 +744,7 @@ mod test {
         source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[]));
         let frame = client.next_frame().await;
 
-        let encoder = crate::encode::BookEncoder::new(&[VenueIdx::new(0)]);
+        let encoder = crate::broadcast::book_encoder::BookEncoder::new(&[VenueIdx::new(0)]);
         let expected = encoder.encode(&[level(100.5, 1.25)], &[], &mut TestBufferProvider);
         assert_eq!(
             frame, expected,
@@ -888,7 +888,7 @@ mod test {
     /// long this runs.
     #[test]
     fn a_long_run_of_books_cycles_a_fixed_set_of_buffers() {
-        let encoder = crate::encode::BookEncoder::new(&[VenueIdx::new(0)]);
+        let encoder = crate::broadcast::book_encoder::BookEncoder::new(&[VenueIdx::new(0)]);
         let asks = [level(100.5, 1.25)];
         let bids = [level(99.5, 2.0)];
 

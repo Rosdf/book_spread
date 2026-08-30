@@ -2,7 +2,7 @@
 //!
 //! A [`SmallBook`] carries no identity - it is the top of one connector's book and nothing
 //! else - so merging is where a level first learns which venue quoted it. That is the whole
-//! reason [`MergedLevel`] exists beside `core_lib`'s [`Level`]: the wire format stamps a
+//! reason [`MergedLevel`] exists beside `core_lib`'s [`BookLevel`]: the wire format stamps a
 //! venue on every level, and once two venues' books are interleaved the levels on one side no
 //! longer share one.
 //!
@@ -21,26 +21,26 @@ use core_lib::small_book::SmallBook;
 
 /// A level with the venue that quoted it attached.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct MergedLevel {
+pub(super) struct MergedLevel {
     size: PositiveF64,
     price: PositiveF64,
     venue: VenueIdx,
 }
 
 impl MergedLevel {
-    pub(crate) fn new(price: PositiveF64, size: PositiveF64, venue: VenueIdx) -> Self {
+    pub(super) fn new(price: PositiveF64, size: PositiveF64, venue: VenueIdx) -> Self {
         Self { size, price, venue }
     }
 
-    pub(crate) fn size(&self) -> PositiveF64 {
+    pub(super) fn size(&self) -> PositiveF64 {
         self.size
     }
 
-    pub(crate) fn price(&self) -> PositiveF64 {
+    pub(super) fn price(&self) -> PositiveF64 {
         self.price
     }
 
-    pub(crate) fn venue(&self) -> VenueIdx {
+    pub(super) fn venue(&self) -> VenueIdx {
         self.venue
     }
 }

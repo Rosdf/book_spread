@@ -1,6 +1,6 @@
 //! Turns a [`Catalogue`] into the `GetCatalogue` response body, once.
 //!
-//! Hand-encoded like [`crate::encode`]'s books, for one shared reason rather than two: the
+//! Hand-encoded like `broadcast::book_encoder`'s books, for one shared reason rather than two: the
 //! bytes are produced once at startup and handed to every caller as a `Bytes` clone, so
 //! nothing here is on a hot path - what it buys is that the response never needs an
 //! intermediate `CatalogueResponse` to exist, and that the encoding of a `uint32` field lives
@@ -71,7 +71,7 @@ mod test {
     use md_wire::grpc::{MESSAGE_PREFIX, message_len};
     use prost::Message as _;
 
-    /// The same guard [`crate::encode`] has: this is a second implementation of an encoding
+    /// The same guard `broadcast::book_encoder` has: this is a second implementation of an encoding
     /// prost already implements, so the bytes have to be prost's - including the two places
     /// proto3 elides a default, index zero and an empty symbol.
     #[test]
