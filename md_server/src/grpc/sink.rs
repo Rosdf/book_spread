@@ -90,13 +90,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> ClientSink for H2Sink<S
             // Registers the waker that comes back when the peer's WINDOW_UPDATE arrives. The
             // payload is deliberately *not* held: whatever is current when that happens is
             // what gets sent.
-            return match send.poll_capacity(cx) {
+            match send.poll_capacity(cx) {
                 Poll::Ready(None | Some(Err(_))) => {
                     self.end();
-                    Sent::Ended
+                    return Sent::Ended;
                 }
-                Poll::Ready(Some(Ok(_))) | Poll::Pending => Sent::Full,
-            };
+                // Capacity was just assigned - possibly not enough on its own, since a
+                // reservation can be granted in parts. Fall through to the capacity check
+                // below rather than discarding this book on a window that only just opened.
+                Poll::Ready(Some(Ok(_))) => {
+                    if send.capacity() < payload.len() {
+                        return Sent::Full;
+                    }
+                }
+                Poll::Pending => return Sent::Full,
+            }
         }
 
         // The refcount bump, and the only one: every client on this symbol queues the same
