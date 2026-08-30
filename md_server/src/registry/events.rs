@@ -1,4 +1,4 @@
-//! The registry's queue: one event per thing that can happen to the `(venue, symbol)` map,
+//! The registry's queue: one event per thing that can happen to the catalogue-instrument map,
 //! and the two halves of the channel that carries them.
 //!
 //! Deliberately the same shape as `core_lib::connector::events`: an unbounded
@@ -8,37 +8,35 @@
 //! and are still ordered against everything else by the queue.
 
 use crate::registry::Refused;
-use core_lib::instrument::InstrumentId;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tokio::sync::mpsc;
-use core_lib::Venue;
 use md_wire::grpc::CatalogueIdx;
 
-/// One generation of broadcaster for one key.
+/// One generation of broadcaster for one key. Identity and nothing else.
 ///
-/// `pending_joins` is the identity: the registry compares it by pointer to tell the
-/// broadcaster that sent this event from a later one that has since taken the same key over.
-/// It is the same `Arc` the broadcaster counts its unclaimed joins on, so nothing extra is
-/// allocated to name a generation.
+/// The key is a [`CatalogueIdx`] rather than a symbol: a broadcaster serves one catalogue
+/// instrument, which may name a pair on every venue. What those pairs *are* is not carried
+/// here - the registry's own entry for the key holds them, so a claim costs no allocation and
+/// the pairs are named in exactly one place.
+///
+/// `pending_joins` is the rest of the identity: the registry compares it by pointer to tell
+/// the broadcaster that sent this event from a later one that has since taken the same key
+/// over. It is the same `Arc` the broadcaster counts its unclaimed joins on, so nothing extra
+/// is allocated to name a generation.
 #[derive(Debug)]
 pub(crate) struct Claim {
-    instrument_id: InstrumentId,
-    venue: Venue,
+    idx: CatalogueIdx,
     pending_joins: Arc<AtomicUsize>,
 }
 
 impl Claim {
-    pub(crate) fn new(instrument_id: InstrumentId, venue: Venue, pending_joins: Arc<AtomicUsize>) -> Self {
-        Self { instrument_id, venue, pending_joins }
+    pub(crate) fn new(idx: CatalogueIdx, pending_joins: Arc<AtomicUsize>) -> Self {
+        Self { idx, pending_joins }
     }
 
-    pub(crate) fn instrument_id(&self) -> InstrumentId {
-        self.instrument_id
-    }
-
-    pub(crate) fn venue(&self) -> Venue {
-        self.venue
+    pub(crate) fn idx(&self) -> CatalogueIdx {
+        self.idx
     }
 
     pub(crate) fn pending_joins(&self) -> &Arc<AtomicUsize> {
@@ -98,19 +96,20 @@ pub(super) enum RegistryEvent<C> {
     RetireIfIdle(RetireIfIdle),
     /// A broadcaster stopping for a reason other than an idle session list. Fire-and-forget:
     /// the sender has nothing left to decide, and the queue is what orders the connector
-    /// unsubscribe this issues ahead of any later subscribe for the same key.
+    /// unsubscribes this issues ahead of any later subscribe for the same key.
+    ///
+    /// It releases every pair of the key's entry, which is what lets one event serve both the
+    /// ordinary teardown and a subscribe that failed part-way - see `Registry::unsubscribe`
+    /// for why releasing a pair that never subscribed is a no-op.
     Retire(Claim),
-    /// The same, for a broadcaster whose subscribe the connector rejected - so, without the
-    /// unsubscribe. See `Registry::abandon_entry`.
-    Abandon(Claim),
     /// Stop taking new keys and end every running broadcaster. Fire-and-forget: the task
     /// stopping is not the acknowledgement, the queue draining is - see
     /// [`RegistryHandle::shutdown`](super::RegistryHandle::shutdown).
     ShutDown,
     #[cfg(test)]
-    IsRegistered(InstrumentId, oneshot::Sender<bool>),
+    IsRegistered(CatalogueIdx, oneshot::Sender<bool>),
     #[cfg(test)]
-    EntryToken(InstrumentId, oneshot::Sender<Option<Arc<AtomicUsize>>>),
+    EntryToken(CatalogueIdx, oneshot::Sender<Option<Arc<AtomicUsize>>>),
 }
 
 /// The receiving half, owned by the registry task.
@@ -181,10 +180,6 @@ impl<C> RegistryTx<C> {
         self.send(RegistryEvent::Retire(claim));
     }
 
-    pub(crate) fn abandon(&self, claim: Claim) {
-        self.send(RegistryEvent::Abandon(claim));
-    }
-
     pub(crate) fn shut_down(&self) {
         self.send(RegistryEvent::ShutDown);
     }
@@ -198,7 +193,7 @@ impl<C> RegistryTx<C> {
     }
 
     #[cfg(test)]
-    pub(crate) fn is_registered(&self, key: InstrumentId) -> oneshot::Receiver<bool> {
+    pub(crate) fn is_registered(&self, key: CatalogueIdx) -> oneshot::Receiver<bool> {
         let (reply, rx) = oneshot::channel();
         self.send(RegistryEvent::IsRegistered(key, reply));
         rx
@@ -207,7 +202,7 @@ impl<C> RegistryTx<C> {
     #[cfg(test)]
     pub(super) fn entry_token(
         &self,
-        key: InstrumentId,
+        key: CatalogueIdx,
     ) -> oneshot::Receiver<Option<Arc<AtomicUsize>>> {
         let (reply, rx) = oneshot::channel();
         self.send(RegistryEvent::EntryToken(key, reply));

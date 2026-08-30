@@ -84,6 +84,10 @@ impl Catalogue {
     /// The venue table is every [`Venue`] this build carries, at its position in
     /// [`Venue::ALL`], so a test and the server agree on which index means which venue
     /// without either spelling it out.
+    ///
+    /// Nothing here is validated - the caller owes it the two rules [`TryFrom<RawCatalogue>`]
+    /// enforces: one venue at most once per instrument, and one `(venue, symbol)` pair across
+    /// the whole catalogue.
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn for_test(instruments: &[(u32, &[(Venue, &str)])]) -> Self {
         let mut venues = VenueTable::new();
@@ -174,6 +178,32 @@ pub(crate) enum BuildCatalogueError {
     TooManyVenues,
     #[error("instrument idx {} is used by two instruments", .0.get())]
     DuplicateInstrumentIdx(CatalogueIdx),
+    /// One broadcaster serves one instrument's whole pair list, holding one book reader per
+    /// venue in it. Two pairs on one venue would want two readers on the same connector,
+    /// which is a contradiction rather than a deeper book.
+    #[error("instrument idx {} names venue {} twice", .idx.get(), .venue.as_str())]
+    DuplicateVenueInInstrument { idx: CatalogueIdx, venue: Venue },
+    /// A symbol has exactly one book reader: the connector hard-errors a second subscribe for
+    /// one it already carries, and `BookReader` is not `Clone`. Two instruments naming the
+    /// same pair would each try to open it.
+    #[error(transparent)]
+    DuplicatePair(Box<DuplicatePair>),
+}
+
+/// The payload of [`BuildCatalogueError::DuplicatePair`], boxed because spelling a pair out
+/// takes several times what the other variants carry and a startup error is never hot.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{}/{symbol} is named by instruments {} and {}",
+    .venue.as_str(),
+    .first.get(),
+    .second.get()
+)]
+pub(crate) struct DuplicatePair {
+    venue: Venue,
+    symbol: SharedString,
+    first: CatalogueIdx,
+    second: CatalogueIdx,
 }
 
 impl TryFrom<RawCatalogue> for Catalogue {
@@ -205,9 +235,13 @@ impl TryFrom<RawCatalogue> for Catalogue {
         }
 
         let mut instruments = new_internal_map();
+        // Every pair carried so far, so a symbol named by two instruments is caught here
+        // rather than as a connector refusal on the first client to ask for the second one.
+        // A `Vec` scanned linearly: a catalogue is tens of entries read once at startup.
+        let mut claimed: Vec<(Venue, SharedString, CatalogueIdx)> = Vec::new();
         for entry in raw.instruments {
             let idx = CatalogueIdx::new(entry.idx);
-            let mut pairs = Vec::with_capacity(entry.pairs.len());
+            let mut pairs: Vec<CataloguePair> = Vec::with_capacity(entry.pairs.len());
             let mut carried = true;
             for pair in entry.pairs {
                 let venue_idx = VenueIdx::new(pair.venue);
@@ -221,6 +255,21 @@ impl TryFrom<RawCatalogue> for Catalogue {
                     carried = false;
                     break;
                 };
+                if pairs.iter().any(|carried_pair| carried_pair.venue == venue) {
+                    return Err(BuildCatalogueError::DuplicateVenueInInstrument { idx, venue });
+                }
+                if let Some((_, _, first)) = claimed
+                    .iter()
+                    .find(|(known, symbol, _)| *known == venue && **symbol == *pair.symbol)
+                {
+                    return Err(BuildCatalogueError::DuplicatePair(Box::new(DuplicatePair {
+                        venue,
+                        symbol: pair.symbol,
+                        first: *first,
+                        second: idx,
+                    })));
+                }
+                claimed.push((venue, pair.symbol.clone(), idx));
                 pairs.push(CataloguePair {
                     venue,
                     venue_idx,
@@ -263,6 +312,100 @@ mod test {
     fn parse(toml: &str) -> Result<Catalogue, BuildCatalogueError> {
         let raw: RawCatalogue = toml::from_str(toml).expect("the fixture is well-formed TOML");
         Catalogue::try_from(raw)
+    }
+
+
+    /// One broadcaster holds one book reader per venue in its instrument, so a venue named
+    /// twice under one instrument is a contradiction rather than a deeper book.
+    #[test]
+    fn a_venue_named_twice_under_one_instrument_is_refused() {
+        let err = parse(
+            r#"
+            [[venues]]
+            idx = 0
+            name = "binance_spot"
+
+            [[instruments]]
+            idx = 1
+            pairs = [{ venue = 0, symbol = "BTCUSDT" }, { venue = 0, symbol = "ETHUSDT" }]
+            "#,
+        )
+        .expect_err("one instrument cannot be quoted twice on one venue");
+
+        assert!(
+            matches!(
+                err,
+                BuildCatalogueError::DuplicateVenueInInstrument {
+                    idx,
+                    venue: Venue::BinanceSpot
+                } if idx == CatalogueIdx::new(1)
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// A symbol has exactly one book reader - the connector hard-errors a second subscribe -
+    /// so two instruments cannot both name it.
+    #[test]
+    fn one_pair_named_by_two_instruments_is_refused() {
+        let err = parse(
+            r#"
+            [[venues]]
+            idx = 0
+            name = "binance_spot"
+            [[venues]]
+            idx = 1
+            name = "bitstamp"
+
+            [[instruments]]
+            idx = 1
+            pairs = [{ venue = 0, symbol = "BTCUSDT" }]
+
+            [[instruments]]
+            idx = 2
+            pairs = [{ venue = 1, symbol = "btcusd" }, { venue = 0, symbol = "BTCUSDT" }]
+            "#,
+        )
+        .expect_err("two instruments cannot both carry binance_spot/BTCUSDT");
+
+        assert!(
+            matches!(err, BuildCatalogueError::DuplicatePair(_)),
+            "got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "binance_spot/BTCUSDT is named by instruments 1 and 2"
+        );
+    }
+
+    /// The same spelling on two *different* venues is not a duplicate: that is the ordinary
+    /// shape of an instrument quoted in two places.
+    #[test]
+    fn one_spelling_shared_by_two_venues_is_carried() {
+        let catalogue = parse(
+            r#"
+            [[venues]]
+            idx = 0
+            name = "binance_spot"
+            [[venues]]
+            idx = 1
+            name = "bitstamp"
+
+            [[instruments]]
+            idx = 0
+            pairs = [{ venue = 0, symbol = "BTCUSD" }, { venue = 1, symbol = "BTCUSD" }]
+            "#,
+        )
+        .expect("a symbol is only claimed per venue");
+
+        assert_eq!(
+            catalogue
+                .instruments()
+                .get(&CatalogueIdx::new(0))
+                .expect("the entry is carried")
+                .len(),
+            2
+        );
     }
 
     /// The ordinary shape: a venue table and instruments filed under the file's own indices,

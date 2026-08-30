@@ -1,30 +1,31 @@
 //! A book-feed front end for the venue connectors.
 //!
-//! One broadcaster per `(venue, symbol)` owns that symbol's single
-//! [`BookReader`](core_lib::connector::book_publisher::BookReader), encodes each book it
-//! publishes exactly once, and hands the resulting bytes to every attached client.
-//! A client joining a symbol that is already streaming is added to the running broadcaster;
-//! it never causes an encode of its own.
+//! One broadcaster per catalogue instrument owns one
+//! [`BookReader`](core_lib::connector::book_publisher::BookReader) per venue quoting it,
+//! merges their books into one, encodes that exactly once, and hands the resulting bytes to
+//! every attached client. A client joining an instrument that is already streaming is added
+//! to the running broadcaster; it never causes an encode of its own.
 //!
 //! The broadcaster owning the clients is the point. The transport is gRPC, and a gRPC server
 //! normally gives each connection a task to drive it; this one does not. A broadcaster owns
 //! each client's whole HTTP/2 connection and drives it from its own `select!`, so a book
 //! crosses no channel and no task boundary between the encoder and the wire, and the same
 //! `Bytes` is handed to every client with no per-client copy. The price is that the writes for
-//! one symbol are serialised on one task; the syscall count is unchanged, only their
-//! parallelism. If a symbol ever outgrows that, shard it across a second broadcaster rather
-//! than reintroducing a hop.
+//! one instrument are serialised on one task; the syscall count is unchanged, only their
+//! parallelism. If an instrument ever outgrows that, shard it across a second broadcaster
+//! rather than reintroducing a hop.
 //!
 //! [`crate::client`] is what keeps that arrangement honest: everything above it works against
 //! three traits, and [`crate::grpc`] is the only module that knows the wire is HTTP/2.
 //!
-//! The single reader is not a choice. `BookReader` is one half of a loom-verified
+//! One reader per symbol is not a choice. `BookReader` is one half of a loom-verified
 //! `shared_buffer` + `atomic_waker` pair built for exactly one consumer, so it is neither
-//! `Clone` nor shareable, and there is exactly one per symbol. Everything here is a layer on
-//! top of that one reader.
+//! `Clone` nor shareable. What keeps a symbol from being read twice once broadcasters are
+//! filed by instrument rather than by symbol is [`crate::catalogue`], which refuses to load a
+//! file naming one `(venue, symbol)` under two instruments.
 //!
-//! Symbols are subscribed on demand: the first client for a symbol subscribes it on its
-//! venue's connector, and the last client to leave unsubscribes it again.
+//! Symbols are subscribed on demand: the first client for an instrument subscribes every one
+//! of its pairs on that pair's connector, and the last client to leave releases them all.
 //!
 //! What a client may ask for at all is [`crate::catalogue`]: a file read once at startup,
 //! which is where the instrument and venue indices a request travels as come from.

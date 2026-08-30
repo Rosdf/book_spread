@@ -1,5 +1,5 @@
-//! The fan-out itself: one task per `(venue, symbol)` that reads, encodes once, and offers the
-//! resulting bytes to every attached client.
+//! The fan-out itself: one task per catalogue instrument that reads every venue quoting it,
+//! merges and encodes once, and offers the resulting bytes to every attached client.
 //!
 //! The broadcaster owns those clients outright - their whole HTTP/2 connections, not just a
 //! handle onto them. There is no per-client task and no channel between the encoder and the
@@ -14,11 +14,14 @@ use crate::client::{ClientHandshake, ClientSink};
 use crate::broadcast::book_encoder::{BookEncoder, BufferProvider};
 use crate::registry::events::{Claim, RegistryTx};
 use bytes::{Bytes, BytesMut};
+use core_lib::Venue;
+use core_lib::atomic_waker::Waiter;
 use core_lib::connector::book_publisher::BookReader;
-use core_lib::instrument::Instrument;
+use core_lib::shared_buffer::{Reader, ReaderGuard};
 use core_lib::small_book::SmallBook;
-use md_wire::grpc::{RejectCode, Rejected, VenueIdx};
+use md_wire::grpc::{CatalogueIdx, RejectCode, Rejected, VenueIdx};
 use std::future::poll_fn;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
@@ -191,26 +194,66 @@ impl<C: ClientHandshake> Join<C> {
 /// What woke the run loop.
 ///
 /// The `select!` resolves to one of these rather than doing the work inline: its branch
-/// futures still borrow `self` inside a handler body, and both `wait_update` and `get_last`
-/// need `&mut self.reader`.
+/// futures still borrow `self` inside a handler body, and both waiting and reading need
+/// `&mut self.readers`.
 #[derive(Debug)]
 enum Wake<C> {
-    Book(Option<()>),
+    /// At least one venue published, or reported its publisher gone. The flag is the former:
+    /// a departure on its own changes nothing to send, because the publisher's parting empty
+    /// book was reported as an update just before it.
+    Book { published: bool },
     Join(Option<Join<C>>),
     /// At least one session finished - the peer hung up, or a write failed.
     Ended,
     Sweep,
 }
 
-/// Owns one symbol's [`BookReader`] and every client attached to it.
+/// One venue's half of a merged book.
+///
+/// The two halves of a [`BookReader`], kept apart on purpose: see [`updates`](Self::updates).
+#[derive(Debug)]
+pub(crate) struct VenueReader {
+    /// The catalogue index stamped on every level from this venue. The whole of what a
+    /// broadcaster needs to know about which venue this is - the symbol behind it matters
+    /// only to the registry, which is what subscribed it and what will release it.
+    venue_idx: VenueIdx,
+    books: Reader<SmallBook>,
+    /// Taken once this venue's publisher is gone.
+    ///
+    /// `None` is both "stop polling this venue" and "its share of the notification state is
+    /// released", which is why it is an `Option` rather than a flag beside a live `Waiter`:
+    /// a departed publisher makes `wait` resolve to `None` immediately and on *every* call,
+    /// so a `select!` branch that kept polling it would spin instead of parking.
+    updates: Option<Waiter>,
+}
+
+impl VenueReader {
+    pub(crate) fn new(venue_idx: VenueIdx, reader: BookReader) -> Self {
+        let (books, waiter) = reader.split();
+        Self {
+            venue_idx,
+            books,
+            updates: Some(waiter),
+        }
+    }
+}
+
+/// One reader per venue quoting an instrument.
+///
+/// Bounded at compile time for the same reason the catalogue's venue table is: an instrument
+/// names each venue at most once, which the catalogue loader enforces, so this is a bound
+/// rather than something to truncate against.
+pub(crate) type VenueReaders = heapless::Vec<VenueReader, { Venue::COUNT }>;
+
+/// Owns one catalogue instrument's readers - one per venue quoting it - and every client
+/// attached to it.
 #[derive(Debug)]
 pub(crate) struct Broadcaster<C: ClientHandshake> {
-    instrument: Instrument,
-    /// The catalogue's index for this symbol's venue, stamped on every level this broadcaster
-    /// sends. Kept rather than consumed by the encoder, because it is also what names the
-    /// venue's book to the merge.
-    venue_idx: VenueIdx,
-    reader: BookReader,
+    /// What the registry files this broadcaster under, and what a client named to reach it.
+    idx: CatalogueIdx,
+    /// One per pair of the catalogue entry, in the catalogue's own order - which is also the
+    /// order the merge breaks ties in.
+    readers: VenueReaders,
     /// One entry per attached client, offered the book in order on every update.
     sessions: Vec<Session<C::Sink>>,
     joins: BroadcasterRx<C>,
@@ -240,28 +283,25 @@ impl<C: ClientHandshake> Broadcaster<C> {
     /// last of them is dropped, which is on the way out of this function.
     pub(crate) async fn start(
         registry: RegistryTx<C>,
-        instrument: Instrument,
-        venue_idx: VenueIdx,
+        idx: CatalogueIdx,
+        mut readers: VenueReaders,
         joins: BroadcasterRx<C>,
         pending_joins: Arc<AtomicUsize>,
-        mut reader: BookReader,
     ) {
         let mut pool = BufferPool::new();
-        // The venue index comes from the registry rather than from `instrument`: it is the
-        // catalogue's numbering, and an `Instrument` knows only which `Venue` it belongs to.
-        let encoder = BookEncoder::new(&[venue_idx]);
+        // The venue indices come from the registry rather than from the instruments: they are
+        // the catalogue's numbering, and an `Instrument` knows only which `Venue` it is on.
+        let venue_ids: heapless::Vec<VenueIdx, { Venue::COUNT }> =
+            readers.iter().map(|reader| reader.venue_idx).collect();
+        let encoder = BookEncoder::new(&venue_ids);
         let mut merged = MergedBook::new();
-        let latest = {
-            let book = reader.get_last();
-            encode_book(&encoder, &mut merged, venue_idx, &book, &mut pool)
-        };
+        let latest = encode_book(&encoder, &mut merged, &mut readers, &mut pool);
 
         Self {
             encoder,
             merged,
-            instrument,
-            venue_idx,
-            reader,
+            idx,
+            readers,
             sessions: Vec::new(),
             joins,
             pending_joins,
@@ -279,9 +319,10 @@ impl<C: ClientHandshake> Broadcaster<C> {
             // Named up front so the `select!` below borrows one field rather than all of
             // `self`, which the reader and joins branches need for themselves.
             let sessions = &mut self.sessions;
+            let readers = &mut self.readers;
             let wake = tokio::select! {
                 biased;
-                update = self.reader.wait_update() => Wake::Book(update),
+                published = poll_fn(|cx| poll_readers(readers, cx)) => Wake::Book { published },
                 join = self.joins.recv() => Wake::Join(join),
                 () = poll_fn(|cx| poll_sessions(sessions, cx, &self.ctx)) => Wake::Ended,
                 _ = sweep.tick() => Wake::Sweep,
@@ -290,14 +331,27 @@ impl<C: ClientHandshake> Broadcaster<C> {
             // Only the two things that can end a session ask for a prune, so a book that
             // reached every client costs no scan of the session list at all.
             let prune = match wake {
-                // The publisher is gone: the connector shut down, or the venue stopped
-                // listing the symbol and the supervisor retired it. `Join(None)` is the
-                // registry having dropped this key's entry, which is how a shutting-down
-                // server ends every broadcaster. Terminal either way - the entry is removed
-                // on the way out, so the next client for this key gets a fresh broadcaster
-                // that retries the subscribe.
-                Wake::Book(None) | Wake::Join(None) => break,
-                Wake::Book(Some(())) => poll_fn(|cx| Poll::Ready(self.publish(cx))).await,
+                // `Join(None)` is the registry having dropped this key's entry, which is how
+                // a shutting-down server ends every broadcaster. Terminal - the entry is
+                // removed on the way out, so the next client for this key gets a fresh
+                // broadcaster that retries the subscribes.
+                Wake::Join(None) => break,
+                Wake::Book { published } => {
+                    let prune = if published {
+                        poll_fn(|cx| Poll::Ready(self.publish(cx))).await
+                    } else {
+                        false
+                    };
+                    // Every publisher is gone: the connectors shut down, or the venues
+                    // stopped listing their symbols and the supervisors retired them. One
+                    // venue going quiet is not this - it simply drops out of the merge - so
+                    // the stream ends only once there is nothing left to merge at all. The
+                    // book just published is the last, and it is empty.
+                    if self.readers.iter().all(|reader| reader.updates.is_none()) {
+                        break;
+                    }
+                    prune
+                }
                 Wake::Ended => true,
                 Wake::Join(Some(join)) => {
                     with_context(|cx| self.attach(join, cx)).await;
@@ -337,20 +391,12 @@ impl<C: ClientHandshake> Broadcaster<C> {
     /// Returns whether any session ended on the way, so the caller prunes only when there is
     /// something to prune.
     fn publish(&mut self, cx: &mut Context<'_>) -> bool {
-        let frame = {
-            let book = self.reader.get_last();
-            // Encoded out of the slot through the merge, which copies the levels it keeps -
-            // there is no intermediate `BookUpdate`. The guard pins a slot in the shared
-            // buffer, so it is dropped at the end of this block, before anything is offered
-            // to a client, and must never be held across an await.
-            encode_book(
-                &self.encoder,
-                &mut self.merged,
-                self.venue_idx,
-                &book,
-                &mut self.ctx.pool,
-            )
-        };
+        let frame = encode_book(
+            &self.encoder,
+            &mut self.merged,
+            &mut self.readers,
+            &mut self.ctx.pool,
+        );
 
         self.ctx.new_framed(frame);
 
@@ -389,33 +435,90 @@ impl<C: ClientHandshake> Broadcaster<C> {
         }
     }
 
-    /// Names this broadcaster to the registry. `Instrument` is `Copy`, so this costs nothing.
+    /// Names this broadcaster to the registry. Identity only: which pairs to release is the
+    /// registry's own record, not this task's - which is also why a venue whose publisher
+    /// went away needs no mention here. That is not an unsubscribe, and the registry is the
+    /// only place allowed to issue one.
     fn claim(&self) -> Claim {
-        Claim::new(
-            self.instrument.id(),
-            self.instrument.venue(),
-            Arc::clone(&self.pending_joins),
-        )
+        Claim::new(self.idx, Arc::clone(&self.pending_joins))
     }
 }
 
-/// Merges `book` into `merged` and encodes the result as one whole frame.
+/// Merges every venue's current book into `merged` and encodes the result as one whole frame.
 ///
 /// A free function rather than a method because [`Broadcaster::start`] has these as locals
 /// while [`Broadcaster::publish`] has them as fields - and because taking them apart is what
-/// keeps the `reader` borrow the caller holds disjoint from the scratch and the pool.
+/// keeps the reader borrow disjoint from the scratch and the pool.
 ///
-/// One book in the slice today: a broadcaster owns one reader, so there is nothing to
-/// interleave and [`MergedBook::refill`] takes its single-venue path.
+/// Encoded out of the slots through the merge, which copies the levels it keeps - there is no
+/// intermediate `BookUpdate`. Each guard pins a slot in its venue's shared buffer, so all of
+/// them are dropped at the end of this call, before anything is offered to a client, and none
+/// may ever be held across an await.
 fn encode_book(
     encoder: &BookEncoder,
     merged: &mut MergedBook,
-    venue_idx: VenueIdx,
-    book: &SmallBook,
+    readers: &mut [VenueReader],
     buffers: &mut impl BufferProvider,
 ) -> Bytes {
-    merged.refill(&[(venue_idx, book)]);
+    // Two passes because the guards have to outlive the borrows taken from them: `iter_mut`
+    // is what makes the `&mut` on each reader disjoint.
+    let mut books = heapless::Vec::<(VenueIdx, ReaderGuard<'_, SmallBook>), { Venue::COUNT }>::new();
+    for reader in readers {
+        books
+            .push((reader.venue_idx, reader.books.get()))
+            .map_err(|_| ())
+            .expect("one reader per venue, which the catalogue enforces");
+    }
+    let sides: heapless::Vec<(VenueIdx, &SmallBook), { Venue::COUNT }> = books
+        .iter()
+        .map(|(venue_idx, guard)| (*venue_idx, &**guard))
+        .collect();
+
+    merged.refill(&sides);
     encoder.encode(merged.asks(), merged.bids(), buffers)
+}
+
+/// Polls every venue that is still publishing, and resolves once any of them has moved.
+///
+/// One freshly created `wait` future per reader, polled once: [`Waiter::wait`] is cancel-safe
+/// with its pending flag in the shared state, so dropping the future a poll returns `Pending`
+/// from and building another next time round loses nothing.
+///
+/// A reader whose publisher has gone hands its `Waiter` over to be dropped and is not polled
+/// again - which is required, not tidy: that call resolves to `None` on every attempt, so a
+/// branch kept on it would spin.
+///
+/// The `bool` is whether any venue actually *published*. A departure resolves this too - the
+/// caller has to notice that the last venue has gone, and a `Pending` it never wakes from
+/// would hide that - but it is not on its own something to send: `BookPublisher::drop`
+/// publishes the empty book before releasing the notifier, and the sticky pending flag means
+/// that update is always reported as `Some` on an earlier poll than the `None`. So the
+/// departing venue has already left the merge by the time this says it is gone, and
+/// re-encoding would produce the frame the client just had.
+fn poll_readers(readers: &mut [VenueReader], cx: &mut Context<'_>) -> Poll<bool> {
+    let mut published = false;
+    let mut departed = false;
+
+    for reader in readers {
+        let Some(waiter) = reader.updates.as_mut() else {
+            continue;
+        };
+        let polled = pin!(waiter.wait()).poll(cx);
+        match polled {
+            Poll::Ready(Some(())) => published = true,
+            Poll::Ready(None) => {
+                reader.updates = None;
+                departed = true;
+            }
+            Poll::Pending => {}
+        }
+    }
+
+    if published || departed {
+        Poll::Ready(published)
+    } else {
+        Poll::Pending
+    }
 }
 
 /// Resolves `f` against the current task's [`Context`], for a call site that has one to give
@@ -490,12 +593,10 @@ mod test {
     use super::SESSION_SWEEP;
     use crate::client::mock::{MockClient, MockPeer, connected};
     use crate::broadcast::book_encoder::BufferProvider;
-    use crate::registry::harness::{FIRST, Harness, registry_for};
-    use crate::test_util::{FakeSource, book};
+    use crate::registry::harness::{FIRST, Harness, registry_for, registry_for_pairs};
+    use crate::test_util::{FakeSource, TestCatalogue, book};
     use crate::venue::Venue;
     use bytes::BytesMut;
-    use core_lib::instrument::Instrument;
-    use core_lib::venue::test_util::test_instrument_for;
     use md_proto::md::v1 as proto;
     use md_wire::grpc::{MESSAGE_PREFIX, RejectCode, VenueIdx};
     use std::sync::Arc;
@@ -503,8 +604,52 @@ mod test {
 
     const SYMBOL: &str = "btcusdt-broadcast-test";
 
-    fn key() -> Instrument {
-        test_instrument_for(Venue::BinanceSpot, SYMBOL)
+    /// The two spellings of the one instrument the merged-book tests serve. Distinct because
+    /// a real catalogue pair is - `BTCUSDT` on Binance, `btcusd` on Bitstamp - and because
+    /// `FakeSource` files its live streams by symbol.
+    const ON_BINANCE: &str = "btcusdt-merged-broadcast-test";
+    const ON_BITSTAMP: &str = "btcusd-merged-broadcast-test";
+
+    /// A harness serving one instrument quoted on both venues, and the source of each.
+    struct TwoVenues {
+        binance_spot: Arc<FakeSource>,
+        bitstamp: Arc<FakeSource>,
+        harness: Harness,
+    }
+
+    fn two_venues() -> TwoVenues {
+        let binance_spot = Arc::new(FakeSource::default());
+        let bitstamp = Arc::new(FakeSource::default());
+        let harness = registry_for_pairs(
+            &binance_spot,
+            &bitstamp,
+            &[&[
+                (Venue::BinanceSpot, ON_BINANCE),
+                (Venue::Bitstamp, ON_BITSTAMP),
+            ]],
+        );
+
+        TwoVenues {
+            binance_spot,
+            bitstamp,
+            harness,
+        }
+    }
+
+    /// `(price, size, venue_idx)` for each level, which is everything one carries.
+    fn levels_of(levels: &[proto::Level]) -> Vec<(f64, f64, u32)> {
+        levels
+            .iter()
+            .map(|level| (level.price, level.size, level.venue_idx))
+            .collect()
+    }
+
+    fn binance_idx() -> u32 {
+        TestCatalogue::venue_idx(Venue::BinanceSpot).get()
+    }
+
+    fn bitstamp_idx() -> u32 {
+        TestCatalogue::venue_idx(Venue::Bitstamp).get()
     }
 
     /// Subscribes one client and reads its opening snapshot, leaving it ready for real books.
@@ -536,11 +681,11 @@ mod test {
             .expect("the registry is still spawning");
     }
 
-    /// Whether the symbol still has a broadcaster.
+    /// Whether the instrument still has a broadcaster.
     async fn is_registered(harness: &Harness) -> bool {
         harness
             .registry
-            .is_registered(key().id())
+            .is_registered(FIRST)
             .await
             .expect("the registry task is alive")
     }
@@ -786,6 +931,138 @@ mod test {
         assert!(
             !is_registered(&harness).await,
             "the entry goes with the broadcaster, so the next client retries the subscribe"
+        );
+    }
+
+
+    /// The whole point of the merge: one stream, one frame, levels from both venues in it,
+    /// each carrying the venue that quoted it.
+    #[tokio::test]
+    async fn two_venues_reach_the_client_as_one_merged_book() {
+        let venues = two_venues();
+        let client = attach(&venues.harness).await;
+
+        venues
+            .binance_spot
+            .publish(ON_BINANCE, &book(&[(100.0, 1.0), (102.0, 1.0)], &[(99.0, 1.0)]));
+        // The first book already reaches the client - it is a book, on one venue, with the
+        // other still empty - so it is read off before the second venue quotes.
+        let one_sided = client.next_book().await;
+        assert_eq!(
+            levels_of(&one_sided.asks),
+            vec![(100.0, 1.0, binance_idx()), (102.0, 1.0, binance_idx())],
+            "a venue that has not published yet is simply not in the book"
+        );
+
+        venues
+            .bitstamp
+            .publish(ON_BITSTAMP, &book(&[(101.0, 2.0)], &[(99.5, 2.0)]));
+        let merged = client.next_book().await;
+
+        assert_eq!(
+            levels_of(&merged.asks),
+            vec![
+                (100.0, 1.0, binance_idx()),
+                (101.0, 2.0, bitstamp_idx()),
+                (102.0, 1.0, binance_idx()),
+            ],
+            "the merged asks ascend across both venues"
+        );
+        assert_eq!(
+            levels_of(&merged.bids),
+            vec![(99.5, 2.0, bitstamp_idx()), (99.0, 1.0, binance_idx())],
+            "the merged bids descend across both venues"
+        );
+        assert_eq!(
+            merged.spread, 0.5,
+            "the spread is derived from the merged tops, not from either venue's own"
+        );
+    }
+
+    /// One venue publishing must not cost the other's levels: the book is rebuilt from every
+    /// reader's current slot, not patched.
+    #[tokio::test]
+    async fn a_book_from_one_venue_keeps_the_other_venues_levels() {
+        let venues = two_venues();
+        let client = attach(&venues.harness).await;
+
+        venues
+            .bitstamp
+            .publish(ON_BITSTAMP, &book(&[(101.0, 2.0)], &[]));
+        let _ = client.next_book().await;
+
+        venues
+            .binance_spot
+            .publish(ON_BINANCE, &book(&[(100.0, 1.0)], &[]));
+        let merged = client.next_book().await;
+
+        assert_eq!(
+            levels_of(&merged.asks),
+            vec![(100.0, 1.0, binance_idx()), (101.0, 2.0, bitstamp_idx())],
+            "the quiet venue's book is still the one it last published"
+        );
+    }
+
+    /// A venue leaving is not the stream ending. Its connector's parting empty book takes it
+    /// out of the merge, and the other venue carries on.
+    #[tokio::test]
+    async fn one_venue_leaving_leaves_the_other_streaming() {
+        let venues = two_venues();
+        let client = attach(&venues.harness).await;
+
+        venues
+            .binance_spot
+            .publish(ON_BINANCE, &book(&[(100.0, 1.0)], &[]));
+        let _ = client.next_book().await;
+        venues
+            .bitstamp
+            .publish(ON_BITSTAMP, &book(&[(101.0, 2.0)], &[]));
+        let _ = client.next_book().await;
+
+        // What a connector shutting down, or a venue delisting its spelling, looks like.
+        venues.bitstamp.drop_stream(ON_BITSTAMP);
+        let without_bitstamp = client.next_book().await;
+        assert_eq!(
+            levels_of(&without_bitstamp.asks),
+            vec![(100.0, 1.0, binance_idx())],
+            "the departed venue drops out of the merge"
+        );
+
+        venues
+            .binance_spot
+            .publish(ON_BINANCE, &book(&[(100.5, 3.0)], &[]));
+        let after = client.next_book().await;
+        assert_eq!(
+            levels_of(&after.asks),
+            vec![(100.5, 3.0, binance_idx())],
+            "the venue that is left keeps publishing into the same stream"
+        );
+
+        assert!(
+            is_registered(&venues.harness).await,
+            "one venue leaving must not retire the instrument"
+        );
+    }
+
+    /// The other end of that rule: once nothing is left to merge, the stream ends the same way
+    /// a single-venue one always has.
+    #[tokio::test]
+    async fn losing_every_venue_ends_every_session() {
+        let venues = two_venues();
+        let client = attach(&venues.harness).await;
+
+        venues.binance_spot.drop_stream(ON_BINANCE);
+        venues.bitstamp.drop_stream(ON_BITSTAMP);
+
+        let farewell = client.next_book().await;
+        assert!(
+            farewell.asks.is_empty() && farewell.bids.is_empty(),
+            "the last thing a client sees is that there is no book anywhere"
+        );
+        assert_eq!(client.ended().await.code(), RejectCode::StreamEnded);
+        assert!(
+            !is_registered(&venues.harness).await,
+            "the entry goes with the broadcaster, so the next client retries both subscribes"
         );
     }
 

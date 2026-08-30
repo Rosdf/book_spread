@@ -1,5 +1,5 @@
-//! Which symbols are being broadcast, the two races around starting and stopping one, and
-//! turning a catalogue index into the instrument a broadcaster is filed under.
+//! Which catalogue instruments are being broadcast, the two races around starting and
+//! stopping one, and resolving a catalogue index into the pairs a broadcaster subscribes.
 
 use crate::catalogue::CataloguePair;
 use crate::registry::events::{
@@ -7,6 +7,7 @@ use crate::registry::events::{
 };
 use crate::venue::{BookSource as _, Connectors};
 use core_lib::Venue;
+use core_lib::connector::book_publisher::BookReader;
 use core_lib::instrument::{Instrument, InstrumentId};
 use core_lib::map::{InternalHashMap, new_internal_map};
 use core_lib::panic::panic_message;
@@ -16,8 +17,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
-use crate::broadcast::broadcaster::{Broadcaster, Join};
-use crate::broadcast::queue::{make_broadcaster_channel, BroadcasterTx};
+use crate::broadcast::broadcaster::{Broadcaster, Join, VenueReader, VenueReaders};
+use crate::broadcast::queue::{make_broadcaster_channel, BroadcasterRx, BroadcasterTx};
 use crate::client::ClientHandshake;
 use md_wire::grpc::{CatalogueIdx, RejectCode, Rejected, VenueIdx};
 
@@ -32,18 +33,45 @@ pub(crate) mod events;
 /// that is never listed costs one sweep a minute.
 const RESOLVE_SWEEP_MAX: Duration = Duration::from_secs(60);
 
-/// A catalogue entry that has become servable: its venue's connector has interned the symbol,
-/// and the index the encoder will stamp on every level of its book.
+/// One pair of a servable catalogue entry: the interned symbol, and the index the encoder
+/// stamps on every level that comes from it.
 #[derive(Debug, Clone, Copy)]
-struct Resolved {
+struct ResolvedPair {
     instrument: Instrument,
     venue_idx: VenueIdx,
 }
+
+impl ResolvedPair {
+    /// The connector that carries this pair.
+    fn venue(self) -> Venue {
+        self.instrument.venue()
+    }
+
+    /// What that connector knows this pair as.
+    fn instrument_id(self) -> InstrumentId {
+        self.instrument.id()
+    }
+}
+
+/// One catalogue instrument's pairs, once every venue has interned its symbol.
+///
+/// The single representation of "which venues make up this instrument": the resolution map
+/// holds one, the entry for a running broadcaster holds a clone of that same one, and the
+/// task that subscribes them holds a third. Sharing rather than re-deriving is what keeps
+/// them from drifting - a release names exactly the pairs the subscribe named - and a clone
+/// is one atomic rather than a copy of the list.
+type Pairs = Arc<[ResolvedPair]>;
 
 /// The registry's half of one running broadcaster.
 #[derive(Debug)]
 struct Entry<C> {
     joins: BroadcasterTx<C>,
+    /// The pairs this key was opened with, released together when it retires.
+    ///
+    /// Recorded here rather than carried on a [`Claim`] because this task is what issued the
+    /// subscribes: they are known synchronously, at insert, while a claim is only ever an
+    /// identity and can stay allocation-free.
+    pairs: Pairs,
     /// Joins already queued on `joins` that the broadcaster has not taken yet.
     ///
     /// This is what closes the teardown race: the increment happens on the registry task,
@@ -52,6 +80,23 @@ struct Entry<C> {
     /// identity - the `Arc` is compared by pointer to tell one generation of broadcaster for
     /// a key from the next.
     pending_joins: Arc<AtomicUsize>,
+}
+
+impl<C> Entry<C> {
+    /// Releases every pair this key was opened with, in the order they were subscribed.
+    ///
+    /// That is what the registry *issued*, which on the unwind of a partly-successful
+    /// subscribe is one pair wider than what the connectors actually carry. Deliberate: a
+    /// release for a pair a connection has no slot for is a no-op down to the wire -
+    /// `remove_slot` finds nothing and enqueues no control frame - and the registry is the
+    /// only subscriber there is, so the pair cannot belong to anyone else.
+    fn unsubscribe<V: Connectors>(&self, connectors: &V) {
+        for pair in &*self.pairs {
+            connectors
+                .source(pair.venue())
+                .unsubscribe(pair.instrument_id());
+        }
+    }
 }
 
 /// A client handed back because the registry would not start a broadcaster for it.
@@ -149,11 +194,11 @@ impl<V: Connectors, C: ClientHandshake> RegistryHandle<V, C> {
     }
 }
 
-/// The `(venue, symbol)` -> broadcaster map, plus the connectors those broadcasters use.
+/// The catalogue-index -> broadcaster map, plus the connectors those broadcasters use.
 ///
 /// Lives on one task and is reached only through its queue, the same way a venue connector
-/// is reached through `ConnectorTx`. That is what orders the connector `unsubscribe` a
-/// retiring broadcaster issues ahead of the `subscribe` the next broadcaster for that key
+/// is reached through `ConnectorTx`. That is what orders the connector `unsubscribe`s a
+/// retiring broadcaster issues ahead of the `subscribe`s the next broadcaster for that key
 /// needs: both calls are made from here, in queue order, and the connector's own queue
 /// preserves it.
 ///
@@ -171,11 +216,16 @@ impl<V: Connectors, C: ClientHandshake> RegistryHandle<V, C> {
 /// it on the spawned task instead.
 #[derive(Debug)]
 struct Registry<V, C> {
-    entries: InternalHashMap<InstrumentId, Entry<C>>,
+    /// One entry per *catalogue instrument* being broadcast, not per symbol: a broadcaster
+    /// serves an instrument's whole pair list as one merged book.
+    entries: InternalHashMap<CatalogueIdx, Entry<C>>,
     connectors: V,
-    /// Catalogue entries whose venue has interned their symbol. Nothing ever leaves this map:
-    /// an `Instrument` handle stays valid for the life of the process.
-    resolved: InternalHashMap<CatalogueIdx, Resolved>,
+    /// Catalogue entries every one of whose venues has interned its symbol. Nothing ever
+    /// leaves this map: an `Instrument` handle stays valid for the life of the process.
+    ///
+    /// The pair list is an `Arc` so a caller can be handed its own handle without keeping the
+    /// map borrowed - one atomic, and only on the path that starts a broadcaster.
+    resolved: InternalHashMap<CatalogueIdx, Pairs>,
     /// Catalogue entries not interned as of the last sweep. Emptied into `resolved` as the
     /// connectors catch up.
     unresolved: InternalHashMap<CatalogueIdx, Box<[CataloguePair]>>,
@@ -236,9 +286,6 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
                 let _ = reply.send(self.retire_if_idle(&claim));
             }
             RegistryEvent::Retire(claim) => self.retire(&claim),
-            RegistryEvent::Abandon(claim) => {
-                self.take_entry(&claim);
-            }
             RegistryEvent::ShutDown => {
                 self.shutting_down = true;
                 self.entries.clear();
@@ -266,7 +313,7 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     /// unservable subscribe from costing a connector round trip.
     fn subscribe(&mut self, idx: CatalogueIdx, client: C) -> Result<(), Refused<C>> {
         match self.resolve(idx) {
-            Ok(resolved) => self.subscribe_resolved(resolved, client),
+            Ok(pairs) => self.subscribe_resolved(idx, pairs, client),
             Err(rejected) => Err(Refused { client, rejected }),
         }
     }
@@ -283,9 +330,9 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     /// [`RejectCode::UnknownInstrument`] for an index this server does not carry at all -
     /// permanent, since the catalogue is loaded once - and [`RejectCode::UnlistedSymbol`] for
     /// one whose venue has not interned its symbol yet, which is worth retrying.
-    fn resolve(&mut self, idx: CatalogueIdx) -> Result<Resolved, Rejected> {
+    fn resolve(&mut self, idx: CatalogueIdx) -> Result<Pairs, Rejected> {
         if let Some(resolved) = self.resolved.get(&idx) {
-            return Ok(*resolved);
+            return Ok(Arc::clone(resolved));
         }
         if !self.unresolved.contains_key(&idx) {
             return Err(Rejected::new(
@@ -298,7 +345,7 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
             Rejected::new(
                 RejectCode::UnlistedSymbol,
                 format!(
-                    "instrument {} is not listed by its venue yet",
+                    "instrument {} is not listed by every one of its venues yet",
                     idx.get()
                 )
                 .into_boxed_str(),
@@ -309,7 +356,7 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
         }
 
         self.sweep();
-        self.resolved.get(&idx).copied().ok_or_else(unlisted)
+        self.resolved.get(&idx).map(Arc::clone).ok_or_else(unlisted)
     }
 
     /// Moves every catalogue entry whose venue has now interned its symbol into `resolved`.
@@ -319,27 +366,37 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     /// for a different index has already been paid, and the backoff below bounds how often
     /// this happens at all.
     ///
-    /// An entry resolves on its first pair, which is the one that will be served. An entry
-    /// with no pairs at all never resolves - it names nothing to subscribe to - and simply
-    /// stays here.
+    /// An entry resolves all at once or not at all: every pair under it is served, so one
+    /// venue that has not interned its symbol yet keeps the whole entry here. That is what
+    /// makes a broadcaster's venue set fixed for its lifetime - it never starts on a partial
+    /// book and then has to grow. An entry with no pairs at all never resolves either: it
+    /// names nothing to subscribe to.
     fn sweep(&mut self) {
         let before = self.unresolved.len();
         let resolved = &mut self.resolved;
         self.unresolved.retain(|idx, pairs| {
-            let Some(first) = pairs.first() else {
+            if pairs.is_empty() {
                 return true;
-            };
-            // `true` keeps the entry here: it is still unresolved.
-            Instrument::lookup(first.venue(), first.symbol()).is_none_or(|instrument| {
-                resolved.insert(
-                    *idx,
-                    Resolved {
+            }
+            let mut interned = heapless::Vec::<ResolvedPair, { Venue::COUNT }>::new();
+            for pair in pairs {
+                // `true` keeps the entry here: it is still unresolved, and every pair
+                // already looked up is discarded rather than remembered - the lookup is a
+                // read-locked hash probe, and half an entry is not servable.
+                let Some(instrument) = Instrument::lookup(pair.venue(), pair.symbol()) else {
+                    return true;
+                };
+                interned
+                    .push(ResolvedPair {
                         instrument,
-                        venue_idx: first.venue_idx(),
-                    },
-                );
-                false
-            })
+                        venue_idx: pair.venue_idx(),
+                    })
+                    .map_err(|_| ())
+                    .expect("one pair per venue, which the catalogue enforces");
+            }
+            // The one place a `Pairs` is built. Everything downstream shares this handle.
+            resolved.insert(*idx, Pairs::from(&*interned));
+            false
         });
 
         // Progress means the connectors are still catching up, so the next sweep is worth
@@ -350,39 +407,29 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
         self.next_sweep = Instant::now() + self.resolve_backoff.next_delay();
     }
 
-    /// Hands `client` to `resolved`'s broadcaster, starting one if this is the first client.
+    /// Hands `client` to `idx`'s broadcaster, starting one if this is the first client.
     ///
-    /// The broadcaster answers on the connection itself - response headers, or a refusal
-    /// carrying the venue's own reason - so a symbol the venue does not list ends the
-    /// connection rather than opening a stream that never produces anything. Nothing comes
-    /// back to the caller except a client the registry declined to take at all.
+    /// The broadcaster answers on the connection itself - response headers, or a venue's own
+    /// refusal - so an instrument a venue does not list ends the connection rather than
+    /// opening a stream that never produces anything. Nothing comes back to the caller except
+    /// a client the registry declined to take at all.
     ///
-    /// Every client of a brand new symbol is served by this one task, and the entry goes into
-    /// the map before the broadcaster is even spawned, so all but the first can only find it
-    /// occupied and queue a join. Exactly one `BookSource::subscribe` is ever issued per key -
-    /// which is an invariant, not a nicety: the connector hard-errors a duplicate subscribe,
-    /// and `BookReader` is not `Clone`, so a symbol has exactly one reader.
-    fn subscribe_resolved(&mut self, resolved: Resolved, client: C) -> Result<(), Refused<C>> {
-        let Resolved {
-            instrument,
-            venue_idx,
-        } = resolved;
-        let mut join = Join::new(client);
-
-        if let Some(entry) = self.entries.get(&instrument.id()) {
-            // Incremented before the send, so a broadcaster whose `RetireIfIdle` is queued
-            // behind this event sees the join and stays alive for it.
-            entry.pending_joins.fetch_add(1, Ordering::Relaxed);
-            match entry.joins.send(join) {
-                Ok(()) => return Ok(()),
-                // The broadcaster is gone but its `Retire` has not been handled yet. Drop the
-                // stale entry and start a fresh one below.
-                Err(returned) => {
-                    join = returned;
-                    self.entries.remove(&instrument.id());
-                }
-            }
-        }
+    /// Every client of a brand new instrument is served by this one task, and the entry goes
+    /// into the map before the broadcaster is even spawned, so all but the first can only find
+    /// it occupied and queue a join. Exactly one `BookSource::subscribe` is ever issued per
+    /// pair - which is an invariant, not a nicety: the connector hard-errors a duplicate
+    /// subscribe, and `BookReader` is not `Clone`. What keeps it true across instruments is
+    /// the catalogue itself, which refuses to carry one `(venue, symbol)` under two of them.
+    fn subscribe_resolved(
+        &mut self,
+        idx: CatalogueIdx,
+        pairs: Pairs,
+        client: C,
+    ) -> Result<(), Refused<C>> {
+        let join = match self.join_running(idx, Join::new(client)) {
+            Ok(()) => return Ok(()),
+            Err(returned) => returned,
+        };
 
         // `upgrade` failing says the same thing `shutting_down` does, one step further along:
         // nothing outside this task holds a way in any more, so a broadcaster started now
@@ -405,63 +452,60 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
             .map_err(|_| ())
             .expect("the receiving half is still in scope");
         self.entries.insert(
-            instrument.id(),
+            idx,
             Entry {
                 joins,
+                pairs: Arc::clone(&pairs),
                 pending_joins: Arc::clone(&pending_joins),
             },
         );
 
-        // Issued here rather than on the broadcaster, because this is the only place that can
-        // put it after the `unsubscribe` of whatever generation held this key before. It
-        // costs no await: `BookSource::subscribe` hands back the reply channel rather than a
-        // future, so the broadcaster is what waits for the venue.
-        let sub = self.connectors.source(instrument.venue()).subscribe(instrument.id());
-
-        tokio::spawn(async move {
-            let reader = match sub.await {
-                Ok(Ok(reader)) => reader,
-                Ok(Err(err)) => {
-                    tracing::warn!(
-                        venue = instrument.venue().as_str(),
-                        symbol = instrument.name(),
-                        %err,
-                        "subscribe rejected"
-                    );
-                    // Queued before the drain: once the registry has taken the entry out, no
-                    // further join can be sent here, so the drain below answers every one there
-                    // will ever be. Nothing to unsubscribe - this broadcaster never held a
-                    // subscription.
-                    tx.abandon(Claim::new(instrument.id(), instrument.venue(), pending_joins));
-                    queued
-                        .drain(Rejected::new(
-                            RejectCode::ConnectorRefused,
-                            err.to_string().into_boxed_str(),
-                        ))
-                        .await;
-                    return;
-                }
-                Err(_) => {
-                    tx.abandon(Claim::new(instrument.id(), instrument.venue(), pending_joins));
-                    queued
-                        .drain(Rejected::new(
-                            RejectCode::ConnectorGone,
-                            Box::from("connector stopped before it could subscribe"),
-                        ))
-                        .await;
-                    return;
-                }
-            };
-
-            Broadcaster::start(tx, instrument, venue_idx, queued, pending_joins, reader).await;
-        });
+        let replies = self.issue_subscribes(&pairs);
+        tokio::spawn(serve(tx, idx, pairs, replies, queued, pending_joins));
         Ok(())
+    }
+
+    /// Hands `join` to the broadcaster already serving `idx`, if there is one.
+    ///
+    /// `Err` gives it back, meaning this key needs a broadcaster of its own: either nothing
+    /// was filed under it, or what was is a broadcaster that has already stopped and whose
+    /// [`RegistryEvent::Retire`] is still queued behind this event - in which case the stale
+    /// entry is dropped here so the caller's fresh one replaces it.
+    fn join_running(&mut self, idx: CatalogueIdx, join: Join<C>) -> Result<(), Join<C>> {
+        let Some(entry) = self.entries.get(&idx) else {
+            return Err(join);
+        };
+
+        // Incremented before the send, so a broadcaster whose `RetireIfIdle` is queued behind
+        // this event sees the join and stays alive for it.
+        entry.pending_joins.fetch_add(1, Ordering::Relaxed);
+        entry.joins.send(join).inspect_err(|_| {
+            self.entries.remove(&idx);
+        })
+    }
+
+    /// Asks every pair's connector for its book stream, and hands back the replies in the
+    /// order the pairs are in.
+    ///
+    /// Issued here rather than on the broadcaster, because this is the only place that can
+    /// put them after the `unsubscribe`s of whatever generation held this key before. It
+    /// costs no await: `BookSource::subscribe` hands back the reply channel rather than a
+    /// future, so the spawned task is what waits for the venues.
+    fn issue_subscribes(&self, pairs: &[ResolvedPair]) -> Replies {
+        pairs
+            .iter()
+            .map(|pair| {
+                self.connectors
+                    .source(pair.venue())
+                    .subscribe(pair.instrument_id())
+            })
+            .collect()
     }
 
     /// Called for a broadcaster whose session list has just emptied. `true` means the entry
     /// is gone and the task should stop.
     fn retire_if_idle(&mut self, claim: &Claim) -> bool {
-        let Some(entry) = self.entries.get(&claim.instrument_id()) else {
+        let Some(entry) = self.entries.get(&claim.idx()) else {
             return true;
         };
         if !Arc::ptr_eq(&entry.pending_joins, claim.pending_joins()) {
@@ -473,44 +517,120 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
             return false;
         }
 
-        self.entries.remove(&claim.instrument_id());
-        self.unsubscribe(claim.venue(), claim.instrument_id());
+        self.take_entry(claim)
+            .expect("checked just above: the entry is here and this claim owns it")
+            .unsubscribe(&self.connectors);
         true
     }
 
     /// Removes a broadcaster that is stopping for a reason other than an idle session list -
-    /// its connector dropped the symbol, or the server is shutting down - and releases the
-    /// connector subscription with it.
+    /// its connectors dropped the symbols, the server is shutting down, or its own subscribe
+    /// failed part-way - and releases every subscription it holds with it.
     ///
     /// A no-op when the entry is already gone or belongs to a newer broadcaster, so a task
     /// that exited through [`Registry::retire_if_idle`] can still send this on its way out.
     fn retire(&mut self, claim: &Claim) {
-        if self.take_entry(claim) {
-            self.unsubscribe(claim.venue(), claim.instrument_id());
+        if let Some(entry) = self.take_entry(claim) {
+            entry.unsubscribe(&self.connectors);
         }
     }
 
-    /// Removes `claim`'s entry if it is still the one `claim` names. `false` means it was
+    /// Takes `claim`'s entry out if it is still the one `claim` names. `None` means it was
     /// already gone - [`RegistryEvent::ShutDown`] cleared it, say - or belongs to a newer
-    /// broadcaster for the same key.
-    ///
-    /// On its own this is the `Abandon` case: a broadcaster whose subscribe the connector
-    /// rejected sends no unsubscribe, because it never held a subscription, and if the
-    /// rejection was "already subscribed" then the subscription belongs to someone else.
-    fn take_entry(&mut self, claim: &Claim) -> bool {
-        let Some(entry) = self.entries.get(&claim.instrument_id()) else {
-            return false;
-        };
+    /// broadcaster for the same key, which must not have its entry taken out from under it.
+    fn take_entry(&mut self, claim: &Claim) -> Option<Entry<C>> {
+        let entry = self.entries.get(&claim.idx())?;
         if !Arc::ptr_eq(&entry.pending_joins, claim.pending_joins()) {
-            return false;
+            return None;
         }
 
-        self.entries.remove(&claim.instrument_id());
-        true
+        self.entries.remove(&claim.idx())
+    }
+}
+
+/// One pending `BookSource::subscribe` reply per pair, in the pairs' own order.
+type Replies = heapless::Vec<oneshot::Receiver<anyhow::Result<BookReader>>, { Venue::COUNT }>;
+
+/// Waits for every venue to answer, then runs the broadcaster - or unwinds the whole
+/// subscribe if any of them refused.
+///
+/// Off the registry task on purpose: waiting here is what keeps the one queue every handshake
+/// and every broadcaster reaches the registry through from stalling on a venue round trip.
+async fn serve<C: ClientHandshake>(
+    registry: RegistryTx<C>,
+    idx: CatalogueIdx,
+    pairs: Pairs,
+    replies: Replies,
+    queued: BroadcasterRx<C>,
+    pending_joins: Arc<AtomicUsize>,
+) {
+    match open_readers(&pairs, replies).await {
+        Ok(readers) => Broadcaster::start(registry, idx, readers, queued, pending_joins).await,
+        // All or nothing: a book missing a venue is not the book this instrument advertises,
+        // and a client cannot tell one from the other on the wire. The readers that did open
+        // went with the `Err`, and the entry's pairs are released by the retire below.
+        Err(rejected) => {
+            // Queued before the drain: once the registry has taken the entry out, no further
+            // join can be sent here, so the drain answers every one there will ever be.
+            registry.retire(Claim::new(idx, pending_joins));
+            queued.drain(rejected).await;
+        }
+    }
+}
+
+/// One reader per pair, or the first reason there is not one for all of them.
+///
+/// Every reply is awaited even once one has failed: dropping the receiving half of a reply
+/// channel the connector is about to send on would leave that subscription established with
+/// nothing reading it, and the release that follows has to be ordered after it rather than
+/// racing it.
+async fn open_readers(pairs: &[ResolvedPair], replies: Replies) -> Result<VenueReaders, Rejected> {
+    let mut readers = VenueReaders::new();
+    let mut refused: Option<Rejected> = None;
+
+    for (pair, reply) in pairs.iter().zip(replies) {
+        match opened(pair, reply.await) {
+            Ok(reader) => readers
+                .push(VenueReader::new(pair.venue_idx, reader))
+                .map_err(|_| ())
+                .expect("one pair per venue, which the catalogue enforces"),
+            Err(rejected) => {
+                refused.get_or_insert(rejected);
+            }
+        }
     }
 
-    fn unsubscribe(&self, venue: Venue, instrument_id: InstrumentId) {
-        self.connectors.source(venue).unsubscribe(instrument_id);
+    if let Some(rejected) = refused {
+        return Err(rejected);
+    }
+    Ok(readers)
+}
+
+/// One pair's answer: its reader, or the refusal a client should hear.
+fn opened<E>(
+    pair: &ResolvedPair,
+    reply: Result<anyhow::Result<BookReader>, E>,
+) -> Result<BookReader, Rejected> {
+    match reply {
+        Ok(Ok(reader)) => Ok(reader),
+        Ok(Err(err)) => {
+            tracing::warn!(
+                venue = pair.venue().as_str(),
+                symbol = pair.instrument.name(),
+                %err,
+                "subscribe rejected"
+            );
+            Err(Rejected::new(
+                RejectCode::ConnectorRefused,
+                err.to_string().into_boxed_str(),
+            ))
+        }
+        // The reply channel closed without an answer, which only a connector that stopped
+        // between taking the subscribe and answering it can do.
+        Err(_) => Err(Rejected::new(
+            RejectCode::ConnectorGone,
+            Box::from("connector stopped before it could subscribe"),
+        )),
     }
 }
 
@@ -518,11 +638,13 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
 mod test {
     use super::events::Claim;
     use crate::broadcast::broadcaster::SESSION_SWEEP;
-    use crate::registry::harness::{FIRST, Harness, registry_for, registry_unlisted};
+    use crate::registry::harness::{
+        FIRST, Harness, registry_for, registry_for_pairs, registry_unlisted,
+        registry_unlisted_pairs,
+    };
     use crate::client::mock::{MockClient, MockPeer, connected};
     use crate::test_util::FakeSource;
     use crate::venue::Venue;
-    use core_lib::instrument::Instrument;
     use core_lib::venue::test_util::test_instrument_for;
     use md_wire::grpc::{CatalogueIdx, RejectCode};
     use std::sync::Arc;
@@ -530,10 +652,6 @@ mod test {
     use std::time::Duration;
 
     const SYMBOL: &str = "btcusdt-registry-test";
-
-    fn key() -> Instrument {
-        test_instrument_for(Venue::BinanceSpot, SYMBOL)
-    }
 
     /// Hands a fresh mock client to the registry and keeps the peer half.
     ///
@@ -564,7 +682,7 @@ mod test {
     async fn is_registered(harness: &Harness) -> bool {
         harness
             .registry
-            .is_registered(key().id())
+            .is_registered(FIRST)
             .await
             .expect("the registry task is alive")
     }
@@ -572,7 +690,7 @@ mod test {
     async fn entry_token(harness: &Harness) -> Option<Arc<AtomicUsize>> {
         harness
             .registry
-            .entry_token(key().id())
+            .entry_token(FIRST)
             .await
             .expect("the registry task is alive")
     }
@@ -631,11 +749,9 @@ mod test {
         drop(first);
 
         let (second, queued) = subscribe(&harness);
-        let retiring = harness.registry.retire_if_idle(Claim::new(
-            key().id(),
-            key().venue(),
-            Arc::clone(&token),
-        ));
+        let retiring = harness
+            .registry
+            .retire_if_idle(Claim::new(FIRST, Arc::clone(&token)));
 
         assert!(
             !retiring.await.expect("the registry task is alive"),
@@ -715,9 +831,12 @@ mod test {
             !is_registered(&harness).await,
             "a rejected symbol must not leave an entry that shadows a later attempt"
         );
-        assert!(
-            source.unsubscribed().is_empty(),
-            "a broadcaster that never held a subscription must not release one"
+        assert_eq!(
+            source.unsubscribed(),
+            vec![SYMBOL],
+            "the release names every pair the entry was opened with, whether or not each one \
+             took - a connector with no slot for it does nothing, and the registry is the \
+             only subscriber there is"
         );
     }
 
@@ -891,6 +1010,136 @@ mod test {
         );
     }
 
+
+    /// The pair-list spellings the two-venue tests use. Distinct on purpose: a catalogue pair
+    /// is one venue's own spelling of an instrument, and `FakeSource` files its live streams
+    /// by symbol.
+    const ON_BINANCE: &str = "btcusdt-registry-pairs";
+    const ON_BITSTAMP: &str = "btcusd-registry-pairs";
+
+    fn both_venues() -> [(Venue, &'static str); 2] {
+        [
+            (Venue::BinanceSpot, ON_BINANCE),
+            (Venue::Bitstamp, ON_BITSTAMP),
+        ]
+    }
+
+    /// One instrument, one broadcaster, one subscribe *per pair* - the invariant that used to
+    /// be "one per symbol" now that a broadcaster is filed under a catalogue index.
+    #[tokio::test]
+    async fn every_pair_of_an_instrument_is_subscribed_once() {
+        let binance_spot = Arc::new(FakeSource::default());
+        let bitstamp = Arc::new(FakeSource::default());
+        let harness = registry_for_pairs(&binance_spot, &bitstamp, &[&both_venues()]);
+
+        let client = subscribed(&harness).await;
+        client
+            .accepted()
+            .await
+            .expect("the fake sources accept every symbol");
+
+        assert_eq!(binance_spot.subscribed(), vec![ON_BINANCE]);
+        assert_eq!(bitstamp.subscribed(), vec![ON_BITSTAMP]);
+    }
+
+    /// All-or-nothing resolution: an instrument is not servable until *every* one of its
+    /// venues has interned its spelling, and it becomes servable the moment the last one does.
+    #[tokio::test]
+    async fn an_instrument_resolves_only_once_every_venue_lists_it() {
+        const ONE: &str = "btcusdt-registry-halflisted";
+        const OTHER: &str = "btcusd-registry-halflisted";
+
+        let binance_spot = Arc::new(FakeSource::default());
+        let bitstamp = Arc::new(FakeSource::default());
+        let pairs = [(Venue::BinanceSpot, ONE), (Venue::Bitstamp, OTHER)];
+        // Only the first venue has listed its spelling when the registry starts.
+        let _ = test_instrument_for(Venue::BinanceSpot, ONE);
+        let harness = registry_unlisted_pairs(&binance_spot, &bitstamp, &[&pairs]);
+
+        let (_peer, client) = connected();
+        let refused = harness
+            .registry
+            .subscribe(FIRST, client)
+            .await
+            .expect("the registry task is alive")
+            .expect_err("the second venue has not interned its spelling yet");
+        assert_eq!(refused.code(), RejectCode::UnlistedSymbol);
+        assert!(
+            binance_spot.subscribed().is_empty(),
+            "a half-resolved instrument must not subscribe the venue that is ready"
+        );
+
+        let _ = test_instrument_for(Venue::Bitstamp, OTHER);
+        // Past the resolution backoff, so the next subscribe pays for a fresh sweep - the
+        // same wait `a_second_request_inside_the_sweep_window_does_not_probe_again` makes.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let peer = subscribed(&harness).await;
+        peer.accepted()
+            .await
+            .expect("both venues have listed their spellings now");
+        assert_eq!(binance_spot.subscribed(), vec![ONE]);
+        assert_eq!(bitstamp.subscribed(), vec![OTHER]);
+    }
+
+    /// All-or-nothing subscription: a book missing a venue is not the book the catalogue
+    /// advertises, so the venue that accepted is released again and the client hears why.
+    #[tokio::test]
+    async fn one_venue_refusing_releases_the_other_and_refuses_the_client() {
+        let binance_spot = Arc::new(FakeSource::default());
+        let bitstamp = Arc::new(FakeSource::rejecting("btcusd is not listed as tradable"));
+        let harness = registry_for_pairs(&binance_spot, &bitstamp, &[&both_venues()]);
+
+        let client = subscribed(&harness).await;
+        let rejected = client
+            .accepted()
+            .await
+            .expect_err("one of the two sources rejects every symbol");
+        assert_eq!(rejected.code(), RejectCode::ConnectorRefused);
+
+        let released = tokio::time::timeout(Duration::from_secs(5), async {
+            while binance_spot.unsubscribed().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "the venue that accepted must be released again, or its symbol is stuck \
+             subscribed with nothing reading it"
+        );
+        assert_eq!(binance_spot.unsubscribed(), vec![ON_BINANCE]);
+        assert!(
+            !is_registered(&harness).await,
+            "a refused instrument must not leave an entry that shadows a later attempt"
+        );
+    }
+
+    /// Retiring releases every pair, not just the one that happens to be first.
+    #[tokio::test]
+    async fn retiring_releases_every_pair() {
+        let binance_spot = Arc::new(FakeSource::default());
+        let bitstamp = Arc::new(FakeSource::default());
+        let harness = registry_for_pairs(&binance_spot, &bitstamp, &[&both_venues()]);
+
+        let client = subscribed(&harness).await;
+        client
+            .accepted()
+            .await
+            .expect("the fake sources accept every symbol");
+        drop(client);
+
+        let released = tokio::time::timeout(Duration::from_secs(5), async {
+            while binance_spot.unsubscribed().is_empty() || bitstamp.unsubscribed().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(released.is_ok(), "both pairs must be released");
+        assert_eq!(binance_spot.unsubscribed(), vec![ON_BINANCE]);
+        assert_eq!(bitstamp.unsubscribed(), vec![ON_BITSTAMP]);
+    }
+
     /// Queues `client` on `idx` and expects the registry to take it.
     async fn listed_reply(harness: &Harness, client: MockClient, idx: CatalogueIdx) {
         harness
@@ -979,20 +1228,62 @@ pub(crate) mod harness {
     /// The same, without interning anything: the catalogue names the symbols and whether
     /// their venue has listed them is the test's to arrange.
     pub(crate) fn registry_unlisted(source: &Arc<FakeSource>, symbols: &[&str]) -> Harness {
-        let entries: Vec<(u32, [(Venue, &str); 1])> = symbols
+        let entries: Vec<[(Venue, &str); 1]> = symbols
+            .iter()
+            .map(|symbol| [(Venue::BinanceSpot, *symbol)])
+            .collect();
+        let instruments: Vec<&[(Venue, &str)]> =
+            entries.iter().map(<[(Venue, &str); 1]>::as_slice).collect();
+
+        build(source, &Arc::new(FakeSource::default()), &instruments)
+    }
+
+    /// A registry over both venues' sources, carrying one instrument per entry of
+    /// `instruments` - each spelled out pair by pair, and each pair interned so the whole
+    /// entry resolves on the first sweep.
+    ///
+    /// For the merged-book tests, which need a source per venue to publish a different book
+    /// on each side of one instrument.
+    pub(crate) fn registry_for_pairs(
+        binance_spot: &Arc<FakeSource>,
+        bitstamp: &Arc<FakeSource>,
+        instruments: &[&[(Venue, &str)]],
+    ) -> Harness {
+        for pairs in instruments {
+            for (venue, symbol) in *pairs {
+                let _ = test_instrument_for(*venue, symbol);
+            }
+        }
+        build(binance_spot, bitstamp, instruments)
+    }
+
+    /// The same, without interning anything: which of the pairs their venues have listed is
+    /// the test's to arrange, one at a time.
+    pub(crate) fn registry_unlisted_pairs(
+        binance_spot: &Arc<FakeSource>,
+        bitstamp: &Arc<FakeSource>,
+        instruments: &[&[(Venue, &str)]],
+    ) -> Harness {
+        build(binance_spot, bitstamp, instruments)
+    }
+
+    /// The shared half: a catalogue filing `instruments` under their position in the slice,
+    /// and a registry over both sources serving it.
+    fn build(
+        binance_spot: &Arc<FakeSource>,
+        bitstamp: &Arc<FakeSource>,
+        instruments: &[&[(Venue, &str)]],
+    ) -> Harness {
+        let carried: Vec<(u32, &[(Venue, &str)])> = instruments
             .iter()
             .enumerate()
-            .map(|(position, symbol)| {
+            .map(|(position, pairs)| {
                 let idx = u32::try_from(position).expect("a test carries a handful of symbols");
-                (idx, [(Venue::BinanceSpot, *symbol)])
+                (idx, *pairs)
             })
             .collect();
-        let carried: Vec<(u32, &[(Venue, &str)])> = entries
-            .iter()
-            .map(|(idx, pairs)| (*idx, pairs.as_slice()))
-            .collect();
 
-        let connectors = FakeConnectors::new(Arc::clone(source), FakeSource::default());
+        let connectors = FakeConnectors::new(Arc::clone(binance_spot), Arc::clone(bitstamp));
         let catalogue = Catalogue::for_test(&carried);
         let handle = RegistryHandle::spawn(connectors, catalogue.into_instruments());
 

@@ -142,13 +142,14 @@ impl BookSource for FakeSource {
 #[derive(Debug)]
 pub struct FakeConnectors {
     binance_spot: Arc<FakeSource>,
-    bitstamp: FakeSource,
+    bitstamp: Arc<FakeSource>,
 }
 
 impl FakeConnectors {
-    /// The Binance-side source is handed in as an `Arc` so the test keeps a handle on it
-    /// after the connectors have been given away to a [`Registry`].
-    pub fn new(binance_spot: Arc<FakeSource>, bitstamp: FakeSource) -> Self {
+    /// Both sources are handed in as `Arc`s so the test keeps a handle on them after the
+    /// connectors have been given away to a [`Registry`] - which a test of a merged book
+    /// needs on both sides, since it publishes a different book on each venue.
+    pub fn new(binance_spot: Arc<FakeSource>, bitstamp: Arc<FakeSource>) -> Self {
         Self {
             binance_spot,
             bitstamp,
@@ -211,8 +212,8 @@ impl TestCatalogue {
         self
     }
 
-    /// Carries one instrument spelled differently on each of `pairs`. Only the first is served
-    /// today; the rest are validated and advertised.
+    /// Carries one instrument spelled differently on each of `pairs`. Every one of them is
+    /// subscribed, and their books are merged into the one book this instrument streams.
     #[must_use]
     pub fn with_pairs(mut self, idx: u32, pairs: &[(Venue, &str)]) -> Self {
         self.instruments.push((

@@ -52,7 +52,17 @@ struct Running {
 }
 
 async fn start(source: &Arc<FakeSource>, catalogue: TestCatalogue) -> Running {
-    let connectors = FakeConnectors::new(Arc::clone(source), FakeSource::default());
+    start_on(source, &Arc::new(FakeSource::default()), catalogue).await
+}
+
+/// The same, with a handle kept on the second venue's source too - for the one test that
+/// publishes on both sides of a merged instrument.
+async fn start_on(
+    binance_spot: &Arc<FakeSource>,
+    bitstamp: &Arc<FakeSource>,
+    catalogue: TestCatalogue,
+) -> Running {
+    let connectors = FakeConnectors::new(Arc::clone(binance_spot), Arc::clone(bitstamp));
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("a loopback port is available");
@@ -289,13 +299,16 @@ async fn one_book_reaches_two_tonic_clients_identically() {
     stop(server).await;
 }
 
-/// An instrument carrying more than one pair streams the first pair's book - merging the rest
-/// into one book is the next stage, but every pair is still advertised.
+/// An instrument carrying more than one pair streams *one* book, merged out of every pair's:
+/// the whole point of the catalogue's pair list, and the only test that proves the merge, the
+/// per-level venue suffix and the two-connector registry path together over a real socket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_multi_pair_instrument_streams_the_first_pairs_book() {
-    let source = Arc::new(FakeSource::default());
-    let server = start(
-        &source,
+async fn a_multi_pair_instrument_streams_one_merged_book() {
+    let binance_spot = Arc::new(FakeSource::default());
+    let bitstamp = Arc::new(FakeSource::default());
+    let server = start_on(
+        &binance_spot,
+        &bitstamp,
         TestCatalogue::new().with_pairs(
             0,
             &[(Venue::BinanceSpot, "MULTIBTCUSDT"), (Venue::Bitstamp, "multibtcusd")],
@@ -307,16 +320,48 @@ async fn a_multi_pair_instrument_streams_the_first_pairs_book() {
     list(Venue::Bitstamp, "multibtcusd");
     let mut books = subscribe(server.addr, 0)
         .await
-        .expect("the fake source accepts every symbol");
+        .expect("both venues accept the instrument's spelling");
     opening_snapshot(&mut books).await;
 
-    source.publish("MULTIBTCUSDT", &book(&[(100.5, 1.25)], &[(99.5, 2.0)]));
-
-    let update = next_book(&mut books).await;
+    binance_spot.publish("MULTIBTCUSDT", &book(&[(100.0, 1.0)], &[(99.0, 1.0)]));
+    let one_venue = next_book(&mut books).await;
     assert_eq!(
-        update.asks[0].venue_idx,
-        venue_idx(Venue::BinanceSpot),
-        "only the first pair - binance_spot/MULTIBTCUSDT - is served today"
+        one_venue.asks.len(),
+        1,
+        "the venue that has not published yet contributes nothing"
+    );
+
+    bitstamp.publish("multibtcusd", &book(&[(100.5, 2.0)], &[(99.5, 2.0)]));
+    let merged = next_book(&mut books).await;
+
+    let asks: Vec<(f64, u32)> = merged
+        .asks
+        .iter()
+        .map(|level| (level.price, level.venue_idx))
+        .collect();
+    assert_eq!(
+        asks,
+        vec![
+            (100.0, venue_idx(Venue::BinanceSpot)),
+            (100.5, venue_idx(Venue::Bitstamp)),
+        ],
+        "both pairs are in one book, best first, each level naming the venue that quoted it"
+    );
+    let bids: Vec<(f64, u32)> = merged
+        .bids
+        .iter()
+        .map(|level| (level.price, level.venue_idx))
+        .collect();
+    assert_eq!(
+        bids,
+        vec![
+            (99.5, venue_idx(Venue::Bitstamp)),
+            (99.0, venue_idx(Venue::BinanceSpot)),
+        ]
+    );
+    assert_eq!(
+        merged.spread, 0.5,
+        "the spread is the merged tops', not either venue's own"
     );
 
     drop(books);

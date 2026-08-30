@@ -55,25 +55,27 @@ message Pair {
 }
 
 message SubscribeBookRequest {
-  // An idx from CatalogueResponse.instruments. Every pair under it is validated; only the
-  // first is served today - merging the rest into one book is the next stage.
+  // An idx from CatalogueResponse.instruments. Every pair under it is subscribed, and their
+  // books are merged into the one book this stream carries.
   uint32 instrument_idx = 1;
 }
 
 message Level {
   double price = 1;
   double size  = 2;
-  // Which venue quoted this level, as an index into CatalogueResponse.venues. One value
-  // across a whole book today; once books are merged, levels on one side will carry
-  // different venues.
+  // Which venue quoted this level, as an index into CatalogueResponse.venues. Levels on one
+  // side carry different venues whenever the instrument names more than one pair - the book
+  // is the merge of every pair's, best first, and a venue with nothing to quote is simply
+  // absent from it.
   uint32 venue_idx = 3;
 }
 
 // Every field tag here is <= 15, so each key costs a single byte. A scalar field
 // added past tag 15 costs one extra byte on every message that carries it.
 message BookUpdate {
-  // Best first, at most 10 levels each. Both sides empty means the connector has no
-  // book - see the existing resync note, which is unchanged.
+  // Best first, at most 10 levels each, across every venue rather than per venue. Both
+  // sides empty means no venue has a book - each one publishes the empty book while it
+  // resyncs, and a venue that does contributes no levels to this one.
   repeated Level asks = 1;
   repeated Level bids = 2;
   // asks[0].price - bids[0].price. NaN when either side is empty.
