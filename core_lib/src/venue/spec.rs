@@ -114,6 +114,10 @@ pub struct FrameCtx<'t, 'd, 'g, Ready, Stage, P> {
     pub table: &'t mut SlotTable<Ready, P>,
     pub dec: &'d mut Decoder<Stage>,
     pub generations: &'g mut Generations,
+    /// When this frame arrived, read once by the session loop - so a decoder stamping
+    /// `slot.last_frame` uses this instead of taking its own `Instant::now()` for what is the
+    /// same instant.
+    pub received: Instant,
 }
 
 impl<Ready, Stage, P> std::fmt::Debug for FrameCtx<'_, '_, '_, Ready, Stage, P> {

@@ -328,7 +328,8 @@ where
 
                 polled = stream.next() => {
                     let Some(incoming) = polled else { return Err(SessionErrorImpl::Closed) };
-                    self.handler.last_message = Instant::now();
+                    let received = Instant::now();
+                    self.handler.last_message = received;
                     match incoming.map_err(ws_err::<W>)? {
                         // A venue-requested reconnect leaves a perfectly healthy socket
                         // behind, so it gets the same close handshake the shutdown path does
@@ -336,13 +337,13 @@ where
                         // deliberately does not: that socket is already dead, and waiting out
                         // `CLOSE_TIMEOUT` for an answer would just burn five seconds.
                         Message::Text(text) => {
-                            if let Some(end) = self.on_frame(text.into()) {
+                            if let Some(end) = self.on_frame(text.into(), received) {
                                 close::<W>(&mut stream).await;
                                 return Ok(end);
                             }
                         }
                         Message::Binary(bin) => {
-                            if let Some(end) = self.on_frame(bin) {
+                            if let Some(end) = self.on_frame(bin, received) {
                                 close::<W>(&mut stream).await;
                                 return Ok(end);
                             }
@@ -489,16 +490,17 @@ where
 
     /// Decodes one frame via [`VenueSpec::on_frame`] and acts on the result. Returns `Some` only
     /// when the session must end; every other outcome is handled in place.
-    fn on_frame(&mut self, bytes: Bytes) -> Option<SessionEnd> {
+    fn on_frame(&mut self, bytes: Bytes, received: Instant) -> Option<SessionEnd> {
         let ctx = FrameCtx {
             table: &mut self.table,
             dec: &mut self.handler.dec,
             generations: &mut self.handler.generations,
+            received,
         };
         match V::on_frame(ctx, bytes) {
             FrameAction::Handled => None,
             FrameAction::Buffer { slot, cursor } => {
-                self.handler.on_buffered(slot, cursor);
+                self.handler.on_buffered(slot, cursor, received);
                 None
             }
             FrameAction::Reconnect => Some(SessionEnd::Reconnect),
@@ -592,8 +594,8 @@ where
     /// A diff arrived for a symbol that has no book yet. `VenueSpec::on_frame` has already staged
     /// it into `slot`'s own arena; this starts the snapshot fetch if it was the first one, and
     /// gives up on a bootstrap that has buffered more than it is allowed to.
-    fn on_buffered(&mut self, slot: &mut Slot<V::Ready, V::Pending>, cursor: u64) {
-        slot.last_frame = Instant::now();
+    fn on_buffered(&mut self, slot: &mut Slot<V::Ready, V::Pending>, cursor: u64, received: Instant) {
+        slot.last_frame = received;
         let limit = self.cfg.core().max_pending_frames();
 
         let mut needs_fetch = false;
@@ -1023,7 +1025,7 @@ mod test {
             .unwrap();
 
         // The first diff is what arms the fetch, exactly as a live frame does.
-        conn.on_frame(Bytes::from_static(b"btcusd:100"));
+        conn.on_frame(Bytes::from_static(b"btcusd:100"), Instant::now());
 
         while let Ok(Some(snap)) =
             tokio::time::timeout(Duration::from_secs(30), snap_rx.recv()).await
@@ -1070,8 +1072,8 @@ mod test {
             ))
             .unwrap();
 
-        conn.on_frame(Bytes::from_static(b"btcusd:100"));
-        conn.on_frame(Bytes::from_static(b"btcusd:101"));
+        conn.on_frame(Bytes::from_static(b"btcusd:100"), Instant::now());
+        conn.on_frame(Bytes::from_static(b"btcusd:101"), Instant::now());
 
         let snap = snap_rx.recv().await.unwrap();
         conn.on_snapshot(snap);
@@ -1130,7 +1132,7 @@ mod test {
             ))
             .unwrap();
 
-        conn.on_frame(Bytes::from_static(b"btcusd:100"));
+        conn.on_frame(Bytes::from_static(b"btcusd:100"), Instant::now());
         let snap = snap_rx.recv().await.unwrap();
         conn.on_snapshot(snap);
 

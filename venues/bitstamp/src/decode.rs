@@ -45,7 +45,6 @@ use core_lib::venue::{
 use serde::Deserialize;
 use serde::de::{DeserializeSeed, Deserializer, Error as _, IgnoredAny, MapAccess, Visitor};
 use std::fmt::{self, Formatter};
-use std::time::Instant;
 
 type BitstampSlot = Slot<Ready, Buffered>;
 type BitstampTable = core_lib::venue::SlotTable<Ready, Buffered>;
@@ -618,6 +617,7 @@ pub(crate) fn on_frame<'t>(
         table,
         dec,
         generations: _,
+        received,
     } = ctx;
     let (scratch, bufs, stage) = dec.parts();
 
@@ -628,7 +628,7 @@ pub(crate) fn on_frame<'t>(
 
     match decoded {
         Ok(Frame::Data { slot, micro }) => {
-            slot.last_frame = Instant::now();
+            slot.last_frame = received;
             let SlotState::Ready(Ready { last_micro }) = slot.state else {
                 unreachable!("FrameSeed only returns Frame::Data for a ready slot")
             };

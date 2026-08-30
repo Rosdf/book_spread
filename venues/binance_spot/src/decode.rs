@@ -33,7 +33,6 @@ use serde::de::{
     DeserializeSeed, Deserializer, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor,
 };
 use std::fmt::{self, Formatter};
-use std::time::Instant;
 
 /// The half of the slot state machine that is not `Bootstrapping`.
 #[derive(Debug)]
@@ -1042,6 +1041,7 @@ pub(crate) fn on_frame<'t>(
         table,
         dec,
         generations,
+        received,
     } = ctx;
     let (scratch, bufs, _stage) = dec.parts();
 
@@ -1053,7 +1053,7 @@ pub(crate) fn on_frame<'t>(
             slot.state = SlotState::Ready(Ready::Live {
                 prev_u: outcome.last_id(),
             });
-            slot.last_frame = Instant::now();
+            slot.last_frame = received;
             if outcome.publish() {
                 slot.publisher.publish(&slot.book);
                 tracing::trace!(
@@ -1069,7 +1069,7 @@ pub(crate) fn on_frame<'t>(
             outcome,
             last_update_id,
         })) => {
-            slot.last_frame = Instant::now();
+            slot.last_frame = received;
             on_seeded(slot, &outcome, last_update_id, generations);
             FrameAction::Handled
         }
