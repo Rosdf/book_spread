@@ -140,18 +140,19 @@ impl Ctx {
     ///
     /// `try_into_mut` succeeding *is* the test for "nothing is holding this": it only hands
     /// back the buffer when this is the last handle onto it. So a client that is behind pins
-    /// exactly the buffer it is behind on, and no others.
+    /// exactly the buffer it is behind on, and no others. Slots that are freed are filled via
+    /// `swap_remove`, so `cooling` order carries no meaning - nothing depends on it.
     fn cool(&mut self, superseded: Bytes) {
-        let mut still_held = heapless::Vec::<Bytes, COOLING>::new();
-        while let Some(cooling) = self.cooling.pop() {
-            match cooling.try_into_mut() {
+        let mut i = 0;
+        while i < self.cooling.len() {
+            match self.cooling.swap_remove(i).try_into_mut() {
                 Ok(buffer) => self.pool.return_buffer(buffer),
                 Err(pinned) => {
-                    let _ = still_held.push(pinned);
+                    let _ = self.cooling.push(pinned);
+                    i += 1;
                 }
             }
         }
-        self.cooling = still_held;
 
         // A full list means every slot is pinned by a client that has not drained. This
         // buffer is then simply not recycled, which costs one allocation next time round -
