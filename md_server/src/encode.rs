@@ -20,7 +20,9 @@ pub(crate) fn put_string(out: &mut Vec<u8>, field: u32, value: &str) {
     if value.is_empty() {
         return;
     }
-    prost::encoding::string::encode(field, &value.to_owned(), out);
+    prost::encoding::encode_key(field, prost::encoding::WireType::LengthDelimited, out);
+    prost::encoding::encode_varint(value.len() as u64, out);
+    out.put_slice(value.as_bytes());
 }
 
 /// Appends one `uint32` field, skipping it entirely when zero - the same proto3 default
