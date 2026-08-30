@@ -13,8 +13,9 @@
 //! and each venue supplies the sink. [`BookSink`] covers the "straight into a known book" half,
 //! which both venues use for their REST snapshot.
 
-use crate::incremental_book::{IncrementalBook, UpdateResult};
+use crate::incremental_book::{IncrementalBook, PUBLISHED_DEPTH, UpdateResult};
 use crate::positive_f64::PositiveF64;
+use crate::small_book::SmallBook;
 use serde::Deserialize;
 use serde::de::{DeserializeSeed, Deserializer, SeqAccess, Visitor};
 use std::fmt::{self, Formatter};
@@ -89,10 +90,21 @@ pub fn merge(acc: &mut Option<UpdateResult>, next: Option<UpdateResult>) {
     }
 }
 
-/// Whether a merged result touched anything a `SmallBook` can show.
+const _: () = assert!(
+    SmallBook::LEVELS == PUBLISHED_DEPTH,
+    "the book tunes its window around the depth published here; they have to agree"
+);
+
+/// Whether a merged result touched anything a [`SmallBook`] can show.
+///
+/// The book knows how deep its window is; how much of that window anybody looks at is this
+/// module's business, and a change deeper than [`SmallBook::LEVELS`] is a change nothing
+/// downstream would be able to see.
 #[inline]
-pub const fn worth_publishing(merged: Option<UpdateResult>) -> bool {
-    matches!(merged, Some(UpdateResult::Close | UpdateResult::Both))
+pub fn worth_publishing(merged: Option<UpdateResult>) -> bool {
+    merged
+        .and_then(UpdateResult::shallowest)
+        .is_some_and(|idx| usize::from(idx) < SmallBook::LEVELS)
 }
 
 /// A decimal string such as `"0.01000000"`, decoded straight to `f64`.
@@ -223,7 +235,7 @@ mod test {
 
         assert_eq!(
             apply_level(&mut book, Side::Bid, 100.0, 0.0),
-            Some(UpdateResult::Close)
+            Some(UpdateResult::shallow(0))
         );
         assert_eq!(book.first_bids().len(), 0);
     }

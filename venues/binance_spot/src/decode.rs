@@ -230,13 +230,17 @@ impl DiffOutcome {
 
     /// Builds an outcome directly, bypassing `DiffSeed`. Production code only ever gets one
     /// out of a decode; this exists so tests can drive `on_seeded` without a JSON round trip.
+    ///
+    /// `publish` is spelled out rather than derived from `applied`: a decode that applied
+    /// levels only publishes when one of them landed shallow enough to show, so tying the
+    /// two together here would let a test assert an outcome the real path cannot produce.
     #[cfg(test)]
-    pub(crate) const fn for_test(first_id: u64, last_id: u64, applied: bool) -> Self {
+    pub(crate) const fn for_test(first_id: u64, last_id: u64, applied: bool, publish: bool) -> Self {
         Self {
             first_id,
             last_id,
             applied,
-            publish: applied,
+            publish,
         }
     }
 }
@@ -1788,7 +1792,7 @@ mod test {
         );
         let mut generations = Generations::default();
 
-        let outcome = super::DiffOutcome::for_test(400, 450, false);
+        let outcome = super::DiffOutcome::for_test(400, 450, false, false);
         on_seeded(&mut slot, &outcome, 500, &mut generations);
 
         assert!(
@@ -1814,7 +1818,7 @@ mod test {
         slot.book.update_bid(pos(100.0), pos(1.0));
         let mut generations = Generations::default();
 
-        let outcome = super::DiffOutcome::for_test(499, 505, true);
+        let outcome = super::DiffOutcome::for_test(499, 505, true, true);
         on_seeded(&mut slot, &outcome, 500, &mut generations);
 
         let SlotState::Ready(Ready::Live { prev_u }) = slot.state else {
@@ -1834,7 +1838,7 @@ mod test {
         slot.book.update_bid(pos(100.0), pos(1.0));
         let mut generations = Generations::default();
 
-        let outcome = super::DiffOutcome::for_test(600, 610, true);
+        let outcome = super::DiffOutcome::for_test(600, 610, true, true);
         on_seeded(&mut slot, &outcome, 500, &mut generations);
 
         assert!(
@@ -1852,7 +1856,7 @@ mod test {
         apply_level(&mut book, Side::Bid, 100.0, 5.0);
         assert_eq!(
             apply_level(&mut book, Side::Bid, 100.0, 0.0),
-            Some(UpdateResult::Close)
+            Some(UpdateResult::shallow(0))
         );
         assert_eq!(book.first_bids().len(), 0);
     }

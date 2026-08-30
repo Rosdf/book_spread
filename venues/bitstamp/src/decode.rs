@@ -194,7 +194,7 @@ fn apply_stage(book: &mut IncrementalBook, stage: &LevelStage) -> Option<UpdateR
 }
 
 /// Whether `apply_stage`'s result is worth publishing - the top of book moved.
-const fn stage_worth_publishing(merged: Option<UpdateResult>) -> bool {
+fn stage_worth_publishing(merged: Option<UpdateResult>) -> bool {
     worth_publishing(merged)
 }
 
@@ -853,7 +853,7 @@ mod test {
         apply_level(&mut book, Side::Bid, 100.0, 5.0);
         assert_eq!(
             apply_level(&mut book, Side::Bid, 100.0, 0.0),
-            Some(UpdateResult::Close)
+            Some(UpdateResult::shallow(0))
         );
         assert_eq!(book.first_bids().len(), 0);
     }

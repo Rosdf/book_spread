@@ -116,7 +116,8 @@ impl<K, V, const N: usize> HeaplessLinearMap<K, V, N> {
         }
     }
 
-    pub fn last(&self) -> Option<(&K, &V)> {
+    /// The worst (largest) entry, the one an insertion past the end would evict.
+    pub fn worst(&self) -> Option<(&K, &V)> {
         if self.is_empty() {
             None
         } else {
@@ -128,6 +129,22 @@ impl<K, V, const N: usize> HeaplessLinearMap<K, V, N> {
             let value = unsafe { self.values.get_unchecked(N - 1).assume_init_ref() };
             Some((key, value))
         }
+    }
+
+    /// The value at logical position `pos`, to read or to overwrite in place.
+    ///
+    /// Paired with [`Self::locate`], which is where a position worth holding on to comes
+    /// from: `Occupied(pos)` says the slot is there and the key in it is the one asked for.
+    ///
+    /// # Safety
+    /// `pos < self.len()`.
+    pub unsafe fn value_mut_unchecked(&mut self, pos: usize) -> &mut V {
+        debug_assert!(pos < self.len(), "position must be within bounds");
+
+        let slot = self.phys(pos);
+        // SAFETY: `slot` is within the live range `[base, N)` (per fn-level `# Safety`),
+        // so it is initialized.
+        unsafe { self.values.get_unchecked_mut(slot).assume_init_mut() }
     }
 
     pub const fn len(&self) -> usize {
@@ -147,6 +164,14 @@ impl<K, V, const N: usize> HeaplessLinearMap<K, V, N> {
         self.base + i
     }
 
+    /// Appends one entry at the worst end.
+    ///
+    /// Not the O(1) push it reads as: right-alignment means the whole run slides down a
+    /// slot to make room, so this costs `len` moves, and a loop of these costs `len` of
+    /// them each. It is here for [`Clone`] and [`Clone::clone_from`], which append into a
+    /// map that is still filling up; anything appending a batch wants
+    /// [`Self::extend_worst_unchecked`], which pays those moves once.
+    ///
     /// # Safety
     /// `key` should be grater then all elements in map and `self.base > 0`, so that there is
     /// a free slot at the front for the live range to grow into
@@ -155,17 +180,22 @@ impl<K, V, const N: usize> HeaplessLinearMap<K, V, N> {
         // `self.len() <= self.len()` trivially, and the caller guarantees the free slot
         // the shift needs (per fn-level `# Safety`).
         unsafe {
-            self.shift_left_and_insert(self.len(), key, value);
+            self.insert_at_unchecked(self.len(), key, value);
         }
     }
 
-    /// Shifts the elements in `[base, base + pos)` one slot to the left - down into the
-    /// free slot at the front - and writes `key`/`value` into the slot at logical `pos`
-    /// that this opens up.
+    /// Inserts `key`/`value` at logical position `pos`, shifting everything better than it
+    /// one slot to the left - down into the free slot at the front.
+    ///
+    /// Costs `pos` moves, not `len`: an insertion near the best end is nearly free, and
+    /// only one at the worst end pays for the whole run.
     ///
     /// # Safety
-    /// `pos <= self.len()` and `self.base > 0`.
-    unsafe fn shift_left_and_insert(&mut self, pos: usize, key: K, value: V) {
+    /// * `pos <= self.len()`;
+    /// * `!self.is_full()`, so there is a free slot at the front to shift into;
+    /// * `key` belongs at `pos`, i.e. it is greater than every key before it and less than
+    ///   the one currently there - what [`Self::locate`] reports as `Vacant(pos)`.
+    pub unsafe fn insert_at_unchecked(&mut self, pos: usize, key: K, value: V) {
         debug_assert!(pos <= self.len(), "insertion position must be within bounds");
         debug_assert!(self.base > 0, "caller must ensure there is spare capacity");
 
@@ -195,12 +225,14 @@ impl<K, V, const N: usize> HeaplessLinearMap<K, V, N> {
         }
     }
 
-    /// Removes and returns the entry at logical position `pos`, shifting everything
-    /// smaller than it one slot to the right so the live range stays right-aligned.
+    /// Removes and returns the entry at logical position `pos`, shifting everything better
+    /// than it one slot to the right so the live range stays right-aligned.
+    ///
+    /// Costs `pos` moves, the mirror of [`Self::insert_at_unchecked`].
     ///
     /// # Safety
     /// `pos < self.len()`.
-    unsafe fn remove_at_unchecked(&mut self, pos: usize) -> (K, V) {
+    pub unsafe fn remove_at_unchecked(&mut self, pos: usize) -> (K, V) {
         debug_assert!(pos < self.len(), "removal position must be within bounds");
 
         let base = self.base;
@@ -239,6 +271,91 @@ impl<K, V, const N: usize> HeaplessLinearMap<K, V, N> {
         // SAFETY: the map is non-empty (per fn-level `# Safety`), so `len() - 1` is a
         // valid logical position.
         unsafe { self.remove_at_unchecked(self.len() - 1) }
+    }
+
+
+    /// Moves the worst `count` entries out of the map, best-first, leaving the `len - count`
+    /// best ones behind.
+    ///
+    /// The survivors are shifted back into `[base, N)` when the returned iterator is
+    /// dropped - one `ptr::copy` per array for the whole batch, rather than the one per
+    /// entry that `count` separate evictions would cost.
+    ///
+    /// # Panics
+    ///
+    /// When `count` exceeds the number of entries held.
+    pub fn drain_worst(&mut self, count: usize) -> DrainWorst<'_, K, V, N> {
+        assert!(
+            count <= self.len(),
+            "cannot drain more entries than the map holds"
+        );
+
+        let survivors_start = self.base;
+        // The map disowns everything for as long as the drain is alive - the entries being
+        // handed out and the survivors alike - because it has no way to describe a run with
+        // a hole at its worst end. Leaking the iterator then leaks those entries, which is
+        // the one thing a leak is allowed to do; leaving `base` covering slots the drain has
+        // already moved out of would not be.
+        self.base = N;
+
+        DrainWorst {
+            next: N - count,
+            end: N,
+            survivors_start,
+            survivors_end: N - count,
+            parent: self,
+        }
+    }
+
+    /// Appends `entries` at the worst end of the map.
+    ///
+    /// One `ptr::copy` per array to open the room, then one write per entry - the batch
+    /// pays the `len` moves that [`Self::insert_last_unchecked`] would pay per entry.
+    ///
+    /// # Safety
+    ///
+    /// * `entries.len() <= N - self.len()`, so the run has room to grow into;
+    /// * every key yielded is greater than every key already held;
+    /// * the keys arrive best-first, i.e. ascending.
+    ///
+    /// An iterator that yields fewer entries than its [`ExactSizeIterator::len`] promised,
+    /// or that panics part-way through, is not a safety violation: the map is left holding
+    /// exactly the entries that did arrive.
+    pub unsafe fn extend_worst_unchecked(&mut self, entries: impl ExactSizeIterator<Item = (K, V)>) {
+        let count = entries.len();
+        debug_assert!(count <= self.base, "caller must ensure there is spare capacity");
+
+        let base = self.base;
+        let len = self.len();
+
+        // SAFETY: `count <= base` (per fn-level `# Safety`), so the destination
+        // `[base - count, N - count)` lies within the arrays, as does the source
+        // `[base, N)`. The two overlap, hence `ptr::copy` (not `copy_nonoverlapping`).
+        // The `count` slots the copy vacates at the worst end are filled in below.
+        unsafe {
+            let keys_ptr = self.keys.as_mut_ptr();
+            std::ptr::copy(keys_ptr.add(base), keys_ptr.add(base - count), len);
+
+            let values_ptr = self.values.as_mut_ptr();
+            std::ptr::copy(values_ptr.add(base), values_ptr.add(base - count), len);
+        }
+
+        // Disowned while the tail has a hole in it, for the same reason as in
+        // `drain_worst`, and put back by `FillWorst`'s `Drop` however this loop ends.
+        self.base = N;
+        let mut fill = FillWorst {
+            parent: self,
+            start: base - count,
+            filled: 0,
+            count,
+        };
+
+        // `take` because `ExactSizeIterator` is a safe trait to implement badly: an
+        // iterator that yields more than it promised must not write past the room made
+        // for it.
+        for (key, value) in entries.take(count) {
+            fill.write(key, value);
+        }
     }
 
     /// The value under `key`, or `None` when nothing is filed there.
@@ -288,6 +405,33 @@ impl<K, V, const N: usize> HeaplessLinearMap<K, V, N> {
     }
 }
 
+/// What a successful [`HeaplessLinearMap::insert`] reports: the logical position the key
+/// ended up at, and the pair evicted to make room for it - `None` unless the map was full.
+pub type Insertion<K, V> = (usize, Option<(K, V)>);
+
+/// What [`HeaplessLinearMap::locate`] found: a logical position, and whether the key asked
+/// about is the one already sitting at it.
+///
+/// Two variants rather than a `(usize, bool)`, because the position means different things
+/// in each - a slot to write through, or a slot to shift into - and a bool that says which
+/// is a bool that can be read backwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Position {
+    /// The key is held at this position.
+    Occupied(usize),
+    /// The key is not held; it belongs at this position, before whatever is there now.
+    Vacant(usize),
+}
+
+impl Position {
+    /// The position, whichever of the two it is.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Occupied(pos) | Self::Vacant(pos) => pos,
+        }
+    }
+}
+
 impl<K, V, const N: usize> Drop for HeaplessLinearMap<K, V, N> {
     fn drop(&mut self) {
         self.clear();
@@ -295,31 +439,27 @@ impl<K, V, const N: usize> Drop for HeaplessLinearMap<K, V, N> {
 }
 
 impl<K: Ord, V, const N: usize> HeaplessLinearMap<K, V, N> {
-    /// Inserts `value` under `key`, keeping the keys sorted. `Ok(Some(..))` is the pair this
-    /// replaced.
+    /// Inserts `value` under `key`, keeping the keys sorted.
+    ///
+    /// `Ok` carries the logical position `key` ended up at - what a caller that publishes
+    /// a prefix of the map needs in order to tell an update it has to send from one it can
+    /// drop - and the pair evicted to make room for it, if the map was full.
     ///
     /// # Errors
     ///
     /// The pair back, when the map is already full and `key` is not in it - there is nowhere
     /// to put it and no heap to grow into.
-    pub fn insert(&mut self, key: K, value: V) -> Result<Option<(K, V)>, (K, V)> {
-        let (pos, existing) = self.locate(&key);
-
-        if existing {
-            // SAFETY:
-            // `locate` reports `existing` only for a `pos` it found a key at, so
-            // `pos < self.len()` and this slot is initialized.
-            let v = unsafe { self.values.get_unchecked_mut(self.base + pos) };
-            // SAFETY:
-            // `v` is initialized, as above, and is about to be overwritten with a
-            // freshly written value below.
-            unsafe {
-                v.assume_init_drop();
+    pub fn insert(&mut self, key: K, value: V) -> Result<Insertion<K, V>, (K, V)> {
+        let pos = match self.locate(&key) {
+            Position::Occupied(pos) => {
+                // SAFETY:
+                // `Occupied(pos)` is only reported for a `pos` a key was found at, so
+                // `pos < self.len()`.
+                *unsafe { self.value_mut_unchecked(pos) } = value;
+                return Ok((pos, None));
             }
-            v.write(value);
-
-            return Ok(None);
-        }
+            Position::Vacant(pos) => pos,
+        };
 
         // `key` is not present yet, it needs to be inserted at `pos`, keeping
         // the array sorted ascending.
@@ -328,9 +468,9 @@ impl<K: Ord, V, const N: usize> HeaplessLinearMap<K, V, N> {
             // `pos <= self.len()` (`locate` scans the live range) and the map is not
             // full, so `self.base > 0`.
             unsafe {
-                self.shift_left_and_insert(pos, key, value);
+                self.insert_at_unchecked(pos, key, value);
             }
-            Ok(None)
+            Ok((pos, None))
         } else if pos == self.len() {
             // `key` is larger than every stored key, so it would become the
             // new largest entry: there is nothing smaller to evict for it.
@@ -346,40 +486,54 @@ impl<K: Ord, V, const N: usize> HeaplessLinearMap<K, V, N> {
             // we would have entered prev branch if pos == self.len(), so `pos` is still
             // within the shortened range; the eviction freed the slot the shift needs.
             unsafe {
-                self.shift_left_and_insert(pos, key, value);
+                self.insert_at_unchecked(pos, key, value);
             }
-            Ok(Some(evicted))
+            Ok((pos, Some(evicted)))
         }
     }
 
-    /// The position `key` belongs at, and whether the key already sitting there is `key`
-    /// itself. `(self.len(), false)` when every stored key is smaller.
+    /// Where `key` is, or where it would go: `Occupied(pos)` when it is already held at
+    /// `pos`, `Vacant(pos)` when it is not and belongs there. `Vacant(self.len())` when
+    /// every key held is smaller.
+    ///
+    /// The position is what [`Self::value_mut_unchecked`], [`Self::insert_at_unchecked`]
+    /// and [`Self::remove_at_unchecked`] take, so a caller that needs to decide between
+    /// them - update in place, or make room, or route the key elsewhere entirely - pays
+    /// for one search rather than one per branch.
     ///
     /// A forward scan rather than the binary search the sorted keys would allow. Over a
     /// map this small the binary search's ~log2(N) comparisons are a fixed cost paid on
     /// every call, while the scan stops at the first key that is not smaller: one or two
-    /// comparisons for the near-best insertions that dominate, degrading a step at a time
-    /// towards the worst case instead of cliffing to it. The same argument `remove` and
-    /// [`Self::get`] already make one function up.
-    fn locate(&self, key: &K) -> (usize, bool) {
+    /// comparisons for the near-best keys that dominate, degrading a step at a time
+    /// towards the worst case instead of cliffing to it. The same argument [`Self::get`]
+    /// already makes one function up.
+    pub fn locate(&self, key: &K) -> Position {
         for (pos, k) in self.keys().iter().enumerate() {
             match k.cmp(key) {
                 Ordering::Less => {}
-                Ordering::Equal => return (pos, true),
-                Ordering::Greater => return (pos, false),
+                Ordering::Equal => return Position::Occupied(pos),
+                Ordering::Greater => return Position::Vacant(pos),
             }
         }
 
-        (self.len(), false)
+        Position::Vacant(self.len())
     }
 
-    pub fn remove(&mut self, key: &K) -> Option<V> {
-        let pos = self.keys().iter().position(|k| *k == *key)?;
+    /// Removes `key`, returning the position it was removed from along with its value.
+    ///
+    /// The position is the one the entry had *before* the removal, so everything that was
+    /// worse than it has shifted down by one - which is what a caller republishing a
+    /// prefix of the map has to redraw.
+    pub fn remove(&mut self, key: &K) -> Option<(usize, V)> {
+        let Position::Occupied(pos) = self.locate(key) else {
+            return None;
+        };
+
         // SAFETY:
-        // `pos` came from searching `self.keys()`, the live range seen as a slice, so
+        // `Occupied(pos)` is only reported for a `pos` a key was found at, so
         // `pos < self.len()`.
         let (_, value) = unsafe { self.remove_at_unchecked(pos) };
-        Some(value)
+        Some((pos, value))
     }
 }
 
@@ -392,6 +546,199 @@ impl<K: Debug, V: Debug, const N: usize> Debug for HeaplessLinearMap<K, V, N> {
         }
 
         map.finish()
+    }
+}
+
+/// The iterator [`HeaplessLinearMap::drain_worst`] hands back: the entries it took, in
+/// ascending (best-first) order.
+///
+/// Whatever is left un-yielded when this is dropped is dropped with it, and the survivors
+/// are shifted back into place then - so the map is only whole again once the drain is.
+pub struct DrainWorst<'a, K, V, const N: usize> {
+    /// The entries still to hand out, at `[next, end)`; the two ends close towards each
+    /// other as they are taken from either side.
+    next: usize,
+    end: usize,
+    /// The entries the drain left behind, at `[survivors_start, survivors_end)`.
+    survivors_start: usize,
+    survivors_end: usize,
+    parent: &'a mut HeaplessLinearMap<K, V, N>,
+}
+
+impl<K, V, const N: usize> DrainWorst<'_, K, V, N> {
+    /// Moves the entry at physical index `slot` out of the map.
+    ///
+    /// # Safety
+    /// `slot` is within `[next, end)`, the entries drained but not yet handed out.
+    unsafe fn take(&mut self, slot: usize) -> (K, V) {
+        // SAFETY: the entries in `[next, end)` were live when the drain started and have
+        // not been read since (per fn-level `# Safety`), so `slot` is initialized and this
+        // is the only read of it.
+        unsafe {
+            let key = self.parent.keys.get_unchecked(slot).assume_init_read();
+            let value = self.parent.values.get_unchecked(slot).assume_init_read();
+            (key, value)
+        }
+    }
+
+    /// Slides the survivors up against the worst end and hands them back to the map.
+    fn restore(&mut self) {
+        let drained = N - self.survivors_end;
+        let len = self.survivors_end - self.survivors_start;
+
+        // SAFETY: the source `[survivors_start, survivors_end)` and the destination
+        // `[survivors_start + drained, N)` both lie within the arrays, and they overlap,
+        // hence `ptr::copy`. The source slots this leaves behind are excluded from the
+        // live range by the `base` written below.
+        unsafe {
+            let keys_ptr = self.parent.keys.as_mut_ptr();
+            std::ptr::copy(
+                keys_ptr.add(self.survivors_start),
+                keys_ptr.add(self.survivors_start + drained),
+                len,
+            );
+
+            let values_ptr = self.parent.values.as_mut_ptr();
+            std::ptr::copy(
+                values_ptr.add(self.survivors_start),
+                values_ptr.add(self.survivors_start + drained),
+                len,
+            );
+        }
+
+        self.parent.base = self.survivors_start + drained;
+    }
+}
+
+/// Only what is left to hand out: the entries themselves are the map's, spoken for by
+/// nothing while the drain is alive, and printing them would need a `K: Debug` bound that
+/// draining does not otherwise ask for.
+impl<K, V, const N: usize> Debug for DrainWorst<'_, K, V, N> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DrainWorst")
+            .field("remaining", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<K, V, const N: usize> Iterator for DrainWorst<'_, K, V, N> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == self.end {
+            return None;
+        }
+
+        let slot = self.next;
+        self.next += 1;
+
+        // SAFETY: `slot` was inside the map's live range when the drain started and lies
+        // in the not-yet-handed-out `[next, end)`, so it is initialized and this is the
+        // only read of it.
+        Some(unsafe { self.take(slot) })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+/// The worst end first, which is the order a deeper tier that is also kept sorted wants
+/// them in when it is grown from its own best end.
+impl<K, V, const N: usize> DoubleEndedIterator for DrainWorst<'_, K, V, N> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.next == self.end {
+            return None;
+        }
+
+        self.end -= 1;
+
+        // SAFETY: as in `next`, from the other end of the same range.
+        Some(unsafe { self.take(self.end) })
+    }
+}
+
+impl<K, V, const N: usize> ExactSizeIterator for DrainWorst<'_, K, V, N> {
+    fn len(&self) -> usize {
+        self.end - self.next
+    }
+}
+
+impl<K, V, const N: usize> Drop for DrainWorst<'_, K, V, N> {
+    fn drop(&mut self) {
+        /// Restores the map even if one of the destructors below panics, in which case the
+        /// entries not yet reached are leaked rather than left owned by a `base` that no
+        /// longer covers them.
+        struct Restore<'d, 'a, K, V, const N: usize>(&'d mut DrainWorst<'a, K, V, N>);
+
+        impl<K, V, const N: usize> Drop for Restore<'_, '_, K, V, N> {
+            fn drop(&mut self) {
+                self.0.restore();
+            }
+        }
+
+        let guard = Restore(self);
+        guard.0.by_ref().for_each(drop);
+    }
+}
+
+/// Holds the map together while [`HeaplessLinearMap::extend_worst_unchecked`] fills the room
+/// it made at the worst end, and closes whatever gap is left over when the fill ends - which
+/// is none at all in the normal case, and the tail of a short or panicking iterator otherwise.
+struct FillWorst<'a, K, V, const N: usize> {
+    parent: &'a mut HeaplessLinearMap<K, V, N>,
+    /// Physical index the run starts at, once it is full.
+    start: usize,
+    filled: usize,
+    count: usize,
+}
+
+impl<K, V, const N: usize> FillWorst<'_, K, V, N> {
+    fn write(&mut self, key: K, value: V) {
+        debug_assert!(self.filled < self.count, "no room was made for this entry");
+
+        let slot = N - self.count + self.filled;
+        // SAFETY: `slot < N`, and it is one of the slots the caller's `ptr::copy` vacated,
+        // so nothing is being overwritten.
+        unsafe {
+            self.parent.keys.get_unchecked_mut(slot).write(key);
+            self.parent.values.get_unchecked_mut(slot).write(value);
+        }
+
+        self.filled += 1;
+    }
+}
+
+impl<K, V, const N: usize> Drop for FillWorst<'_, K, V, N> {
+    fn drop(&mut self) {
+        let missing = self.count - self.filled;
+
+        if missing > 0 {
+            let end = N - missing;
+
+            // SAFETY: the run of entries that did arrive is `[start, end)` - the shifted
+            // survivors followed by `filled` new ones - and the destination
+            // `[start + missing, N)` is that run slid up against the worst end. Both lie
+            // within the arrays and they overlap, hence `ptr::copy`.
+            unsafe {
+                let keys_ptr = self.parent.keys.as_mut_ptr();
+                std::ptr::copy(
+                    keys_ptr.add(self.start),
+                    keys_ptr.add(self.start + missing),
+                    end - self.start,
+                );
+
+                let values_ptr = self.parent.values.as_mut_ptr();
+                std::ptr::copy(
+                    values_ptr.add(self.start),
+                    values_ptr.add(self.start + missing),
+                    end - self.start,
+                );
+            }
+        }
+
+        self.parent.base = self.start + missing;
     }
 }
 
@@ -444,7 +791,7 @@ impl<'a, K, V, const N: usize> IntoIterator for &'a HeaplessLinearMap<K, V, N> {
 
 #[cfg(test)]
 mod test {
-    use super::HeaplessLinearMap;
+    use super::{HeaplessLinearMap, Position};
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -470,9 +817,9 @@ mod test {
     #[test]
     fn fills_then_rejects_new_largest() {
         let mut m = empty::<3>();
-        assert_eq!(m.insert(5, 50), Ok(None));
-        assert_eq!(m.insert(1, 10), Ok(None));
-        assert_eq!(m.insert(3, 30), Ok(None));
+        assert_eq!(m.insert(5, 50), Ok((0, None)));
+        assert_eq!(m.insert(1, 10), Ok((0, None)));
+        assert_eq!(m.insert(3, 30), Ok((1, None)));
         assert_eq!(m.keys(), &[1, 3, 5]);
         // full now; inserting something larger than max should be rejected
         assert_eq!(m.insert(10, 100), Err((10, 100)));
@@ -488,7 +835,7 @@ mod test {
         assert_eq!(m.keys(), &[1, 5, 9]);
         // 3 is smaller than max (9) -> evict 9, insert 3 sorted
         let evicted = m.insert(3, 30).unwrap();
-        assert_eq!(evicted, Some((9, 90)));
+        assert_eq!(evicted, (1, Some((9, 90))), "3 goes in at 1, 9 comes out");
         assert_eq!(m.keys(), &[1, 3, 5]);
     }
 
@@ -497,9 +844,9 @@ mod test {
         let mut m = empty::<3>();
         m.insert(5, 50).unwrap();
         let r = m.insert(5, 999).unwrap();
-        assert_eq!(r, None);
+        assert_eq!(r, (0, None), "the value at 0 is replaced, nothing is evicted");
         assert_eq!(m.keys(), &[5]);
-        assert_eq!(m.last(), Some((&5, &999)));
+        assert_eq!(m.worst(), Some((&5, &999)));
     }
 
     #[test]
@@ -508,9 +855,9 @@ mod test {
         m.insert(1, 10).unwrap();
         m.insert(2, 20).unwrap();
         let r = m.insert(1, 111).unwrap();
-        assert_eq!(r, None);
+        assert_eq!(r, (0, None), "a full map still has room for a value it already keys");
         assert_eq!(m.keys(), &[1, 2]);
-        assert_eq!(m.last(), Some((&2, &20)));
+        assert_eq!(m.worst(), Some((&2, &20)));
     }
 
     #[test]
@@ -518,9 +865,9 @@ mod test {
         let mut m = empty::<3>();
         assert_eq!(m.get(&1), None, "an empty map has nothing under any key");
 
-        assert_eq!(m.insert(5, 50), Ok(None));
-        assert_eq!(m.insert(1, 10), Ok(None));
-        assert_eq!(m.insert(3, 30), Ok(None));
+        assert_eq!(m.insert(5, 50), Ok((0, None)));
+        assert_eq!(m.insert(1, 10), Ok((0, None)));
+        assert_eq!(m.insert(3, 30), Ok((1, None)));
 
         assert_eq!(m.get(&1), Some(&10), "the first key");
         assert_eq!(m.get(&3), Some(&30), "a middle key");
@@ -530,7 +877,7 @@ mod test {
 
         // The entries shift on a remove, so what `get` reads has to follow them rather than
         // the position the key went in at.
-        assert_eq!(m.remove(&1), Some(10));
+        assert_eq!(m.remove(&1), Some((0, 10)));
         assert_eq!(m.get(&1), None);
         assert_eq!(m.get(&3), Some(&30));
         assert_eq!(m.get(&5), Some(&50));
@@ -541,8 +888,8 @@ mod test {
     #[test]
     fn get_takes_a_borrowed_key() {
         let mut m: HeaplessLinearMap<String, i32, 2> = HeaplessLinearMap::new();
-        assert_eq!(m.insert("btcusdt".to_owned(), 1), Ok(None));
-        assert_eq!(m.insert("ethusdt".to_owned(), 2), Ok(None));
+        assert_eq!(m.insert("btcusdt".to_owned(), 1), Ok((0, None)));
+        assert_eq!(m.insert("ethusdt".to_owned(), 2), Ok((1, None)));
 
         assert_eq!(m.get("btcusdt"), Some(&1));
         assert_eq!(m.get("ethusdt"), Some(&2));
@@ -560,7 +907,7 @@ mod test {
         assert_eq!(m.remove(&99), None);
         assert_eq!(m.len(), 2);
         assert_eq!(m.keys(), &[1, 2]);
-        assert_eq!(m.last(), Some((&2, &20)));
+        assert_eq!(m.worst(), Some((&2, &20)));
     }
 
     #[test]
@@ -577,10 +924,10 @@ mod test {
         m.insert(2, 20).unwrap();
         m.insert(3, 30).unwrap();
 
-        assert_eq!(m.remove(&3), Some(30));
+        assert_eq!(m.remove(&3), Some((2, 30)));
         assert_eq!(m.len(), 2);
         assert_eq!(m.keys(), &[1, 2]);
-        assert_eq!(m.last(), Some((&2, &20)));
+        assert_eq!(m.worst(), Some((&2, &20)));
     }
 
     #[test]
@@ -590,10 +937,10 @@ mod test {
         m.insert(2, 20).unwrap();
         m.insert(3, 30).unwrap();
 
-        assert_eq!(m.remove(&1), Some(10));
+        assert_eq!(m.remove(&1), Some((0, 10)));
         assert_eq!(m.len(), 2);
         assert_eq!(m.keys(), &[2, 3]);
-        assert_eq!(m.last(), Some((&3, &30)));
+        assert_eq!(m.worst(), Some((&3, &30)));
     }
 
     #[test]
@@ -604,17 +951,17 @@ mod test {
         m.insert(3, 30).unwrap();
         m.insert(4, 40).unwrap();
 
-        assert_eq!(m.remove(&2), Some(20));
+        assert_eq!(m.remove(&2), Some((1, 20)));
         assert_eq!(m.len(), 3);
         assert_eq!(m.keys(), &[1, 3, 4]);
         // values must have shifted in lock-step with keys, not just keys
-        assert_eq!(m.last(), Some((&4, &40)));
-        assert_eq!(m.remove(&3), Some(30));
+        assert_eq!(m.worst(), Some((&4, &40)));
+        assert_eq!(m.remove(&3), Some((1, 30)), "3 shifted down when 2 left");
         assert_eq!(m.keys(), &[1, 4]);
-        assert_eq!(m.last(), Some((&4, &40)));
-        assert_eq!(m.remove(&1), Some(10));
+        assert_eq!(m.worst(), Some((&4, &40)));
+        assert_eq!(m.remove(&1), Some((0, 10)));
         assert_eq!(m.keys(), &[4]);
-        assert_eq!(m.last(), Some((&4, &40)));
+        assert_eq!(m.worst(), Some((&4, &40)));
     }
 
     #[test]
@@ -624,11 +971,11 @@ mod test {
         m.insert(2, 20).unwrap();
         m.insert(3, 30).unwrap();
 
-        assert_eq!(m.remove(&2), Some(20));
-        assert_eq!(m.remove(&1), Some(10));
-        assert_eq!(m.remove(&3), Some(30));
+        assert_eq!(m.remove(&2), Some((1, 20)));
+        assert_eq!(m.remove(&1), Some((0, 10)));
+        assert_eq!(m.remove(&3), Some((0, 30)));
         assert_eq!(m.len(), 0);
-        assert_eq!(m.last(), None);
+        assert_eq!(m.worst(), None);
         // removing again from the now-empty map is a no-op
         assert_eq!(m.remove(&3), None);
     }
@@ -640,12 +987,297 @@ mod test {
         m.insert(2, 20).unwrap();
         assert!(m.is_full());
 
-        assert_eq!(m.remove(&1), Some(10));
+        assert_eq!(m.remove(&1), Some((0, 10)));
         assert!(!m.is_full());
 
-        assert_eq!(m.insert(3, 30), Ok(None));
+        assert_eq!(m.insert(3, 30), Ok((1, None)));
         assert_eq!(m.keys(), &[2, 3]);
-        assert_eq!(m.last(), Some((&3, &30)));
+        assert_eq!(m.worst(), Some((&3, &30)));
+    }
+
+    #[test]
+    fn locate_reports_a_position_and_whether_the_key_is_at_it() {
+        let mut m = empty::<4>();
+        assert_eq!(m.locate(&1), Position::Vacant(0), "an empty map");
+
+        m.insert(2, 20).unwrap();
+        m.insert(4, 40).unwrap();
+        m.insert(6, 60).unwrap();
+
+        assert_eq!(m.locate(&2), Position::Occupied(0));
+        assert_eq!(m.locate(&4), Position::Occupied(1));
+        assert_eq!(m.locate(&6), Position::Occupied(2));
+        assert_eq!(m.locate(&1), Position::Vacant(0), "better than everything");
+        assert_eq!(m.locate(&5), Position::Vacant(2), "between two held keys");
+        assert_eq!(m.locate(&9), Position::Vacant(3), "worse than everything");
+        assert_eq!(m.locate(&9).index(), m.len());
+    }
+
+    #[test]
+    fn a_located_position_can_be_written_through() {
+        let mut m = empty::<3>();
+        m.insert(1, 10).unwrap();
+        m.insert(2, 20).unwrap();
+
+        let Position::Occupied(pos) = m.locate(&2) else {
+            panic!("the key is held");
+        };
+        // SAFETY: `pos` came from an `Occupied`, so it is within bounds.
+        *unsafe { m.value_mut_unchecked(pos) } = 222;
+
+        assert_eq!(m.get(&2), Some(&222));
+        assert_eq!(m.keys(), &[1, 2], "and the keys are untouched");
+    }
+
+    #[test]
+    fn locate_then_insert_at_puts_the_key_where_it_was_told() {
+        let mut m = empty::<4>();
+        m.insert(1, 10).unwrap();
+        m.insert(3, 30).unwrap();
+
+        let Position::Vacant(pos) = m.locate(&2) else {
+            panic!("the key is not held");
+        };
+        assert_eq!(pos, 1);
+        // SAFETY: `pos` is where `locate` says 2 belongs, and the map is not full.
+        unsafe {
+            m.insert_at_unchecked(pos, 2, 20);
+        }
+
+        assert_eq!(m.keys(), &[1, 2, 3]);
+        assert_eq!(m.iter().collect::<Vec<_>>(), vec![(&1, &10), (&2, &20), (&3, &30)]);
+    }
+
+    #[test]
+    fn remove_at_takes_the_entry_the_position_names() {
+        let mut m = empty::<4>();
+        m.insert(1, 10).unwrap();
+        m.insert(2, 20).unwrap();
+        m.insert(3, 30).unwrap();
+
+        // SAFETY: 1 < 3 entries held.
+        let taken = unsafe { m.remove_at_unchecked(1) };
+        assert_eq!(taken, (2, 20));
+        assert_eq!(m.keys(), &[1, 3]);
+
+        // SAFETY: 1 < 2 entries held.
+        assert_eq!(unsafe { m.remove_at_unchecked(1) }, (3, 30));
+        // SAFETY: 0 < 1 entry held.
+        assert_eq!(unsafe { m.remove_at_unchecked(0) }, (1, 10));
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn a_drain_can_be_taken_from_its_worst_end() {
+        let mut m = empty::<4>();
+        m.insert(1, 10).unwrap();
+        m.insert(2, 20).unwrap();
+        m.insert(3, 30).unwrap();
+        m.insert(4, 40).unwrap();
+
+        // Worst-first is the order a sorted deeper tier grown from its front wants.
+        assert_eq!(
+            m.drain_worst(3).rev().collect::<Vec<_>>(),
+            vec![(4, 40), (3, 30), (2, 20)]
+        );
+        assert_eq!(m.keys(), &[1]);
+    }
+
+    #[test]
+    fn a_drain_taken_from_both_ends_hands_out_each_entry_once() {
+        let counter = Rc::new(Cell::new(0));
+        let mut m = empty_tracked::<4>();
+        for key in 1..=4 {
+            m.insert(key, DropTracker(Rc::clone(&counter))).unwrap();
+        }
+
+        {
+            let mut drain = m.drain_worst(4);
+            assert_eq!(drain.len(), 4);
+            let (best, _) = drain.next().expect("four to hand out");
+            let (worst, _) = drain.next_back().expect("three left");
+            assert_eq!((best, worst), (1, 4));
+            assert_eq!(drain.len(), 2, "and the two in the middle are still owed");
+        }
+
+        // The two handed out were dropped by this test, the two left over by the drain.
+        assert_eq!(counter.get(), 4);
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn drain_worst_takes_the_largest_entries_best_first() {
+        let mut m = empty::<4>();
+        m.insert(1, 10).unwrap();
+        m.insert(2, 20).unwrap();
+        m.insert(3, 30).unwrap();
+        m.insert(4, 40).unwrap();
+
+        assert_eq!(
+            m.drain_worst(2).collect::<Vec<_>>(),
+            vec![(3, 30), (4, 40)],
+            "the two worst, in ascending order"
+        );
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.keys(), &[1, 2]);
+        assert_eq!(m.worst(), Some((&2, &20)));
+    }
+
+    #[test]
+    fn drain_worst_leaves_the_survivors_usable() {
+        let mut m = empty::<3>();
+        m.insert(1, 10).unwrap();
+        m.insert(2, 20).unwrap();
+        m.insert(3, 30).unwrap();
+
+        m.drain_worst(2).for_each(drop);
+
+        // The capacity the drain freed is the capacity an insert finds.
+        assert_eq!(m.insert(9, 90), Ok((1, None)));
+        assert_eq!(m.insert(5, 50), Ok((1, None)));
+        assert_eq!(m.keys(), &[1, 5, 9]);
+        assert_eq!(m.insert(7, 70), Ok((2, Some((9, 90)))));
+        assert_eq!(m.keys(), &[1, 5, 7]);
+    }
+
+    #[test]
+    fn drain_worst_of_nothing_and_of_everything() {
+        let mut m = empty::<3>();
+        m.insert(1, 10).unwrap();
+        m.insert(2, 20).unwrap();
+
+        assert_eq!(m.drain_worst(0).count(), 0);
+        assert_eq!(m.keys(), &[1, 2], "a zero-count drain is a no-op");
+
+        assert_eq!(m.drain_worst(2).collect::<Vec<_>>(), vec![(1, 10), (2, 20)]);
+        assert!(m.is_empty());
+        assert_eq!(m.worst(), None);
+
+        assert_eq!(m.drain_worst(0).count(), 0, "and so is one on an empty map");
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot drain more entries than the map holds")]
+    fn drain_worst_rejects_a_count_past_the_end() {
+        let mut m = empty::<3>();
+        m.insert(1, 10).unwrap();
+        m.drain_worst(2).for_each(drop);
+    }
+
+    #[test]
+    fn dropping_a_drain_early_drops_what_it_did_not_yield() {
+        let counter = Rc::new(Cell::new(0));
+        let mut m = empty_tracked::<4>();
+        m.insert(1, DropTracker(Rc::clone(&counter))).unwrap();
+        m.insert(2, DropTracker(Rc::clone(&counter))).unwrap();
+        m.insert(3, DropTracker(Rc::clone(&counter))).unwrap();
+        m.insert(4, DropTracker(Rc::clone(&counter))).unwrap();
+
+        {
+            let mut drain = m.drain_worst(3);
+            drop(drain.next().expect("three entries were drained"));
+            assert_eq!(counter.get(), 1, "only the one that was handed out");
+        }
+        assert_eq!(counter.get(), 3, "the other two go with the drain");
+
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.keys(), &[1]);
+        drop(m);
+        assert_eq!(counter.get(), 4, "and the survivor is still the map's to drop");
+    }
+
+    #[test]
+    fn extend_worst_appends_a_batch_at_the_worst_end() {
+        let mut m = empty::<4>();
+        m.insert(1, 10).unwrap();
+
+        // SAFETY: 3 <= 4 - 1 spare slots, and 2 < 3 < 4 are ascending and all greater
+        // than the only key held.
+        unsafe {
+            m.extend_worst_unchecked([(2, 20), (3, 30), (4, 40)].into_iter());
+        }
+
+        assert_eq!(m.keys(), &[1, 2, 3, 4]);
+        assert_eq!(m.len(), 4);
+        assert!(m.is_full());
+        assert_eq!(m.worst(), Some((&4, &40)));
+        assert_eq!(m.get(&3), Some(&30), "values follow their keys");
+    }
+
+    #[test]
+    fn extend_worst_into_an_empty_map_and_by_nothing() {
+        let mut m = empty::<3>();
+
+        // SAFETY: the map is empty, so there is room and nothing to be greater than.
+        unsafe {
+            m.extend_worst_unchecked([(1, 10), (2, 20)].into_iter());
+        }
+        assert_eq!(m.keys(), &[1, 2]);
+
+        // SAFETY: an empty batch needs no room and violates no ordering.
+        unsafe {
+            m.extend_worst_unchecked(std::iter::empty());
+        }
+        assert_eq!(m.keys(), &[1, 2], "an empty batch is a no-op");
+    }
+
+    #[test]
+    fn extend_worst_keeps_only_what_a_short_iterator_gave() {
+        /// An `ExactSizeIterator` that promises three entries and yields one.
+        struct Liar(Option<(i32, i32)>);
+
+        impl Iterator for Liar {
+            type Item = (i32, i32);
+
+            fn next(&mut self) -> Option<Self::Item> {
+                self.0.take()
+            }
+        }
+
+        impl ExactSizeIterator for Liar {
+            fn len(&self) -> usize {
+                3
+            }
+        }
+
+        let mut m = empty::<4>();
+        m.insert(1, 10).unwrap();
+
+        // SAFETY: room was reserved for the three it claims, and the one it yields is
+        // greater than the key held.
+        unsafe {
+            m.extend_worst_unchecked(Liar(Some((2, 20))));
+        }
+
+        assert_eq!(m.keys(), &[1, 2], "the room it did not use is given back");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.worst(), Some((&2, &20)));
+        assert_eq!(m.insert(3, 30), Ok((2, None)));
+        assert_eq!(m.keys(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn a_drain_and_an_extend_are_inverses() {
+        let mut m = empty::<4>();
+        m.insert(2, 20).unwrap();
+        m.insert(1, 10).unwrap();
+        m.insert(4, 40).unwrap();
+        m.insert(3, 30).unwrap();
+
+        let spilled = m.drain_worst(2).collect::<Vec<_>>();
+        assert_eq!(m.keys(), &[1, 2]);
+
+        // SAFETY: exactly the entries just drained, in the order they came out, going back
+        // into the room their removal made.
+        unsafe {
+            m.extend_worst_unchecked(spilled.into_iter());
+        }
+
+        assert_eq!(m.keys(), &[1, 2, 3, 4]);
+        assert_eq!(
+            m.iter().collect::<Vec<_>>(),
+            vec![(&1, &10), (&2, &20), (&3, &30), (&4, &40)]
+        );
     }
 
     #[test]
