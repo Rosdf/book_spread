@@ -72,11 +72,37 @@ impl<K: ClientSink> Session<K> {
         }
     }
 
+    /// Offers the current book and then drives the transport, so the bytes just queued reach
+    /// the wire in this pass rather than on a later lap of the run loop.
+    ///
+    /// The mirror of [`poll_progress`](Self::poll_progress), and the order is the difference:
+    /// that one runs on laps with nothing new to offer, where driving first may open the
+    /// window before the offer. Here there is something new, so the offer goes first.
+    pub(super) fn deliver_and_flush(
+        &mut self,
+        cx: &mut Context<'_>,
+        session_ctx: &impl SessionCtx,
+    ) -> State {
+        self.deliver(cx, session_ctx);
+        if self.state.is_ended() {
+            return State::Ended;
+        }
+
+        // Unconditionally, not only when `deliver` queued something: a client whose window is
+        // shut has nothing to flush, but this is the only thing that will ever read its
+        // WINDOW_UPDATE, so skipping it is what strands one.
+        self.state = self.sink.poll_progress(cx);
+        self.state
+    }
+
     /// Drives this client's transport, then offers it anything it is missing.
     ///
     /// Called for every session on every lap of the broadcaster's loop. In the steady state it
     /// registers one interest and returns, which is what makes polling every client from one
     /// task cheap enough to be the design rather than a compromise.
+    ///
+    /// The mirror of [`deliver_and_flush`](Self::deliver_and_flush), which runs the two steps in
+    /// the other order for the lap that has something new to offer.
     pub(super) fn poll_progress(
         &mut self,
         cx: &mut Context<'_>,

@@ -404,9 +404,9 @@ impl<C: ClientHandshake> Broadcaster<C> {
         let mut ended = false;
         for session in &mut self.sessions {
             // At most a refcount bump, never a re-encode and never a copy: every session on
-            // this symbol is offered the one buffer the encoder just produced.
-            session.deliver(cx, ctx);
-            ended |= session.ended();
+            // this symbol is offered the one buffer the encoder just produced, then driven
+            // while its connection is still hot.
+            ended |= session.deliver_and_flush(cx, ctx).is_ended();
         }
         ended
     }
@@ -428,7 +428,7 @@ impl<C: ClientHandshake> Broadcaster<C> {
         self.pending_joins.fetch_sub(1, Ordering::Relaxed);
 
         let mut session = join.into_session();
-        session.deliver(cx, &self.ctx);
+        session.deliver_and_flush(cx, &self.ctx);
 
         if !session.ended() {
             self.sessions.push(session);
