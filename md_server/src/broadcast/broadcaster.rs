@@ -475,6 +475,13 @@ fn encode_book(
         .map(|(venue_idx, guard)| (*venue_idx, &**guard))
         .collect();
 
+    // The only case reachable today, and worth its own path: with one venue there is nothing
+    // to merge, so this writes straight out of the reader's own book and skips `MergedBook`
+    // (and the per-level venue lookup it costs) entirely.
+    if let [(venue, book)] = sides.as_slice() {
+        return encoder.encode_single(*venue, book.asks(), book.bids(), buffers);
+    }
+
     merged.refill(&sides);
     encoder.encode(merged.asks(), merged.bids(), buffers)
 }
