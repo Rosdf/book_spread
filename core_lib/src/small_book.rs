@@ -9,6 +9,7 @@ pub struct SmallBook {
 }
 
 impl SmallBook {
+    pub const LEVELS: usize = DEPTH;
     pub fn asks(&self) -> &[Level] {
         &self.asks
     }

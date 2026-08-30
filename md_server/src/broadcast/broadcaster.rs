@@ -8,6 +8,7 @@
 //! bookkeeping and [`crate::client`] for what backpressure does to it.
 
 use super::session::{Session, SessionCtx};
+use crate::broadcast::book_merger::MergedBook;
 use crate::broadcast::queue::BroadcasterRx;
 use crate::client::{ClientHandshake, ClientSink};
 use crate::encode::{BookEncoder, BufferProvider};
@@ -15,6 +16,7 @@ use crate::registry::events::{Claim, RegistryTx};
 use bytes::{Bytes, BytesMut};
 use core_lib::connector::book_publisher::BookReader;
 use core_lib::instrument::Instrument;
+use core_lib::small_book::SmallBook;
 use md_wire::grpc::{RejectCode, Rejected, VenueIdx};
 use std::future::poll_fn;
 use std::sync::Arc;
@@ -204,6 +206,10 @@ enum Wake<C> {
 #[derive(Debug)]
 pub(crate) struct Broadcaster<C: ClientHandshake> {
     instrument: Instrument,
+    /// The catalogue's index for this symbol's venue, stamped on every level this broadcaster
+    /// sends. Kept rather than consumed by the encoder, because it is also what names the
+    /// venue's book to the merge.
+    venue_idx: VenueIdx,
     reader: BookReader,
     /// One entry per attached client, offered the book in order on every update.
     sessions: Vec<Session<C::Sink>>,
@@ -214,6 +220,9 @@ pub(crate) struct Broadcaster<C: ClientHandshake> {
     /// Holds this symbol's encoded identity and the buffer every frame is cut from, so a
     /// book costs neither an allocation nor a re-encode of `venue`/`symbol`.
     encoder: BookEncoder,
+    /// The scratch both merged sides are built in, reused on every publish so a book still
+    /// costs no allocation of its own.
+    merged: MergedBook,
     ctx: Ctx,
     registry: RegistryTx<C>,
 }
@@ -240,15 +249,18 @@ impl<C: ClientHandshake> Broadcaster<C> {
         let mut pool = BufferPool::new();
         // The venue index comes from the registry rather than from `instrument`: it is the
         // catalogue's numbering, and an `Instrument` knows only which `Venue` it belongs to.
-        let encoder = BookEncoder::new(venue_idx);
+        let encoder = BookEncoder::new(&[venue_idx]);
+        let mut merged = MergedBook::new();
         let latest = {
             let book = reader.get_last();
-            encoder.encode(book.asks(), book.bids(), &mut pool)
+            encode_book(&encoder, &mut merged, venue_idx, &book, &mut pool)
         };
 
         Self {
             encoder,
+            merged,
             instrument,
+            venue_idx,
             reader,
             sessions: Vec::new(),
             joins,
@@ -327,12 +339,17 @@ impl<C: ClientHandshake> Broadcaster<C> {
     fn publish(&mut self, cx: &mut Context<'_>) -> bool {
         let frame = {
             let book = self.reader.get_last();
-            // Encoded straight out of the slot - there is no intermediate `BookUpdate` to
-            // copy the levels into. The guard pins a slot in the shared buffer, so it is
-            // dropped at the end of this block, before anything is offered to a client, and
-            // must never be held across an await.
-            self.encoder
-                .encode(book.asks(), book.bids(), &mut self.ctx.pool)
+            // Encoded out of the slot through the merge, which copies the levels it keeps -
+            // there is no intermediate `BookUpdate`. The guard pins a slot in the shared
+            // buffer, so it is dropped at the end of this block, before anything is offered
+            // to a client, and must never be held across an await.
+            encode_book(
+                &self.encoder,
+                &mut self.merged,
+                self.venue_idx,
+                &book,
+                &mut self.ctx.pool,
+            )
         };
 
         self.ctx.new_framed(frame);
@@ -380,6 +397,25 @@ impl<C: ClientHandshake> Broadcaster<C> {
             Arc::clone(&self.pending_joins),
         )
     }
+}
+
+/// Merges `book` into `merged` and encodes the result as one whole frame.
+///
+/// A free function rather than a method because [`Broadcaster::start`] has these as locals
+/// while [`Broadcaster::publish`] has them as fields - and because taking them apart is what
+/// keeps the `reader` borrow the caller holds disjoint from the scratch and the pool.
+///
+/// One book in the slice today: a broadcaster owns one reader, so there is nothing to
+/// interleave and [`MergedBook::refill`] takes its single-venue path.
+fn encode_book(
+    encoder: &BookEncoder,
+    merged: &mut MergedBook,
+    venue_idx: VenueIdx,
+    book: &SmallBook,
+    buffers: &mut impl BufferProvider,
+) -> Bytes {
+    merged.refill(&[(venue_idx, book)]);
+    encoder.encode(merged.asks(), merged.bids(), buffers)
 }
 
 /// Resolves `f` against the current task's [`Context`], for a call site that has one to give
@@ -708,15 +744,8 @@ mod test {
         source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[]));
         let frame = client.next_frame().await;
 
-        let encoder = crate::encode::BookEncoder::new(VenueIdx::new(0));
-        let expected = encoder.encode(
-            &[core_lib::incremental_book::Level::new(
-                core_lib::positive_f64::PositiveF64::new(100.5).expect("positive"),
-                core_lib::positive_f64::PositiveF64::new(1.25).expect("positive"),
-            )],
-            &[],
-            &mut TestBufferProvider,
-        );
+        let encoder = crate::encode::BookEncoder::new(&[VenueIdx::new(0)]);
+        let expected = encoder.encode(&[level(100.5, 1.25)], &[], &mut TestBufferProvider);
         assert_eq!(
             frame, expected,
             "what a client is given is exactly the buffer the encoder produced, header included"
@@ -859,7 +888,7 @@ mod test {
     /// long this runs.
     #[test]
     fn a_long_run_of_books_cycles_a_fixed_set_of_buffers() {
-        let encoder = crate::encode::BookEncoder::new(VenueIdx::new(0));
+        let encoder = crate::encode::BookEncoder::new(&[VenueIdx::new(0)]);
         let asks = [level(100.5, 1.25)];
         let bids = [level(99.5, 2.0)];
 
@@ -882,11 +911,13 @@ mod test {
         );
     }
 
-    /// A book level, out of two prices a test spelled as plain floats.
-    fn level(price: f64, size: f64) -> core_lib::incremental_book::Level {
-        core_lib::incremental_book::Level::new(
+    /// A merged book level on the one venue these tests serve, out of two prices a test
+    /// spelled as plain floats.
+    fn level(price: f64, size: f64) -> crate::broadcast::book_merger::MergedLevel {
+        crate::broadcast::book_merger::MergedLevel::new(
             core_lib::positive_f64::PositiveF64::new(price).expect("positive"),
             core_lib::positive_f64::PositiveF64::new(size).expect("positive"),
+            VenueIdx::new(0),
         )
     }
 
