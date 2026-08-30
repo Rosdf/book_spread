@@ -308,6 +308,29 @@ impl Shared {
     /// and with the Release `fetch_and` in `Notifier::drop`, so a waiter that
     /// observes either flag also sees the work behind it.
     fn try_resolve(&self) -> Poll<Option<()>> {
+        // Relaxed peek first: a poller with nothing to do - called once per lap
+        // for every parked venue by `poll_readers` - would otherwise take the
+        // line exclusive on every single lap. Both flags set means neither
+        // branch below can fire no matter how stale this read is: there is
+        // nothing this call could legitimately claim, so skipping the RMW loses
+        // nothing that a `Relaxed` load could see anyway.
+        //
+        // This is safe to skip even when it is stale - even when a notify() or
+        // shutdown lands in the instant right after this load - because
+        // `Waiter::wait` never trusts a single `try_resolve`: it calls this
+        // again after `register`, and *that* call always falls through to the
+        // real Acquire `fetch_or` below whenever there is anything to see,
+        // stale or not. A notification racing the fast path here is still
+        // sitting in `state` for that second call - or for `notify`'s own
+        // direct wake of the now-registered waker - to pick up. Nothing here
+        // may itself skip the real RMW while the shared state actually holds
+        // work; that assumption is `Waiter::wait`'s to keep, not this
+        // function's.
+        let peek = self.state.load(Ordering::Relaxed);
+        if peek & NOT_PENDING != 0 && peek & NOTIFIER_ACTIVE != 0 {
+            return Poll::Pending;
+        }
+
         let old = self.state.fetch_or(NOT_PENDING, Ordering::Acquire);
 
         if old & NOT_PENDING == 0 {

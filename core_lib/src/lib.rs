@@ -5,6 +5,9 @@ pub use all_venues::Venue;
 pub mod atomic_waker;
 pub mod heapless_linear_map;
 pub mod incremental_book;
+// Reaches `connector`, which does not exist under `--cfg loom` for the same reason `net` and
+// `venue` are gated below.
+#[cfg(not(loom))]
 pub mod instrument;
 pub mod panic;
 pub mod positive_f64;
