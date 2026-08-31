@@ -116,7 +116,7 @@ async fn catalogue_of(addr: SocketAddr) -> proto::CatalogueResponse {
 
 /// The venue index a level from `venue` carries, as both sides agree on it.
 fn venue_idx(venue: Venue) -> u32 {
-    md_server::test_util::TestCatalogue::venue_idx(venue).get()
+    md_server::test_util::venue_idx(venue)
 }
 
 async fn next_book(books: &mut Streaming<proto::BookUpdate>) -> proto::BookUpdate {

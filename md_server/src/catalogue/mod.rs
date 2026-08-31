@@ -1,4 +1,5 @@
-//! What this server advertises: the venue index table, and every instrument it will serve.
+//! What this server advertises: every instrument it will serve, and which venue quotes each
+//! side of it.
 //!
 //! Loaded once, before the server starts serving, and then split in two by
 //! [`crate::server::serve`] - the encoded `GetCatalogue` response the accept loop hands out,
@@ -6,9 +7,15 @@
 //! symbols. Nothing reloads it: there is no refresh task and no publish channel, so everything
 //! downstream holds a value rather than a subscription.
 //!
-//! Identity on the wire is numeric because of this file. A client reads the two tables once,
-//! and everything after that is a [`CatalogueIdx`] on a subscribe and a [`VenueIdx`] on every
-//! level.
+//! Identity on the wire is numeric, but only half of that numbering comes from here. An
+//! instrument's [`CatalogueIdx`] - what a client names on a subscribe - is this file's, and it
+//! is the entry's *position*: the first `[[instruments]]` table is index zero, the second is
+//! one, and so on, so the file never spells an index out and cannot contradict itself about
+//! one. A venue's index is not this file's at all; a catalogue names its venues by name, and
+//! [`crate::encode::venue_idx`] is what turns that into the number a `Level` carries.
+//!
+//! An entry whose venue this build does not carry still consumes its position, so dropping one
+//! never renumbers the entries after it.
 //!
 //! Nothing here validates the shape of a symbol. A catalogue entry naming a symbol no venue
 //! lists is advertised as written and simply never resolves, which is the same state as a
@@ -19,17 +26,15 @@ pub(crate) mod encode;
 pub(crate) mod source;
 
 use core_lib::Venue;
-use core_lib::heapless_linear_map::HeaplessLinearMap;
 use core_lib::map::{InternalHashMap, new_internal_map};
 use core_lib::shared_string::SharedString;
-use md_wire::grpc::{CatalogueIdx, VenueIdx};
+use md_wire::grpc::CatalogueIdx;
 use serde::Deserialize;
 
 /// One venue's spelling of one instrument.
 #[derive(Debug, Clone)]
 pub(crate) struct CataloguePair {
     venue: Venue,
-    venue_idx: VenueIdx,
     /// The venue's own spelling, case-sensitive and never normalised - the same contract
     /// `core_lib`'s instrument registry keeps.
     symbol: SharedString,
@@ -40,36 +45,20 @@ impl CataloguePair {
         self.venue
     }
 
-    pub(crate) fn venue_idx(&self) -> VenueIdx {
-        self.venue_idx
-    }
-
     pub(crate) fn symbol(&self) -> &str {
         &self.symbol
     }
 }
 
-/// The venue table: at most one entry per [`Venue`] this build carries.
-///
-/// A linear map rather than a hash map because the size is a compile-time fact - two entries
-/// today - so this allocates nothing and hashes nothing, and a scan over two keys beats both.
-type VenueTable = HeaplessLinearMap<VenueIdx, Venue, { Venue::COUNT }>;
-
 /// What the server advertises, as loaded.
 #[derive(Debug, Default)]
 pub(crate) struct Catalogue {
-    venues: VenueTable,
     /// Instrument indices are the catalogue file's own and may be sparse, so this one stays a
     /// map.
     instruments: InternalHashMap<CatalogueIdx, Box<[CataloguePair]>>,
 }
 
 impl Catalogue {
-    /// The venue table, for the one thing that has to write it out.
-    pub(crate) fn venues(&self) -> &VenueTable {
-        &self.venues
-    }
-
     pub(crate) fn instruments(&self) -> &InternalHashMap<CatalogueIdx, Box<[CataloguePair]>> {
         &self.instruments
     }
@@ -81,82 +70,53 @@ impl Catalogue {
 
     /// Builds a catalogue directly, for a test that needs one without a file.
     ///
-    /// The venue table is every [`Venue`] this build carries, at its position in
-    /// [`Venue::ALL`], so a test and the server agree on which index means which venue
-    /// without either spelling it out.
+    /// Indices are named rather than positional here, unlike a loaded file: a test that wants
+    /// a sparse or out-of-order catalogue says so.
     ///
     /// Nothing here is validated - the caller owes it the two rules [`TryFrom<RawCatalogue>`]
     /// enforces: one venue at most once per instrument, and one `(venue, symbol)` pair across
     /// the whole catalogue.
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn for_test(instruments: &[(u32, &[(Venue, &str)])]) -> Self {
-        let mut venues = VenueTable::new();
-        for (position, venue) in Venue::ALL.into_iter().enumerate() {
-            let idx = u32::try_from(position).expect("this build carries a handful of venues");
-            venues
-                .insert(VenueIdx::new(idx), venue)
-                .map_err(|_| ())
-                .expect("the table is sized for every venue this build carries");
-        }
-
         let mut built = new_internal_map();
         for &(idx, pairs) in instruments {
             let carried: Vec<CataloguePair> = pairs
                 .iter()
                 .map(|&(venue, symbol)| CataloguePair {
                     venue,
-                    venue_idx: venue_idx_of(&venues, venue),
                     symbol: SharedString::from(symbol),
                 })
                 .collect();
             built.insert(CatalogueIdx::new(idx), carried.into_boxed_slice());
         }
 
-        Self {
-            venues,
-            instruments: built,
-        }
+        Self { instruments: built }
     }
 }
 
 /// A catalogue file, as written.
 ///
 /// ```toml
-/// [[venues]]
-/// idx  = 0
-/// name = "binance_spot"
-///
 /// [[instruments]]
-/// idx   = 0
 /// pairs = [{ venue = "binance_spot", symbol = "BTCUSDT" }]
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawCatalogue {
     #[serde(default)]
-    venues: Box<[RawVenue]>,
-    #[serde(default)]
     instruments: Box<[RawInstrument]>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawVenue {
-    idx: u32,
-    name: SharedString,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawInstrument {
-    idx: u32,
     pairs: Box<[RawPair]>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPair {
-    venue: u32,
+    venue: SharedString,
     symbol: SharedString,
 }
 
@@ -167,17 +127,6 @@ struct RawPair {
 /// do with it. These are the ones that make the file self-contradictory instead.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BuildCatalogueError {
-    #[error("venue idx {} is used by two venues", .0.get())]
-    DuplicateVenueIdx(VenueIdx),
-    #[error("venue {} appears twice", .0.as_str())]
-    DuplicateVenue(Venue),
-    #[error(
-        "the venue table has more entries than this build has venues ({})",
-        Venue::COUNT
-    )]
-    TooManyVenues,
-    #[error("instrument idx {} is used by two instruments", .0.get())]
-    DuplicateInstrumentIdx(CatalogueIdx),
     /// One broadcaster serves one instrument's whole pair list, holding one book reader per
     /// venue in it. Two pairs on one venue would want two readers on the same connector,
     /// which is a contradiction rather than a deeper book.
@@ -210,45 +159,28 @@ impl TryFrom<RawCatalogue> for Catalogue {
     type Error = BuildCatalogueError;
 
     fn try_from(raw: RawCatalogue) -> Result<Self, Self::Error> {
-        let mut venues = VenueTable::new();
-        for entry in raw.venues {
-            let idx = VenueIdx::new(entry.idx);
-            let Some(venue) = Venue::parse(&entry.name) else {
-                // Advertising it would promise a stream this build cannot open, so it - and
-                // every instrument under it, below - is dropped rather than carried.
-                tracing::warn!(
-                    venue = entry.name.as_str(),
-                    idx = entry.idx,
-                    "dropping a catalogue venue this build does not carry"
-                );
-                continue;
-            };
-            if venues.get(&idx).is_some() {
-                return Err(BuildCatalogueError::DuplicateVenueIdx(idx));
-            }
-            if venues.iter().any(|(_, known)| *known == venue) {
-                return Err(BuildCatalogueError::DuplicateVenue(venue));
-            }
-            venues
-                .insert(idx, venue)
-                .map_err(|_| BuildCatalogueError::TooManyVenues)?;
-        }
-
         let mut instruments = new_internal_map();
-        // Every pair carried so far, so a symbol named by two instruments is caught here
-        // rather than as a connector refusal on the first client to ask for the second one.
-        // A `Vec` scanned linearly: a catalogue is tens of entries read once at startup.
+        // Every pair carried so far and the instrument that claimed it, so a symbol named by
+        // two instruments is caught here rather than as a connector refusal on the first
+        // client to ask for the second one. A `Vec` scanned linearly: a catalogue is tens of
+        // entries read once at startup.
         let mut claimed: Vec<(Venue, SharedString, CatalogueIdx)> = Vec::new();
-        for entry in raw.instruments {
-            let idx = CatalogueIdx::new(entry.idx);
+
+        for (position, entry) in raw.instruments.into_iter().enumerate() {
+            // The entry's position *is* its index, and an entry dropped below still consumes
+            // one, so an unservable venue never renumbers the entries after it.
+            let idx = CatalogueIdx::new(
+                u32::try_from(position)
+                    .expect("a catalogue file is tens of entries, not four billion"),
+            );
             let mut pairs: Vec<CataloguePair> = Vec::with_capacity(entry.pairs.len());
             let mut carried = true;
+
             for pair in entry.pairs {
-                let venue_idx = VenueIdx::new(pair.venue);
-                let Some(&venue) = venues.get(&venue_idx) else {
+                let Some(venue) = Venue::parse(pair.venue.as_str()) else {
                     tracing::warn!(
-                        instrument = entry.idx,
-                        venue_idx = pair.venue,
+                        instrument = idx.get(),
+                        venue = pair.venue.as_str(),
                         symbol = pair.symbol.as_str(),
                         "dropping a catalogue instrument whose venue this build does not carry"
                     );
@@ -272,48 +204,29 @@ impl TryFrom<RawCatalogue> for Catalogue {
                 claimed.push((venue, pair.symbol.clone(), idx));
                 pairs.push(CataloguePair {
                     venue,
-                    venue_idx,
                     symbol: pair.symbol,
                 });
             }
             if !carried {
                 continue;
             }
-            if instruments.insert(idx, pairs.into_boxed_slice()).is_some() {
-                return Err(BuildCatalogueError::DuplicateInstrumentIdx(idx));
-            }
+            instruments.insert(idx, pairs.into_boxed_slice());
         }
 
-        Ok(Self {
-            venues,
-            instruments,
-        })
+        Ok(Self { instruments })
     }
-}
-
-/// The index `venue` sits at in `venues`.
-///
-/// The table is small and keyed the other way round - by index, which is what the encoder and
-/// a pair's own `venue_idx` need - so this is the scan that answers the reverse question.
-#[cfg(any(test, feature = "test-util"))]
-fn venue_idx_of(venues: &VenueTable, venue: Venue) -> VenueIdx {
-    venues
-        .iter()
-        .find_map(|(idx, known)| (*known == venue).then_some(*idx))
-        .expect("every venue this build carries is in the table")
 }
 
 #[cfg(test)]
 mod test {
     use super::{BuildCatalogueError, Catalogue, RawCatalogue};
     use core_lib::Venue;
-    use md_wire::grpc::{CatalogueIdx, VenueIdx};
+    use md_wire::grpc::CatalogueIdx;
 
     fn parse(toml: &str) -> Result<Catalogue, BuildCatalogueError> {
         let raw: RawCatalogue = toml::from_str(toml).expect("the fixture is well-formed TOML");
         Catalogue::try_from(raw)
     }
-
 
     /// One broadcaster holds one book reader per venue in its instrument, so a venue named
     /// twice under one instrument is a contradiction rather than a deeper book.
@@ -321,13 +234,14 @@ mod test {
     fn a_venue_named_twice_under_one_instrument_is_refused() {
         let err = parse(
             r#"
-            [[venues]]
-            idx = 0
-            name = "binance_spot"
+            [[instruments]]
+            pairs = [{ venue = "bitstamp", symbol = "btcusd" }]
 
             [[instruments]]
-            idx = 1
-            pairs = [{ venue = 0, symbol = "BTCUSDT" }, { venue = 0, symbol = "ETHUSDT" }]
+            pairs = [
+                { venue = "binance_spot", symbol = "BTCUSDT" },
+                { venue = "binance_spot", symbol = "ETHUSDT" },
+            ]
             "#,
         )
         .expect_err("one instrument cannot be quoted twice on one venue");
@@ -350,20 +264,14 @@ mod test {
     fn one_pair_named_by_two_instruments_is_refused() {
         let err = parse(
             r#"
-            [[venues]]
-            idx = 0
-            name = "binance_spot"
-            [[venues]]
-            idx = 1
-            name = "bitstamp"
+            [[instruments]]
+            pairs = [{ venue = "binance_spot", symbol = "BTCUSDT" }]
 
             [[instruments]]
-            idx = 1
-            pairs = [{ venue = 0, symbol = "BTCUSDT" }]
-
-            [[instruments]]
-            idx = 2
-            pairs = [{ venue = 1, symbol = "btcusd" }, { venue = 0, symbol = "BTCUSDT" }]
+            pairs = [
+                { venue = "bitstamp", symbol = "btcusd" },
+                { venue = "binance_spot", symbol = "BTCUSDT" },
+            ]
             "#,
         )
         .expect_err("two instruments cannot both carry binance_spot/BTCUSDT");
@@ -374,7 +282,7 @@ mod test {
         );
         assert_eq!(
             err.to_string(),
-            "binance_spot/BTCUSDT is named by instruments 1 and 2"
+            "binance_spot/BTCUSDT is named by instruments 0 and 1"
         );
     }
 
@@ -384,16 +292,11 @@ mod test {
     fn one_spelling_shared_by_two_venues_is_carried() {
         let catalogue = parse(
             r#"
-            [[venues]]
-            idx = 0
-            name = "binance_spot"
-            [[venues]]
-            idx = 1
-            name = "bitstamp"
-
             [[instruments]]
-            idx = 0
-            pairs = [{ venue = 0, symbol = "BTCUSD" }, { venue = 1, symbol = "BTCUSD" }]
+            pairs = [
+                { venue = "binance_spot", symbol = "BTCUSD" },
+                { venue = "bitstamp", symbol = "BTCUSD" },
+            ]
             "#,
         )
         .expect("a symbol is only claimed per venue");
@@ -408,125 +311,63 @@ mod test {
         );
     }
 
-    /// The ordinary shape: a venue table and instruments filed under the file's own indices,
-    /// which need not be dense.
+    /// The ordinary shape: instruments filed under their position in the file, each pair
+    /// naming its venue by name and keeping that venue's own spelling of the symbol.
     #[test]
-    fn a_catalogue_carries_the_files_own_indices() {
+    fn a_catalogue_files_instruments_under_their_position() {
         let catalogue = parse(
             r#"
-            [[venues]]
-            idx = 0
-            name = "binance_spot"
-            [[venues]]
-            idx = 3
-            name = "bitstamp"
+            [[instruments]]
+            pairs = [{ venue = "bitstamp", symbol = "ethusd" }]
 
             [[instruments]]
-            idx = 7
-            pairs = [{ venue = 0, symbol = "BTCUSDT" }, { venue = 3, symbol = "btcusd" }]
+            pairs = [
+                { venue = "binance_spot", symbol = "BTCUSDT" },
+                { venue = "bitstamp", symbol = "btcusd" },
+            ]
             "#,
         )
         .expect("the fixture is a valid catalogue");
 
-        assert_eq!(
-            catalogue.venues().get(&VenueIdx::new(3)),
-            Some(&Venue::Bitstamp)
-        );
+        assert_eq!(catalogue.instruments().len(), 2);
         let pairs = catalogue
             .instruments()
-            .get(&CatalogueIdx::new(7))
-            .expect("the instrument is carried");
+            .get(&CatalogueIdx::new(1))
+            .expect("the second entry is index one");
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].symbol(), "BTCUSDT");
         assert_eq!(pairs[0].venue(), Venue::BinanceSpot);
-        assert_eq!(pairs[1].venue_idx(), VenueIdx::new(3));
+        assert_eq!(pairs[1].symbol(), "btcusd");
+        assert_eq!(pairs[1].venue(), Venue::Bitstamp);
     }
 
     /// A venue this build does not carry cannot be served, so it is dropped - and so is every
     /// instrument that names it, since a surviving entry must always have a `Venue` to probe
-    /// with.
+    /// with. The dropped entry keeps its position, so the entries after it are not renumbered
+    /// out from under a client that already read the catalogue.
     #[test]
     fn a_venue_this_build_does_not_carry_takes_its_instruments_with_it() {
         let catalogue = parse(
             r#"
-            [[venues]]
-            idx = 0
-            name = "binance_spot"
-            [[venues]]
-            idx = 1
-            name = "kraken"
-
             [[instruments]]
-            idx = 0
-            pairs = [{ venue = 0, symbol = "BTCUSDT" }]
+            pairs = [{ venue = "binance_spot", symbol = "BTCUSDT" }]
             [[instruments]]
-            idx = 1
-            pairs = [{ venue = 1, symbol = "XBTUSD" }]
+            pairs = [{ venue = "kraken", symbol = "XBTUSD" }]
+            [[instruments]]
+            pairs = [{ venue = "bitstamp", symbol = "btcusd" }]
             "#,
         )
         .expect("an unknown venue is dropped rather than fatal");
 
-        assert_eq!(catalogue.venues().len(), 1);
-        assert_eq!(catalogue.instruments().len(), 1);
+        assert_eq!(catalogue.instruments().len(), 2);
         assert!(catalogue.instruments().contains_key(&CatalogueIdx::new(0)));
-    }
-
-    /// A file that contradicts itself is refused rather than silently half-loaded: two
-    /// entries under one index means a client's subscribe would name something ambiguous.
-    #[test]
-    fn a_repeated_index_is_refused() {
-        let venue = parse(
-            r#"
-            [[venues]]
-            idx = 0
-            name = "binance_spot"
-            [[venues]]
-            idx = 0
-            name = "bitstamp"
-            "#,
+        assert!(
+            !catalogue.instruments().contains_key(&CatalogueIdx::new(1)),
+            "the kraken entry is dropped"
         );
-        assert!(matches!(
-            venue,
-            Err(BuildCatalogueError::DuplicateVenueIdx(_))
-        ));
-
-        let instrument = parse(
-            r#"
-            [[venues]]
-            idx = 0
-            name = "binance_spot"
-
-            [[instruments]]
-            idx = 4
-            pairs = [{ venue = 0, symbol = "BTCUSDT" }]
-            [[instruments]]
-            idx = 4
-            pairs = [{ venue = 0, symbol = "ETHUSDT" }]
-            "#,
+        assert!(
+            catalogue.instruments().contains_key(&CatalogueIdx::new(2)),
+            "but it still consumes index one, so the entry after it keeps index two"
         );
-        assert!(matches!(
-            instrument,
-            Err(BuildCatalogueError::DuplicateInstrumentIdx(_))
-        ));
-    }
-
-    /// One venue under two indices is the same contradiction from the other side: a level
-    /// would have two right answers for which venue quoted it.
-    #[test]
-    fn one_venue_under_two_indices_is_refused() {
-        let repeated = parse(
-            r#"
-            [[venues]]
-            idx = 0
-            name = "binance_spot"
-            [[venues]]
-            idx = 1
-            name = "BINANCE_SPOT"
-            "#,
-        );
-        assert!(matches!(
-            repeated,
-            Err(BuildCatalogueError::DuplicateVenue(Venue::BinanceSpot))
-        ));
     }
 }

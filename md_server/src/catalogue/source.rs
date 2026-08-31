@@ -104,13 +104,11 @@ mod test {
         std::fs::write(
             &path,
             r#"
-            [[venues]]
-            idx = 0
-            name = "binance_spot"
+            [[instruments]]
+            pairs = [{ venue = "bitstamp", symbol = "btcusd" }]
 
             [[instruments]]
-            idx = 1
-            pairs = [{ venue = 0, symbol = "BTCUSDT" }]
+            pairs = [{ venue = "binance_spot", symbol = "BTCUSDT" }]
             "#,
         )
         .expect("the temp file is writable");
@@ -120,7 +118,7 @@ mod test {
             .expect("the fixture is a valid catalogue");
         assert!(
             loaded.instruments().contains_key(&CatalogueIdx::new(1)),
-            "the file's own index is what a client will name"
+            "an entry's position in the file is what a client will name"
         );
 
         std::fs::write(&path, "this is not toml = = =").expect("the temp file is writable");

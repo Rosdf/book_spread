@@ -13,7 +13,6 @@
 
 use core_lib::Venue;
 use core_lib::positive_f64::PositiveF64;
-use md_wire::grpc::VenueIdx;
 use std::cmp::Ordering;
 
 use core_lib::incremental_book::Level as BookLevel;
@@ -24,11 +23,11 @@ use core_lib::small_book::SmallBook;
 pub(super) struct MergedLevel {
     size: PositiveF64,
     price: PositiveF64,
-    venue: VenueIdx,
+    venue: Venue,
 }
 
 impl MergedLevel {
-    pub(super) fn new(price: PositiveF64, size: PositiveF64, venue: VenueIdx) -> Self {
+    pub(super) fn new(price: PositiveF64, size: PositiveF64, venue: Venue) -> Self {
         Self { size, price, venue }
     }
 
@@ -40,7 +39,7 @@ impl MergedLevel {
         self.price
     }
 
-    pub(super) fn venue(&self) -> VenueIdx {
+    pub(super) fn venue(&self) -> Venue {
         self.venue
     }
 }
@@ -52,7 +51,7 @@ impl MergedLevel {
 type MergedSide = heapless::Vec<MergedLevel, { SmallBook::LEVELS }>;
 
 /// The head of each venue's remaining levels on one side, in the order the caller gave them.
-type Heads<'a> = heapless::Vec<(VenueIdx, &'a [BookLevel]), { Venue::COUNT }>;
+type Heads<'a> = heapless::Vec<(Venue, &'a [BookLevel]), { Venue::COUNT }>;
 
 /// Both merged sides, reused across publishes.
 ///
@@ -98,7 +97,7 @@ impl MergedBook {
     ///
     /// More than [`SmallBook::LEVELS`] levels available across the venues means the best ten
     /// overall, not ten per venue.
-    pub(super) fn refill(&mut self, books: &[(VenueIdx, &SmallBook)]) {
+    pub(super) fn refill(&mut self, books: &[(Venue, &SmallBook)]) {
         self.asks.clear();
         self.bids.clear();
 
@@ -116,7 +115,7 @@ impl MergedBook {
 }
 
 /// The single-venue path: `levels` is already the answer, minus the venue tag.
-fn copy_side(out: &mut MergedSide, venue: VenueIdx, levels: &[BookLevel]) {
+fn copy_side(out: &mut MergedSide, venue: Venue, levels: &[BookLevel]) {
     out.extend(
         levels
             .iter()
@@ -132,7 +131,7 @@ fn copy_side(out: &mut MergedSide, venue: VenueIdx, levels: &[BookLevel]) {
 /// tie go to the earlier venue in `books`.
 fn merge_side(
     out: &mut MergedSide,
-    books: &[(VenueIdx, &SmallBook)],
+    books: &[(Venue, &SmallBook)],
     side: fn(&SmallBook) -> &[BookLevel],
     better: Ordering,
 ) {
@@ -180,11 +179,11 @@ fn best_head(heads: &Heads<'_>, better: Ordering) -> Option<usize> {
 mod test {
     use super::{MergedBook, MergedLevel};
     use crate::test_util::book;
+    use crate::venue::Venue;
     use core_lib::small_book::SmallBook;
-    use md_wire::grpc::VenueIdx;
 
-    const FIRST: VenueIdx = VenueIdx::new(0);
-    const SECOND: VenueIdx = VenueIdx::new(1);
+    const FIRST: Venue = Venue::BinanceSpot;
+    const SECOND: Venue = Venue::Bitstamp;
 
     /// A `SmallBook` the only way there is to build one: refilled from an `IncrementalBook`.
     fn small(asks: &[(f64, f64)], bids: &[(f64, f64)]) -> SmallBook {
@@ -209,10 +208,10 @@ mod test {
     }
 
     /// `(price, size, venue)` for each level, which is everything a level carries.
-    fn seen(levels: &[MergedLevel]) -> Vec<(f64, f64, u32)> {
+    fn seen(levels: &[MergedLevel]) -> Vec<(f64, f64, Venue)> {
         levels
             .iter()
-            .map(|level| (level.price().get(), level.size().get(), level.venue().get()))
+            .map(|level| (level.price().get(), level.size().get(), level.venue()))
             .collect()
     }
 
@@ -225,12 +224,12 @@ mod test {
 
         assert_eq!(
             seen(merged.asks()),
-            vec![(100.5, 1.25, 1), (101.0, 2.0, 1)],
+            vec![(100.5, 1.25, SECOND), (101.0, 2.0, SECOND)],
             "asks stay ascending and carry the venue they were merged under"
         );
         assert_eq!(
             seen(merged.bids()),
-            vec![(99.5, 2.0, 1), (99.0, 4.0, 1)],
+            vec![(99.5, 2.0, SECOND), (99.0, 4.0, SECOND)],
             "bids stay descending"
         );
     }
@@ -246,20 +245,20 @@ mod test {
         assert_eq!(
             seen(merged.asks()),
             vec![
-                (100.0, 1.0, 0),
-                (101.0, 2.0, 1),
-                (102.0, 1.0, 0),
-                (103.0, 2.0, 1),
+                (100.0, 1.0, FIRST),
+                (101.0, 2.0, SECOND),
+                (102.0, 1.0, FIRST),
+                (103.0, 2.0, SECOND),
             ],
             "the merged asks ascend across both venues"
         );
         assert_eq!(
             seen(merged.bids()),
             vec![
-                (99.0, 1.0, 0),
-                (98.0, 2.0, 1),
-                (97.0, 1.0, 0),
-                (96.0, 2.0, 1),
+                (99.0, 1.0, FIRST),
+                (98.0, 2.0, SECOND),
+                (97.0, 1.0, FIRST),
+                (96.0, 2.0, SECOND),
             ],
             "the merged bids descend across both venues"
         );
@@ -277,12 +276,12 @@ mod test {
 
         assert_eq!(
             seen(merged.asks()),
-            vec![(100.0, 1.0, 0), (100.0, 2.0, 1)],
+            vec![(100.0, 1.0, FIRST), (100.0, 2.0, SECOND)],
             "a tie goes to the earlier venue, so the bytes are the same on every run"
         );
         assert_eq!(
             seen(merged.bids()),
-            vec![(99.0, 1.0, 0), (99.0, 2.0, 1)],
+            vec![(99.0, 1.0, FIRST), (99.0, 2.0, SECOND)],
         );
     }
 
@@ -295,8 +294,8 @@ mod test {
 
         merged.refill(&[(FIRST, &empty()), (SECOND, &quoting)]);
 
-        assert_eq!(seen(merged.asks()), vec![(100.0, 1.0, 1)]);
-        assert_eq!(seen(merged.bids()), vec![(99.0, 1.0, 1)]);
+        assert_eq!(seen(merged.asks()), vec![(100.0, 1.0, SECOND)]);
+        assert_eq!(seen(merged.bids()), vec![(99.0, 1.0, SECOND)]);
     }
 
     #[test]
@@ -330,12 +329,12 @@ mod test {
         );
         assert_eq!(
             seen(merged.asks()).first().copied(),
-            Some((100.0, 1.0, 0)),
+            Some((100.0, 1.0, FIRST)),
             "and they are the best ten"
         );
         assert_eq!(
             seen(merged.asks()).last().copied(),
-            Some((109.0, 1.0, 1)),
+            Some((109.0, 1.0, SECOND)),
         );
     }
 
@@ -350,7 +349,7 @@ mod test {
         merged.refill(&[(FIRST, &deep)]);
         merged.refill(&[(SECOND, &shallow)]);
 
-        assert_eq!(seen(merged.asks()), vec![(200.0, 5.0, 1)]);
+        assert_eq!(seen(merged.asks()), vec![(200.0, 5.0, SECOND)]);
         assert!(
             merged.bids().is_empty(),
             "the previous book's bids must not survive a refill"

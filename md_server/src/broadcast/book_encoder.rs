@@ -3,16 +3,15 @@
 //!
 //! The obvious way to produce an `md.v1.BookUpdate` is to fill a [`BookUpdate`] and
 //! call `encode_to_vec`. That costs a malloc/free pair per book, two traversals (one for
-//! `encoded_len`, one for the encode), a copy of every level out of the reader's slot into
-//! the scratch, and a re-encode of each level's venue index, of which a broadcaster only ever
-//! writes the handful its catalogue entry names.
+//! `encoded_len`, one for the encode) and a copy of every level out of the reader's slot into
+//! the scratch.
 //!
 //! None of that is necessary, because the message is completely deterministic. Every field
 //! tag is `<= 15`, so every key is a single byte; a book carries at most [`MAX_DEPTH`] levels
-//! a side; and the venues a broadcaster can quote are fixed for its life, so each encoded
-//! `Level.venue_idx` suffix can be built once and appended after that level's two doubles. So
-//! the encoder holds those suffixes once and appends the levels straight out of the merge
-//! into storage it already owns.
+//! a side; and a `Level.venue_idx` is one byte of key and one of varint, whatever the venue -
+//! [`crate::encode::venue_idx`] numbers venues from one and the build refuses to grow past
+//! what a single varint byte holds. So a level's body has one length, known at compile time,
+//! and the encoder appends the levels straight out of the merge into storage it already owns.
 //!
 //! That storage is a small pool of whole buffers, not a fresh allocation per book. A frame is
 //! a `Bytes` that owns the buffer it was frozen from, so a client that is behind pins the
@@ -29,7 +28,8 @@
 //! What keeps it honest is this module's `the_hand_encoder_agrees_with_prost` test, which encodes a
 //! spread of books both ways and asserts the bytes are equal. The one rule that is easy to
 //! miss is proto3 default elision: prost omits a scalar field equal to its default, so a
-//! `double` field that is `0.0` is not written at all. [`PositiveF64`] permits `+0.0`
+//! `double` field that is `0.0` is not written at all. A `venue_idx` is never one of these -
+//! that is what numbering venues from one buys. [`PositiveF64`] permits `+0.0`
 //! (`is_sign_positive` is true for it), so a level with a zero price or size is reachable and
 //! the rule has to be replicated - see [`BookEncoder::put_side`]. The same rule applies to
 //! `spread`: a locked book, where the best ask equals the best bid, produces a `0.0` spread
@@ -39,13 +39,12 @@
 //! [`PositiveF64`]: core_lib::positive_f64::PositiveF64
 
 use super::book_merger::MergedLevel;
-use crate::encode::put_uint32;
+use crate::encode::MAX_VENUE_IDX_ENCODED_LEN;
 use bytes::{BufMut as _, Bytes, BytesMut};
 use core_lib::Venue;
-use core_lib::heapless_linear_map::HeaplessLinearMap;
 use core_lib::incremental_book::Level as BookLevel;
 use core_lib::small_book::SmallBook;
-use md_wire::grpc::{MESSAGE_PREFIX, VenueIdx, put_message_prefix};
+use md_wire::grpc::{MESSAGE_PREFIX, put_message_prefix};
 
 /// Levels a side, matching `SmallBook`'s depth. Bounds the size of the reusable buffer, and
 /// checked against in [`BookEncoder::encode`] - that bound is what the `expect` there relies
@@ -69,75 +68,37 @@ const LEVEL_VENUE_FIELD: u32 = 3;
 const SPREAD_LEN: usize = 9;
 
 /// A level's two scalars at full width: each a one-byte key and eight little-endian bytes.
-/// What a level's body is, before its venue suffix and before proto3 elides a zero.
+/// What a level's body is, before its `venue_idx` and before proto3 elides a zero.
 const LEVEL_SCALARS: usize = 18;
 
 pub(super) trait BufferProvider {
     fn get_buffer(&mut self, capacity: usize) -> BytesMut;
 }
 
-/// Encodes one symbol's merged books, recycling its storage across every one of them.
+/// Encodes one symbol's merged books into buffers it borrows from a [`BufferProvider`].
 ///
-/// One per broadcaster, holding the suffix of every venue that broadcaster can quote: a
-/// merged book's levels no longer share one venue, so the identity is looked up per level
-/// rather than being the encoder's own.
+/// Stateless: a level's venue travels on the level itself, and every venue encodes to the
+/// same width, so there is nothing per-broadcaster left to hold.
 #[derive(Debug)]
-pub(super) struct BookEncoder {
-    /// The encoded `Level.venue_idx` field - key, then the index as a varint - appended after
-    /// each level's price and size, one entry per venue this broadcaster serves. A suffix is
-    /// *empty* for venue index zero: proto3 elides a scalar equal to its default, so writing
-    /// anything there would stop these bytes being prost's.
-    ///
-    /// A linear map rather than a hash map for the same reason the catalogue's venue table is
-    /// one - at most [`Venue::COUNT`] entries, known at compile time, so a scan over two keys
-    /// on the per-level path beats hashing and allocates nothing.
-    venue_suffix: HeaplessLinearMap<VenueIdx, Box<[u8]>, { Venue::COUNT }>,
-    /// The largest a level's body (`price` + `size` + `venue_suffix`) can be, taken over the
-    /// *widest* venue suffix. Bounds the one-byte length varint every level's key is followed
-    /// by - see the `debug_assert!` in [`BookEncoder::new`] - and, through
-    /// [`BookEncoder::encode`], the capacity a frame asks the pool for, which is an upper
-    /// bound rather than an exact size once venues of different widths share a book.
-    level_body_max: u8,
-}
+pub(super) struct BookEncoder;
 
 impl BookEncoder {
-    /// `venue_ids` is every venue whose levels this encoder will be asked to write - the
-    /// venues' indices in the catalogue, which is the only thing that knows them, since a
-    /// book carries no identity itself and neither does an `Instrument`. Passing one that is
-    /// never quoted costs an unused entry; leaving one out that is quoted is a panic in
-    /// [`BookEncoder::encode`].
-    pub(super) fn new(venue_ids: &[VenueIdx]) -> Self {
-        let mut map = HeaplessLinearMap::new();
-        let mut max_suffix: usize = 0;
-
-        for idx in venue_ids {
-            // Built with prost rather than by hand: this runs once per broadcaster, so there is
-            // nothing to win by open-coding it, and borrowing prost's own varint keeps a large
-            // index correct by construction - including the elided zero.
-            let mut venue_suffix = Vec::new();
-            put_uint32(&mut venue_suffix, LEVEL_VENUE_FIELD, idx.get());
-            max_suffix = usize::max(max_suffix, venue_suffix.len());
-
-            map.insert(*idx, venue_suffix.into_boxed_slice())
-                // Only reachable with more distinct venues than this build carries, which the
-                // catalogue's own venue table - the source of every `VenueIdx` - cannot name.
-                .map_err(|_| ())
-                .expect("a catalogue names at most one index per venue");
-        }
-
-        let level_body_max = LEVEL_SCALARS + max_suffix;
-        debug_assert!(
-            level_body_max < 0x80,
-            "a level's body must stay a one-byte length varint - a venue index is at most a \
-             five-byte varint, so this holds for every catalogue this server can load"
+    /// A level's body at full width: `price`, `size` and `venue_idx`, before proto3 elides a
+    /// zero price or size. The same for every level of every book, which is what lets the
+    /// one-byte length varint be written before the body rather than patched in after it.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the assert above the cast is what rules the truncation out"
+    )]
+    const LEVEL_BODY: u8 = {
+        let body = LEVEL_SCALARS + MAX_VENUE_IDX_ENCODED_LEN;
+        assert!(
+            body < 0x80,
+            "a level's body must stay under the varint continuation bit, so its length is the \
+             single byte `put_side` writes in front of it"
         );
-
-        Self {
-            venue_suffix: map,
-            level_body_max: u8::try_from(level_body_max)
-                .expect("checked above: level_body_max < 0x80"),
-        }
-    }
+        body as u8
+    };
 
     /// Encodes one book into a whole gRPC length-prefixed message, best level first on each
     /// side.
@@ -147,7 +108,6 @@ impl BookEncoder {
     /// `repeated` fields and `spread` computed the same way, so the signal survives as "no
     /// levels" rather than as a short read.
     pub(super) fn encode(
-        &self,
         asks: &[MergedLevel],
         bids: &[MergedLevel],
         buffers: &mut impl BufferProvider,
@@ -162,7 +122,7 @@ impl BookEncoder {
         // is cheaper than a traversal to find out. The exact length is known once the body is
         // written, and patched in below.
         let needed = MESSAGE_PREFIX
-            + (2 + self.level_body_max as usize) * (asks.len() + bids.len())
+            + (2 + usize::from(Self::LEVEL_BODY)) * (asks.len() + bids.len())
             + SPREAD_LEN;
         let mut buf = buffers.get_buffer(needed);
         debug_assert!(
@@ -171,8 +131,8 @@ impl BookEncoder {
         );
 
         buf.put_bytes(0, MESSAGE_PREFIX);
-        self.put_side(&mut buf, ASKS_KEY, asks);
-        self.put_side(&mut buf, BIDS_KEY, bids);
+        Self::put_side(&mut buf, ASKS_KEY, asks);
+        Self::put_side(&mut buf, BIDS_KEY, bids);
 
         let spread = asks
             .first()
@@ -194,29 +154,21 @@ impl BookEncoder {
 
     /// Appends one `repeated Level` field, one entry per level.
     ///
-    /// The body length is this level's own suffix plus its two scalars, minus 9 for each of
-    /// `price`/`size` prost would elide. That subtraction never fires on a real book - a venue
-    /// does not quote a zero price or a zero size - so it predicts perfectly, and it is what
-    /// keeps these bytes equal to prost's.
-    ///
-    /// Per level rather than per encoder: two venues on one side can have suffixes of
-    /// different widths, and a level written to `level_body_max` when its own suffix is
-    /// narrower is a length that does not describe what follows it.
-    fn put_side(&self, buf: &mut BytesMut, key: u8, levels: &[MergedLevel]) {
+    /// The body length is [`Self::LEVEL_BODY`] minus 9 for each of `price`/`size` prost would
+    /// elide. That subtraction never fires on a real book - a venue does not quote a zero
+    /// price or a zero size - so it predicts perfectly, and it is what keeps these bytes equal
+    /// to prost's.
+    fn put_side(buf: &mut BytesMut, key: u8, levels: &[MergedLevel]) {
         for level in levels {
             let price = level.price().get();
             let size = level.size().get();
-            let suffix = self
-                .venue_suffix
-                .get(&level.venue())
-                .expect("every venue a level can carry was named to `BookEncoder::new`");
-            let full = u8::try_from(LEVEL_SCALARS + suffix.len())
-                .expect("no wider than `level_body_max`, checked under 0x80 at construction");
-            let body_len = full - 9 * u8::from(price == 0.0) - 9 * u8::from(size == 0.0);
+
+            let body_len =
+                Self::LEVEL_BODY - 9 * u8::from(price == 0.0) - 9 * u8::from(size == 0.0);
 
             buf.put_u8(key);
-            // A one-byte varint: checked at construction to be under the 0x80 continuation
-            // threshold.
+            // A one-byte varint: `LEVEL_BODY` is asserted under the 0x80 continuation
+            // threshold, and this is no larger.
             buf.put_u8(body_len);
             if price != 0.0 {
                 buf.put_u8(PRICE_KEY);
@@ -226,19 +178,18 @@ impl BookEncoder {
                 buf.put_u8(SIZE_KEY);
                 buf.put_f64_le(size);
             }
-            buf.put_slice(suffix);
+            crate::encode::put_venue_idx(buf, LEVEL_VENUE_FIELD, level.venue());
         }
     }
 
     /// The single-venue fast path: `asks`/`bids` are [`BookLevel`]s straight out of a
-    /// `SmallBook`, all quoted by `venue` - so its suffix is looked up once here rather than
-    /// once per level, and there is no [`MergedLevel`] to copy the levels into first.
+    /// `SmallBook`, all quoted by `venue`, so there is no [`MergedLevel`] to copy the levels
+    /// into first.
     ///
     /// Otherwise identical to [`Self::encode`]; see its doc for the buffer sizing, the
     /// elision rules and why the resync signal survives as "no levels".
     pub(super) fn encode_single(
-        &self,
-        venue: VenueIdx,
+        venue: Venue,
         asks: &[BookLevel],
         bids: &[BookLevel],
         buffers: &mut impl BufferProvider,
@@ -248,13 +199,8 @@ impl BookEncoder {
             "a book is at most MAX_DEPTH levels a side"
         );
 
-        let suffix = self
-            .venue_suffix
-            .get(&venue)
-            .expect("every venue a book can carry was named to `BookEncoder::new`");
-
         let needed = MESSAGE_PREFIX
-            + (2 + self.level_body_max as usize) * (asks.len() + bids.len())
+            + (2 + usize::from(Self::LEVEL_BODY)) * (asks.len() + bids.len())
             + SPREAD_LEN;
         let mut buf = buffers.get_buffer(needed);
         debug_assert!(
@@ -263,8 +209,8 @@ impl BookEncoder {
         );
 
         buf.put_bytes(0, MESSAGE_PREFIX);
-        Self::put_side_single(&mut buf, ASKS_KEY, asks, suffix);
-        Self::put_side_single(&mut buf, BIDS_KEY, bids, suffix);
+        Self::put_side_single(&mut buf, ASKS_KEY, asks, venue);
+        Self::put_side_single(&mut buf, BIDS_KEY, bids, venue);
 
         let spread = asks
             .first()
@@ -282,19 +228,19 @@ impl BookEncoder {
         buf.freeze()
     }
 
-    /// [`Self::put_side`]'s single-venue twin: every level on `levels` is quoted by the same
-    /// venue, so `suffix` is looked up once by the caller instead of once per level.
-    fn put_side_single(buf: &mut BytesMut, key: u8, levels: &[BookLevel], suffix: &[u8]) {
+    /// [`Self::put_side`]'s single-venue twin: every level on `levels` is quoted by `venue`,
+    /// so there is no per-level [`MergedLevel`] to read it off.
+    fn put_side_single(buf: &mut BytesMut, key: u8, levels: &[BookLevel], venue: Venue) {
         for level in levels {
             let price = level.price().get();
             let size = level.size().get();
-            let full = u8::try_from(LEVEL_SCALARS + suffix.len())
-                .expect("no wider than `level_body_max`, checked under 0x80 at construction");
-            let body_len = full - 9 * u8::from(price == 0.0) - 9 * u8::from(size == 0.0);
+
+            let body_len =
+                Self::LEVEL_BODY - 9 * u8::from(price == 0.0) - 9 * u8::from(size == 0.0);
 
             buf.put_u8(key);
-            // A one-byte varint: checked at construction to be under the 0x80 continuation
-            // threshold.
+            // A one-byte varint: `LEVEL_BODY` is asserted under the 0x80 continuation
+            // threshold, and this is no larger.
             buf.put_u8(body_len);
             if price != 0.0 {
                 buf.put_u8(PRICE_KEY);
@@ -304,15 +250,15 @@ impl BookEncoder {
                 buf.put_u8(SIZE_KEY);
                 buf.put_f64_le(size);
             }
-            buf.put_slice(suffix);
+            crate::encode::put_venue_idx(buf, LEVEL_VENUE_FIELD, venue);
         }
     }
 
     /// The largest frame this encoder can produce. Only the tests ask; nothing on the write
     /// path needs to know, since a frame carries its own length.
     #[cfg(test)]
-    fn max_frame_len(&self) -> usize {
-        MESSAGE_PREFIX + (2 + self.level_body_max as usize) * 2 * MAX_DEPTH + SPREAD_LEN
+    fn max_frame_len() -> usize {
+        MESSAGE_PREFIX + (2 + usize::from(Self::LEVEL_BODY)) * 2 * MAX_DEPTH + SPREAD_LEN
     }
 }
 
@@ -320,11 +266,13 @@ impl BookEncoder {
 mod test {
     use super::{BookEncoder, BufferProvider};
     use crate::broadcast::book_merger::MergedLevel;
+    use crate::encode::venue_idx;
     use bytes::BytesMut;
+    use core_lib::Venue;
     use core_lib::incremental_book::Level as BookLevel;
     use core_lib::positive_f64::PositiveF64;
     use md_proto::md::v1 as proto;
-    use md_wire::grpc::{MESSAGE_PREFIX, VenueIdx, message_len};
+    use md_wire::grpc::{MESSAGE_PREFIX, message_len};
     use prost::Message as _;
 
     struct TestBufferProvider;
@@ -335,11 +283,11 @@ mod test {
         }
     }
 
-    fn level(price: f64, size: f64, venue_idx: u32) -> MergedLevel {
+    fn level(price: f64, size: f64, venue: Venue) -> MergedLevel {
         MergedLevel::new(
             PositiveF64::new(price).expect("test prices are positive"),
             PositiveF64::new(size).expect("test sizes are positive"),
-            VenueIdx::new(venue_idx),
+            venue,
         )
     }
 
@@ -356,18 +304,9 @@ mod test {
             .map(|l| proto::Level {
                 price: l.price().get(),
                 size: l.size().get(),
-                venue_idx: l.venue().get(),
+                venue_idx: venue_idx(l.venue()).get(),
             })
             .collect()
-    }
-
-    /// Every venue any level of `asks` or `bids` carries, which is what the encoder has to be
-    /// told about up front.
-    fn venues_of(asks: &[MergedLevel], bids: &[MergedLevel]) -> Vec<VenueIdx> {
-        let mut all: Vec<VenueIdx> = asks.iter().chain(bids).map(MergedLevel::venue).collect();
-        all.sort_unstable();
-        all.dedup();
-        all
     }
 
     fn spread_of(asks: &[MergedLevel], bids: &[MergedLevel]) -> f64 {
@@ -381,39 +320,70 @@ mod test {
     #[test]
     fn the_hand_encoder_agrees_with_prost() {
         let deep: Vec<MergedLevel> = (1..=10)
-            .map(|i| level(f64::from(i) * 1.5, f64::from(i) / 8.0, 1))
+            .map(|i| level(f64::from(i) * 1.5, f64::from(i) / 8.0, Venue::BinanceSpot))
             .collect();
-        // Venue index zero is the elision case - proto3 writes nothing for a scalar equal to
-        // its default - and 300 is the one that needs a two-byte varint, which a venue name
-        // never did.
         let cases: Vec<(&str, Vec<MergedLevel>, Vec<MergedLevel>)> = vec![
             // The resync signal: both sides empty. NaN spread, always written.
             ("empty", Vec::new(), Vec::new()),
             // One side only: the other side's absence also makes the spread NaN.
-            ("asks only", vec![level(100.5, 1.25, 0)], Vec::new()),
-            ("bids only", Vec::new(), vec![level(99.5, 2.0, 1), level(99.0, 4.0, 1)]),
+            (
+                "asks only",
+                vec![level(100.5, 1.25, Venue::Bitstamp)],
+                Vec::new(),
+            ),
+            (
+                "bids only",
+                Vec::new(),
+                vec![
+                    level(99.5, 2.0, Venue::BinanceSpot),
+                    level(99.0, 4.0, Venue::Bitstamp),
+                ],
+            ),
             // Full depth both sides: the largest frame.
             ("full depth", deep.clone(), deep),
-            // An index past one byte of varint, which the length prefix has to account for.
-            ("wide index", vec![level(100.5, 1.25, 300)], vec![level(99.5, 2.0, 300)]),
-            // A merged book, which is the whole point of the per-level suffix: one side
-            // carrying both the elided zero and the two-byte varint, so a suffix looked up
-            // per level and one cached per encoder cannot produce the same bytes.
+            // The highest venue index this build carries, on both sides.
+            (
+                "widest index",
+                vec![level(100.5, 1.25, Venue::Bitstamp)],
+                vec![level(99.5, 2.0, Venue::Bitstamp)],
+            ),
+            // A merged book, which is the whole point of tagging each level: one side
+            // carrying levels from both venues, so a venue read per level and one assumed for
+            // the whole side cannot produce the same bytes.
             (
                 "two venues on one side",
-                vec![level(100.0, 1.0, 0), level(100.0, 2.0, 300), level(101.0, 3.0, 0)],
-                vec![level(99.0, 1.0, 300), level(99.0, 2.0, 0)],
+                vec![
+                    level(100.0, 1.0, Venue::BinanceSpot),
+                    level(100.0, 2.0, Venue::Bitstamp),
+                    level(101.0, 3.0, Venue::BinanceSpot),
+                ],
+                vec![
+                    level(99.0, 1.0, Venue::BinanceSpot),
+                    level(99.0, 2.0, Venue::Bitstamp),
+                ],
             ),
             // `PositiveF64` permits `+0.0`, so prost's default elision is reachable.
             (
                 "zero price and size",
-                vec![level(0.0, 1.0, 0), level(1.0, 0.0, 0), level(0.0, 0.0, 0)],
-                vec![level(f64::MIN_POSITIVE, f64::MAX, 0)],
+                vec![
+                    level(0.0, 1.0, Venue::Bitstamp),
+                    level(1.0, 0.0, Venue::BinanceSpot),
+                    level(0.0, 0.0, Venue::BinanceSpot),
+                ],
+                vec![level(f64::MIN_POSITIVE, f64::MAX, Venue::BinanceSpot)],
             ),
             // A locked book: best ask equals best bid, so the spread is 0.0 and prost elides it.
-            ("locked", vec![level(100.0, 1.0, 0)], vec![level(100.0, 1.0, 0)]),
+            (
+                "locked",
+                vec![level(100.0, 1.0, Venue::BinanceSpot)],
+                vec![level(100.0, 1.0, Venue::Bitstamp)],
+            ),
             // A crossed book: a negative spread, which is never elided.
-            ("crossed", vec![level(99.0, 1.0, 1)], vec![level(100.0, 1.0, 1)]),
+            (
+                "crossed",
+                vec![level(99.0, 1.0, Venue::Bitstamp)],
+                vec![level(100.0, 1.0, Venue::BinanceSpot)],
+            ),
         ];
 
         for (case, asks, bids) in cases {
@@ -424,8 +394,7 @@ mod test {
             }
             .encode_to_vec();
 
-            let encoder = BookEncoder::new(&venues_of(&asks, &bids));
-            let frame = encoder.encode(&asks, &bids, &mut TestBufferProvider);
+            let frame = BookEncoder::encode(&asks, &bids, &mut TestBufferProvider);
 
             let header = frame[..MESSAGE_PREFIX]
                 .try_into()
@@ -453,7 +422,7 @@ mod test {
         let deep: Vec<BookLevel> = (1..=10)
             .map(|i| book_level(f64::from(i) * 1.5, f64::from(i) / 8.0))
             .collect();
-        let venue = VenueIdx::new(300);
+        let venue = Venue::BinanceSpot;
         let cases: Vec<(&str, Vec<BookLevel>, Vec<BookLevel>)> = vec![
             ("empty", Vec::new(), Vec::new()),
             ("asks only", vec![book_level(100.5, 1.25)], Vec::new()),
@@ -472,11 +441,18 @@ mod test {
                 ],
                 vec![book_level(f64::MIN_POSITIVE, f64::MAX)],
             ),
-            ("locked", vec![book_level(100.0, 1.0)], vec![book_level(100.0, 1.0)]),
-            ("crossed", vec![book_level(99.0, 1.0)], vec![book_level(100.0, 1.0)]),
+            (
+                "locked",
+                vec![book_level(100.0, 1.0)],
+                vec![book_level(100.0, 1.0)],
+            ),
+            (
+                "crossed",
+                vec![book_level(99.0, 1.0)],
+                vec![book_level(100.0, 1.0)],
+            ),
         ];
 
-        let encoder = BookEncoder::new(&[venue]);
         for (case, asks, bids) in cases {
             let merged_asks: Vec<MergedLevel> = asks
                 .iter()
@@ -487,8 +463,10 @@ mod test {
                 .map(|l| MergedLevel::new(l.price(), l.size(), venue))
                 .collect();
 
-            let via_merge = encoder.encode(&merged_asks, &merged_bids, &mut TestBufferProvider);
-            let via_single = encoder.encode_single(venue, &asks, &bids, &mut TestBufferProvider);
+            let via_merge =
+                BookEncoder::encode(&merged_asks, &merged_bids, &mut TestBufferProvider);
+            let via_single =
+                BookEncoder::encode_single(venue, &asks, &bids, &mut TestBufferProvider);
 
             assert_eq!(
                 via_single, via_merge,
@@ -501,16 +479,15 @@ mod test {
     /// the same as if it were the first.
     #[test]
     fn a_reused_encoder_keeps_producing_whole_frames() {
-        let encoder = BookEncoder::new(&[VenueIdx::new(0)]);
-        let asks = [level(100.5, 1.25, 0)];
-        let bids = [level(99.5, 2.0, 0)];
+        let asks = [level(100.5, 1.25, Venue::Bitstamp)];
+        let bids = [level(99.5, 2.0, Venue::Bitstamp)];
 
-        let first = encoder.encode(&asks, &bids, &mut TestBufferProvider);
+        let first = BookEncoder::encode(&asks, &bids, &mut TestBufferProvider);
         // Held on to on purpose: a live frame is what keeps the buffer from being reclaimed
         // in place, which is the case where `reserve` has to allocate a fresh chunk.
         let mut held = vec![first.clone()];
         for _ in 0..2_000 {
-            held.push(encoder.encode(&asks, &bids, &mut TestBufferProvider));
+            held.push(BookEncoder::encode(&asks, &bids, &mut TestBufferProvider));
         }
 
         assert!(
@@ -518,7 +495,7 @@ mod test {
             "every frame from one book must be identical, whatever the buffer did underneath"
         );
         assert!(
-            first.len() <= encoder.max_frame_len(),
+            first.len() <= BookEncoder::max_frame_len(),
             "the advertised maximum must bound a real frame"
         );
     }

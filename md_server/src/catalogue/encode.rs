@@ -12,8 +12,9 @@
 //! debug.
 
 use crate::catalogue::Catalogue;
-use crate::encode::{put_message, put_string, put_uint32};
+use crate::encode::{put_message, put_string, put_uint32, put_venue_idx};
 use bytes::{BufMut as _, Bytes, BytesMut};
+use core_lib::Venue;
 use md_wire::grpc::{MESSAGE_PREFIX, put_message_prefix};
 
 /// `CatalogueResponse.venues`, field 1, wire type 2.
@@ -37,9 +38,9 @@ pub(crate) fn encode(catalogue: &Catalogue) -> Bytes {
 
     let mut entries = Vec::new();
 
-    for (idx, venue) in catalogue.venues() {
+    for venue in Venue::ALL {
         entries.clear();
-        put_uint32(&mut entries, IDX_FIELD, idx.get());
+        put_venue_idx(&mut entries, IDX_FIELD, venue);
         put_string(&mut entries, NAME_FIELD, venue.as_str());
         put_message(&mut message, VENUES_FIELD, &entries);
     }
@@ -51,7 +52,7 @@ pub(crate) fn encode(catalogue: &Catalogue) -> Bytes {
         put_uint32(&mut entries, IDX_FIELD, idx.get());
         for pair in pairs {
             let mut encoded = Vec::new();
-            put_uint32(&mut encoded, IDX_FIELD, pair.venue_idx().get());
+            put_venue_idx(&mut encoded, IDX_FIELD, pair.venue());
             put_string(&mut encoded, SYMBOL_FIELD, pair.symbol());
             put_message(&mut entries, PAIRS_FIELD, &encoded);
         }
@@ -71,9 +72,10 @@ mod test {
     use md_wire::grpc::{MESSAGE_PREFIX, message_len};
     use prost::Message as _;
 
-    /// The same guard `broadcast::book_encoder` has: this is a second implementation of an encoding
-    /// prost already implements, so the bytes have to be prost's - including the two places
-    /// proto3 elides a default, index zero and an empty symbol.
+    /// The same guard `broadcast::book_encoder` has: this is a second implementation of an
+    /// encoding prost already implements, so the bytes have to be prost's - including the two
+    /// places proto3 elides a default here, instrument index zero and an empty symbol. A venue
+    /// index is never one of them: `crate::encode::venue_idx` numbers from one.
     #[test]
     fn the_hand_encoder_agrees_with_prost() {
         let catalogue = Catalogue::for_test(&[
@@ -91,11 +93,11 @@ mod test {
         let expected = proto::CatalogueResponse {
             venues: vec![
                 proto::VenueEntry {
-                    idx: 0,
+                    idx: 1,
                     name: "binance_spot".to_owned(),
                 },
                 proto::VenueEntry {
-                    idx: 1,
+                    idx: 2,
                     name: "bitstamp".to_owned(),
                 },
             ],
@@ -103,7 +105,7 @@ mod test {
                 proto::InstrumentEntry {
                     idx: 0,
                     pairs: vec![proto::Pair {
-                        venue_idx: 0,
+                        venue_idx: 1,
                         symbol: "BTCUSDT".to_owned(),
                     }],
                 },
@@ -111,11 +113,11 @@ mod test {
                     idx: 9,
                     pairs: vec![
                         proto::Pair {
-                            venue_idx: 0,
+                            venue_idx: 1,
                             symbol: "ETHUSDT".to_owned(),
                         },
                         proto::Pair {
-                            venue_idx: 1,
+                            venue_idx: 2,
                             symbol: "ethusd".to_owned(),
                         },
                     ],
@@ -127,7 +129,7 @@ mod test {
                 proto::InstrumentEntry {
                     idx: 12,
                     pairs: vec![proto::Pair {
-                        venue_idx: 1,
+                        venue_idx: 2,
                         symbol: String::new(),
                     }],
                 },

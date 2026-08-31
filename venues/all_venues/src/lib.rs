@@ -14,7 +14,7 @@
 /// Not `#[non_exhaustive]`: every venue this build carries is listed here, and a `match` over
 /// it - [`Venue::as_str`], a server's per-venue connector table - is meant to stop compiling
 /// the day a variant is added, not to silently fall through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum Venue {
     BinanceSpot,
     Bitstamp,

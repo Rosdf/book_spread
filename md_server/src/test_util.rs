@@ -11,7 +11,7 @@
 //! [`BookSource`] exists as a trait.
 use crate::catalogue::Catalogue;
 use crate::venue::{BookSource, Connectors, Venue};
-use md_wire::grpc::{CatalogueIdx, VenueIdx};
+use md_wire::grpc::CatalogueIdx;
 use core_lib::connector::book_publisher::{BookPublisher, BookReader, make_book_publisher_pair};
 use core_lib::incremental_book::IncrementalBook;
 use core_lib::instrument::{Instrument, InstrumentId};
@@ -226,20 +226,6 @@ impl TestCatalogue {
         self
     }
 
-    /// The index a level quoted by `venue` carries.
-    ///
-    /// # Panics
-    ///
-    /// Never: every [`Venue`] is in [`Venue::ALL`], which is what this searches.
-    #[must_use]
-    pub fn venue_idx(venue: Venue) -> VenueIdx {
-        let idx = Venue::ALL
-            .iter()
-            .position(|known| *known == venue)
-            .expect("every venue this build carries is in `Venue::ALL`");
-        VenueIdx::new(u32::try_from(idx).expect("this build carries a handful of venues"))
-    }
-
     /// The index a subscribe names for the instrument at `idx`. Trivial today - it is `idx` -
     /// and here so a test says what it means rather than casting.
     #[must_use]
@@ -299,4 +285,8 @@ pub async fn serve(
     stop: impl Future<Output = ()> + Send,
 ) -> anyhow::Result<()> {
     crate::server::serve(listener, connectors, catalogue.build(), stop).await
+}
+
+pub const fn venue_idx(venue: Venue) -> u32 {
+    crate::encode::venue_idx(venue).get()
 }

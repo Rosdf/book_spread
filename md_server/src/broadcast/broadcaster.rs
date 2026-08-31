@@ -8,10 +8,10 @@
 //! bookkeeping and [`crate::client`] for what backpressure does to it.
 
 use super::session::{Session, SessionCtx};
+use crate::broadcast::book_encoder::{BookEncoder, BufferProvider};
 use crate::broadcast::book_merger::MergedBook;
 use crate::broadcast::queue::BroadcasterRx;
 use crate::client::{ClientHandshake, ClientSink};
-use crate::broadcast::book_encoder::{BookEncoder, BufferProvider};
 use crate::registry::events::{Claim, RegistryTx};
 use bytes::{Bytes, BytesMut};
 use core_lib::Venue;
@@ -19,7 +19,7 @@ use core_lib::atomic_waker::Waiter;
 use core_lib::connector::book_publisher::BookReader;
 use core_lib::shared_buffer::{Reader, ReaderGuard};
 use core_lib::small_book::SmallBook;
-use md_wire::grpc::{CatalogueIdx, RejectCode, Rejected, VenueIdx};
+use md_wire::grpc::{CatalogueIdx, RejectCode, Rejected};
 use std::future::poll_fn;
 use std::pin::pin;
 use std::sync::Arc;
@@ -217,7 +217,7 @@ pub(crate) struct VenueReader {
     /// The catalogue index stamped on every level from this venue. The whole of what a
     /// broadcaster needs to know about which venue this is - the symbol behind it matters
     /// only to the registry, which is what subscribed it and what will release it.
-    venue_idx: VenueIdx,
+    venue: Venue,
     books: Reader<SmallBook>,
     /// Taken once this venue's publisher is gone.
     ///
@@ -229,10 +229,10 @@ pub(crate) struct VenueReader {
 }
 
 impl VenueReader {
-    pub(crate) fn new(venue_idx: VenueIdx, reader: BookReader) -> Self {
+    pub(crate) fn new(venue: Venue, reader: BookReader) -> Self {
         let (books, waiter) = reader.split();
         Self {
-            venue_idx,
+            venue,
             books,
             updates: Some(waiter),
         }
@@ -261,9 +261,6 @@ pub(crate) struct Broadcaster<C: ClientHandshake> {
     /// Joins the registry has queued but this task has not taken yet. Also this
     /// broadcaster's identity to the registry - see [`Claim`].
     pending_joins: Arc<AtomicUsize>,
-    /// Holds this symbol's encoded identity and the buffer every frame is cut from, so a
-    /// book costs neither an allocation nor a re-encode of `venue`/`symbol`.
-    encoder: BookEncoder,
     /// The scratch both merged sides are built in, reused on every publish so a book still
     /// costs no allocation of its own.
     merged: MergedBook,
@@ -290,16 +287,11 @@ impl<C: ClientHandshake> Broadcaster<C> {
         pending_joins: Arc<AtomicUsize>,
     ) {
         let mut pool = BufferPool::new();
-        // The venue indices come from the registry rather than from the instruments: they are
-        // the catalogue's numbering, and an `Instrument` knows only which `Venue` it is on.
-        let venue_ids: heapless::Vec<VenueIdx, { Venue::COUNT }> =
-            readers.iter().map(|reader| reader.venue_idx).collect();
-        let encoder = BookEncoder::new(&venue_ids);
+
         let mut merged = MergedBook::new();
-        let latest = encode_book(&encoder, &mut merged, &mut readers, &mut pool);
+        let latest = encode_book(&mut merged, &mut readers, &mut pool);
 
         Self {
-            encoder,
             merged,
             idx,
             readers,
@@ -393,7 +385,6 @@ impl<C: ClientHandshake> Broadcaster<C> {
     /// something to prune.
     fn publish(&mut self, cx: &mut Context<'_>) -> bool {
         let frame = encode_book(
-            &self.encoder,
             &mut self.merged,
             &mut self.readers,
             &mut self.ctx.pool,
@@ -456,34 +447,33 @@ impl<C: ClientHandshake> Broadcaster<C> {
 /// them are dropped at the end of this call, before anything is offered to a client, and none
 /// may ever be held across an await.
 fn encode_book(
-    encoder: &BookEncoder,
     merged: &mut MergedBook,
     readers: &mut [VenueReader],
     buffers: &mut impl BufferProvider,
 ) -> Bytes {
     // Two passes because the guards have to outlive the borrows taken from them: `iter_mut`
     // is what makes the `&mut` on each reader disjoint.
-    let mut books = heapless::Vec::<(VenueIdx, ReaderGuard<'_, SmallBook>), { Venue::COUNT }>::new();
+    let mut books = heapless::Vec::<(Venue, ReaderGuard<'_, SmallBook>), { Venue::COUNT }>::new();
     for reader in readers {
         books
-            .push((reader.venue_idx, reader.books.get()))
+            .push((reader.venue, reader.books.get()))
             .map_err(|_| ())
             .expect("one reader per venue, which the catalogue enforces");
     }
-    let sides: heapless::Vec<(VenueIdx, &SmallBook), { Venue::COUNT }> = books
+    let sides: heapless::Vec<(Venue, &SmallBook), { Venue::COUNT }> = books
         .iter()
-        .map(|(venue_idx, guard)| (*venue_idx, &**guard))
+        .map(|(venue, guard)| (*venue, &**guard))
         .collect();
 
     // The only case reachable today, and worth its own path: with one venue there is nothing
     // to merge, so this writes straight out of the reader's own book and skips `MergedBook`
     // (and the per-level venue lookup it costs) entirely.
     if let [(venue, book)] = sides.as_slice() {
-        return encoder.encode_single(*venue, book.asks(), book.bids(), buffers);
+        return BookEncoder::encode_single(*venue, book.asks(), book.bids(), buffers);
     }
 
     merged.refill(&sides);
-    encoder.encode(merged.asks(), merged.bids(), buffers)
+    BookEncoder::encode(merged.asks(), merged.bids(), buffers)
 }
 
 /// Polls every venue that is still publishing, and resolves once any of them has moved.
@@ -569,7 +559,11 @@ fn poll_sessions<K: ClientSink>(
 /// session finished rather than any one of them. `begin_finish` only queues, which is what
 /// makes one deadline for the whole set possible; a client that will not read costs the
 /// deadline once, not once per client.
-async fn close<K: ClientSink>(sessions: &mut Vec<Session<K>>, session_ctx: &Ctx, rejected: &Rejected) {
+async fn close<K: ClientSink>(
+    sessions: &mut Vec<Session<K>>,
+    session_ctx: &Ctx,
+    rejected: &Rejected,
+) {
     if sessions.is_empty() {
         return;
     }
@@ -589,7 +583,10 @@ async fn close<K: ClientSink>(sessions: &mut Vec<Session<K>>, session_ctx: &Ctx,
             Poll::Pending
         }
     });
-    if tokio::time::timeout(TEARDOWN_TIMEOUT, flushed).await.is_err() {
+    if tokio::time::timeout(TEARDOWN_TIMEOUT, flushed)
+        .await
+        .is_err()
+    {
         tracing::debug!("gave up telling some clients why their stream ended");
     }
     // Dropping them closes what is left, which a client that stopped reading has to handle.
@@ -599,10 +596,11 @@ async fn close<K: ClientSink>(sessions: &mut Vec<Session<K>>, session_ctx: &Ctx,
 #[cfg(test)]
 mod test {
     use super::SESSION_SWEEP;
+    use crate::broadcast::book_encoder::{BookEncoder, BufferProvider};
     use crate::client::mock::{MockClient, MockPeer, connected};
-    use crate::broadcast::book_encoder::BufferProvider;
+    use crate::encode::venue_idx;
     use crate::registry::harness::{FIRST, Harness, registry_for, registry_for_pairs};
-    use crate::test_util::{FakeSource, TestCatalogue, book};
+    use crate::test_util::{FakeSource, book};
     use crate::venue::Venue;
     use bytes::BytesMut;
     use md_proto::md::v1 as proto;
@@ -644,20 +642,20 @@ mod test {
         }
     }
 
-    /// `(price, size, venue_idx)` for each level, which is everything one carries.
-    fn levels_of(levels: &[proto::Level]) -> Vec<(f64, f64, u32)> {
+    /// `(price, size, venue)` for each level, which is everything one carries.
+    fn levels_of(levels: &[proto::Level]) -> Vec<(f64, f64, VenueIdx)> {
         levels
             .iter()
-            .map(|level| (level.price, level.size, level.venue_idx))
+            .map(|level| (level.price, level.size, VenueIdx::new(level.venue_idx)))
             .collect()
     }
 
-    fn binance_idx() -> u32 {
-        TestCatalogue::venue_idx(Venue::BinanceSpot).get()
+    const fn binance_idx() -> VenueIdx {
+        venue_idx(Venue::BinanceSpot)
     }
 
-    fn bitstamp_idx() -> u32 {
-        TestCatalogue::venue_idx(Venue::Bitstamp).get()
+    const fn bitstamp_idx() -> VenueIdx {
+        venue_idx(Venue::Bitstamp)
     }
 
     /// Subscribes one client and reads its opening snapshot, leaving it ready for real books.
@@ -744,7 +742,7 @@ mod test {
             vec![proto::Level {
                 price: 100.5,
                 size: 1.25,
-                venue_idx: 0,
+                venue_idx: binance_idx().get(),
             }],
             "asks travel best first"
         );
@@ -754,12 +752,12 @@ mod test {
                 proto::Level {
                     price: 99.5,
                     size: 2.0,
-                    venue_idx: 0,
+                    venue_idx: binance_idx().get(),
                 },
                 proto::Level {
                     price: 99.0,
                     size: 4.0,
-                    venue_idx: 0,
+                    venue_idx: binance_idx().get(),
                 },
             ],
             "bids travel best first"
@@ -897,8 +895,7 @@ mod test {
         source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[]));
         let frame = client.next_frame().await;
 
-        let encoder = crate::broadcast::book_encoder::BookEncoder::new(&[VenueIdx::new(0)]);
-        let expected = encoder.encode(&[level(100.5, 1.25)], &[], &mut TestBufferProvider);
+        let expected = BookEncoder::encode(&[level(100.5, 1.25)], &[], &mut TestBufferProvider);
         assert_eq!(
             frame, expected,
             "what a client is given is exactly the buffer the encoder produced, header included"
@@ -942,7 +939,6 @@ mod test {
         );
     }
 
-
     /// The whole point of the merge: one stream, one frame, levels from both venues in it,
     /// each carrying the venue that quoted it.
     #[tokio::test]
@@ -950,9 +946,10 @@ mod test {
         let venues = two_venues();
         let client = attach(&venues.harness).await;
 
-        venues
-            .binance_spot
-            .publish(ON_BINANCE, &book(&[(100.0, 1.0), (102.0, 1.0)], &[(99.0, 1.0)]));
+        venues.binance_spot.publish(
+            ON_BINANCE,
+            &book(&[(100.0, 1.0), (102.0, 1.0)], &[(99.0, 1.0)]),
+        );
         // The first book already reaches the client - it is a book, on one venue, with the
         // other still empty - so it is read off before the second venue quotes.
         let one_sided = client.next_book().await;
@@ -1173,17 +1170,16 @@ mod test {
     /// long this runs.
     #[test]
     fn a_long_run_of_books_cycles_a_fixed_set_of_buffers() {
-        let encoder = crate::broadcast::book_encoder::BookEncoder::new(&[VenueIdx::new(0)]);
         let asks = [level(100.5, 1.25)];
         let bids = [level(99.5, 2.0)];
 
         let mut pool = super::BufferPool::new();
-        let first = encoder.encode(&asks, &bids, &mut pool);
+        let first = BookEncoder::encode(&asks, &bids, &mut pool);
         let mut ctx = super::Ctx::new(first, pool);
 
         let mut allocations = std::collections::HashSet::new();
         for _ in 0..1_000 {
-            let frame = encoder.encode(&asks, &bids, &mut ctx.pool);
+            let frame = BookEncoder::encode(&asks, &bids, &mut ctx.pool);
             allocations.insert(frame.as_ptr());
             ctx.new_framed(frame);
         }
@@ -1196,13 +1192,13 @@ mod test {
         );
     }
 
-    /// A merged book level on the one venue these tests serve, out of two prices a test
-    /// spelled as plain floats.
+    /// A merged book level on [`Venue::BinanceSpot`], which is the one venue the single-venue
+    /// harness serves, out of two prices a test spelled as plain floats.
     fn level(price: f64, size: f64) -> crate::broadcast::book_merger::MergedLevel {
         crate::broadcast::book_merger::MergedLevel::new(
             core_lib::positive_f64::PositiveF64::new(price).expect("positive"),
             core_lib::positive_f64::PositiveF64::new(size).expect("positive"),
-            VenueIdx::new(0),
+            Venue::BinanceSpot,
         )
     }
 

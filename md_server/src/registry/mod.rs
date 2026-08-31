@@ -1,26 +1,26 @@
 //! Which catalogue instruments are being broadcast, the two races around starting and
 //! stopping one, and resolving a catalogue index into the pairs a broadcaster subscribes.
 
+use crate::broadcast::broadcaster::{Broadcaster, Join, VenueReader, VenueReaders};
+use crate::broadcast::queue::{BroadcasterRx, BroadcasterTx, make_broadcaster_channel};
 use crate::catalogue::CataloguePair;
+use crate::client::ClientHandshake;
 use crate::registry::events::{
     Claim, RegistryEvent, RegistryRx, RegistryTx, RegistryWeakTx, create_event_channel,
 };
 use crate::venue::{BookSource as _, Connectors};
 use core_lib::Venue;
 use core_lib::connector::book_publisher::BookReader;
-use core_lib::instrument::{Instrument, InstrumentId};
+use core_lib::instrument::Instrument;
 use core_lib::map::{InternalHashMap, new_internal_map};
 use core_lib::panic::panic_message;
 use core_lib::venue::backoff::Backoff;
+use md_wire::grpc::{CatalogueIdx, RejectCode, Rejected};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
-use crate::broadcast::broadcaster::{Broadcaster, Join, VenueReader, VenueReaders};
-use crate::broadcast::queue::{make_broadcaster_channel, BroadcasterRx, BroadcasterTx};
-use crate::client::ClientHandshake;
-use md_wire::grpc::{CatalogueIdx, RejectCode, Rejected, VenueIdx};
 
 pub(crate) mod events;
 
@@ -33,26 +33,6 @@ pub(crate) mod events;
 /// that is never listed costs one sweep a minute.
 const RESOLVE_SWEEP_MAX: Duration = Duration::from_secs(60);
 
-/// One pair of a servable catalogue entry: the interned symbol, and the index the encoder
-/// stamps on every level that comes from it.
-#[derive(Debug, Clone, Copy)]
-struct ResolvedPair {
-    instrument: Instrument,
-    venue_idx: VenueIdx,
-}
-
-impl ResolvedPair {
-    /// The connector that carries this pair.
-    fn venue(self) -> Venue {
-        self.instrument.venue()
-    }
-
-    /// What that connector knows this pair as.
-    fn instrument_id(self) -> InstrumentId {
-        self.instrument.id()
-    }
-}
-
 /// One catalogue instrument's pairs, once every venue has interned its symbol.
 ///
 /// The single representation of "which venues make up this instrument": the resolution map
@@ -60,7 +40,7 @@ impl ResolvedPair {
 /// task that subscribes them holds a third. Sharing rather than re-deriving is what keeps
 /// them from drifting - a release names exactly the pairs the subscribe named - and a clone
 /// is one atomic rather than a copy of the list.
-type Pairs = Arc<[ResolvedPair]>;
+type Pairs = Arc<[Instrument]>;
 
 /// The registry's half of one running broadcaster.
 #[derive(Debug)]
@@ -92,9 +72,7 @@ impl<C> Entry<C> {
     /// only subscriber there is, so the pair cannot belong to anyone else.
     fn unsubscribe<V: Connectors>(&self, connectors: &V) {
         for pair in &*self.pairs {
-            connectors
-                .source(pair.venue())
-                .unsubscribe(pair.instrument_id());
+            connectors.source(pair.venue()).unsubscribe(pair.id());
         }
     }
 }
@@ -378,7 +356,7 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
             if pairs.is_empty() {
                 return true;
             }
-            let mut interned = heapless::Vec::<ResolvedPair, { Venue::COUNT }>::new();
+            let mut interned = heapless::Vec::<Instrument, { Venue::COUNT }>::new();
             for pair in pairs {
                 // `true` keeps the entry here: it is still unresolved, and every pair
                 // already looked up is discarded rather than remembered - the lookup is a
@@ -387,10 +365,7 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
                     return true;
                 };
                 interned
-                    .push(ResolvedPair {
-                        instrument,
-                        venue_idx: pair.venue_idx(),
-                    })
+                    .push(instrument)
                     .map_err(|_| ())
                     .expect("one pair per venue, which the catalogue enforces");
             }
@@ -491,14 +466,10 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     /// put them after the `unsubscribe`s of whatever generation held this key before. It
     /// costs no await: `BookSource::subscribe` hands back the reply channel rather than a
     /// future, so the spawned task is what waits for the venues.
-    fn issue_subscribes(&self, pairs: &[ResolvedPair]) -> Replies {
+    fn issue_subscribes(&self, pairs: &[Instrument]) -> Replies {
         pairs
             .iter()
-            .map(|pair| {
-                self.connectors
-                    .source(pair.venue())
-                    .subscribe(pair.instrument_id())
-            })
+            .map(|pair| self.connectors.source(pair.venue()).subscribe(pair.id()))
             .collect()
     }
 
@@ -584,14 +555,14 @@ async fn serve<C: ClientHandshake>(
 /// channel the connector is about to send on would leave that subscription established with
 /// nothing reading it, and the release that follows has to be ordered after it rather than
 /// racing it.
-async fn open_readers(pairs: &[ResolvedPair], replies: Replies) -> Result<VenueReaders, Rejected> {
+async fn open_readers(pairs: &[Instrument], replies: Replies) -> Result<VenueReaders, Rejected> {
     let mut readers = VenueReaders::new();
     let mut refused: Option<Rejected> = None;
 
     for (pair, reply) in pairs.iter().zip(replies) {
-        match opened(pair, reply.await) {
+        match opened(*pair, reply.await) {
             Ok(reader) => readers
-                .push(VenueReader::new(pair.venue_idx, reader))
+                .push(VenueReader::new(pair.venue(), reader))
                 .map_err(|_| ())
                 .expect("one pair per venue, which the catalogue enforces"),
             Err(rejected) => {
@@ -608,7 +579,7 @@ async fn open_readers(pairs: &[ResolvedPair], replies: Replies) -> Result<VenueR
 
 /// One pair's answer: its reader, or the refusal a client should hear.
 fn opened<E>(
-    pair: &ResolvedPair,
+    pair: Instrument,
     reply: Result<anyhow::Result<BookReader>, E>,
 ) -> Result<BookReader, Rejected> {
     match reply {
@@ -616,7 +587,7 @@ fn opened<E>(
         Ok(Err(err)) => {
             tracing::warn!(
                 venue = pair.venue().as_str(),
-                symbol = pair.instrument.name(),
+                symbol = pair.name(),
                 %err,
                 "subscribe rejected"
             );
@@ -638,11 +609,11 @@ fn opened<E>(
 mod test {
     use super::events::Claim;
     use crate::broadcast::broadcaster::SESSION_SWEEP;
+    use crate::client::mock::{MockClient, MockPeer, connected};
     use crate::registry::harness::{
         FIRST, Harness, registry_for, registry_for_pairs, registry_unlisted,
         registry_unlisted_pairs,
     };
-    use crate::client::mock::{MockClient, MockPeer, connected};
     use crate::test_util::FakeSource;
     use crate::venue::Venue;
     use core_lib::venue::test_util::test_instrument_for;
@@ -1010,7 +981,6 @@ mod test {
         );
     }
 
-
     /// The pair-list spellings the two-venue tests use. Distinct on purpose: a catalogue pair
     /// is one venue's own spelling of an instrument, and `FakeSource` files its live streams
     /// by symbol.
@@ -1204,8 +1174,8 @@ pub(crate) mod harness {
     use super::RegistryHandle;
     use super::events::RegistryTx;
     use crate::catalogue::Catalogue;
-    use crate::test_util::{FakeConnectors, FakeSource};
     use crate::client::mock::MockClient;
+    use crate::test_util::{FakeConnectors, FakeSource};
     use crate::venue::Venue;
     use core_lib::venue::test_util::test_instrument_for;
     use md_wire::grpc::CatalogueIdx;

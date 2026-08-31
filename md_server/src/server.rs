@@ -33,7 +33,6 @@ pub async fn run(
     let catalogue = FileCatalogue::new(config.catalogue().path()).load().await?;
     tracing::info!(
         instruments = catalogue.instruments().len(),
-        venues = catalogue.venues().len(),
         "loaded the catalogue"
     );
 
