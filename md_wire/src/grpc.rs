@@ -16,12 +16,14 @@
 //! - **Refusal**: a Trailers-Only response - `grpc-status`, `grpc-message`, and the exact
 //!   [`RejectCode`] in [`REJECT_CODE_HEADER`].
 //!
-//! # Identity is numeric
+//! # Identity is numeric, with one exception
 //!
 //! A client asks [`CATALOGUE_PATH`] what this server carries and gets back two tables: venue
-//! index -> venue name, and instrument index -> the pairs under it. Everything after that
-//! travels as an index - a [`CatalogueIdx`] on a subscribe, a [`VenueIdx`] on every level -
-//! so no venue name and no symbol is spelled out on the hot path.
+//! index -> venue name, and instrument index -> the pairs under it. A [`VenueIdx`] on every
+//! level is what stays purely numeric on the hot path, since no book update spells a symbol
+//! out. A subscribe is the exception: it names a [`CatalogueIdx`], but it also names every
+//! pair the client read under it, because that index is a position in a file the server can be
+//! restarted on after an edit - see `md_server::registry::Registry::subscribe`.
 //!
 //! # One book per stream
 //!
@@ -34,7 +36,7 @@
 //!
 //! # Why the reject codes are not just gRPC status codes
 //!
-//! The eight [`RejectCode`]s say more than the canonical status codes do - in particular
+//! The nine [`RejectCode`]s say more than the canonical status codes do - in particular
 //! [`RejectCode::retryable`] is not derivable from the status alone, since `NOT_FOUND` for an
 //! instrument this server does not carry is permanent while `NOT_FOUND` for one whose venue
 //! has not listed its symbol yet is not. So both travel: the canonical code in `grpc-status`,
@@ -165,6 +167,12 @@ pub enum RejectCode {
     NotThisService = 7,
     /// The request body was not a well-formed message of the method's type.
     MalformedRequest = 8,
+    /// The instrument index is carried, but under different pairs than the subscribe named.
+    /// The client's view of the catalogue is stale - an index is a position in the catalogue
+    /// file, so an entry added or removed since the client read it renumbers the ones after
+    /// it. Re-fetch the catalogue and look the pair up again; retrying this request cannot
+    /// help.
+    InstrumentChanged = 9,
 }
 
 impl RejectCode {
@@ -182,6 +190,7 @@ impl RejectCode {
             6 => Some(Self::StreamEnded),
             7 => Some(Self::NotThisService),
             8 => Some(Self::MalformedRequest),
+            9 => Some(Self::InstrumentChanged),
             _ => None,
         }
     }
@@ -203,7 +212,7 @@ impl RejectCode {
         match self {
             Self::MalformedRequest => Status::InvalidArgument,
             Self::UnknownInstrument | Self::UnlistedSymbol => Status::NotFound,
-            Self::ConnectorRefused => Status::FailedPrecondition,
+            Self::ConnectorRefused | Self::InstrumentChanged => Status::FailedPrecondition,
             Self::ShuttingDown | Self::ConnectorGone | Self::StreamEnded => Status::Unavailable,
             Self::NotThisService => Status::Unimplemented,
         }
@@ -275,7 +284,7 @@ mod test {
         put_message_prefix,
     };
 
-    const ALL_CODES: [RejectCode; 8] = [
+    const ALL_CODES: [RejectCode; 9] = [
         RejectCode::UnknownInstrument,
         RejectCode::UnlistedSymbol,
         RejectCode::ShuttingDown,
@@ -284,6 +293,7 @@ mod test {
         RejectCode::StreamEnded,
         RejectCode::NotThisService,
         RejectCode::MalformedRequest,
+        RejectCode::InstrumentChanged,
     ];
 
     /// The metadata header is the only thing carrying the exact code, so it has to survive a
@@ -295,7 +305,7 @@ mod test {
             assert_eq!(RejectCode::from_byte(code.as_byte()), Some(code));
         }
         assert_eq!(RejectCode::from_byte(0), None);
-        assert_eq!(RejectCode::from_byte(9), None);
+        assert_eq!(RejectCode::from_byte(10), None);
     }
 
     /// A refusal is never `Ok`: a client that only reads `grpc-status` must not see a
@@ -361,5 +371,15 @@ mod test {
         assert_eq!(CatalogueIdx::new(7).get(), 7);
         assert_eq!(VenueIdx::new(0).get(), 0);
         assert_ne!(CatalogueIdx::new(1), CatalogueIdx::new(2));
+    }
+
+    /// A stale catalogue index is not something retrying the same request can fix - the client
+    /// has to re-fetch the catalogue first - and the request was well-formed and the instrument
+    /// exists, so `FAILED_PRECONDITION` is the honest canonical status rather than
+    /// `INVALID_ARGUMENT` or `NOT_FOUND`.
+    #[test]
+    fn a_stale_instrument_is_not_retryable_and_is_a_failed_precondition() {
+        assert!(!RejectCode::InstrumentChanged.retryable());
+        assert_eq!(RejectCode::InstrumentChanged.status(), Status::FailedPrecondition);
     }
 }

@@ -110,8 +110,10 @@ impl VenueNames {
 
 /// Streams `instrument`'s book until the server ends the stream.
 ///
-/// `instrument` is an index from [`catalogue`]; `label` is only what an empty book is printed
-/// against, since no level is available to name a venue in that case.
+/// `instrument` is an index from [`catalogue`] and `pairs` is exactly what that catalogue
+/// listed under it - echoed back so the server can tell a stale index from a current one, see
+/// `md_wire::grpc::RejectCode::InstrumentChanged`. `label` is only what an empty book is
+/// printed against, since no level is available to name a venue in that case.
 ///
 /// # Errors
 ///
@@ -119,6 +121,7 @@ impl VenueNames {
 pub async fn follow(
     addr: &str,
     instrument: u32,
+    pairs: Vec<proto::SubscribePair>,
     venues: &VenueNames,
     label: &str,
 ) -> Result<(), tonic::Status> {
@@ -129,6 +132,7 @@ pub async fn follow(
     let mut books = client
         .subscribe_book(proto::SubscribeBookRequest {
             instrument_idx: instrument,
+            pairs,
         })
         .await?
         .into_inner();

@@ -12,10 +12,11 @@ package md.v1;
 // re-encode the message per client. See `md_wire::grpc` for the framing constants and the
 // refusal codes, and `md_server::client` for the fan-out itself.
 //
-// Identity on this wire is numeric. A `Level` carries the index of the venue that quoted it
-// rather than that venue's name, and a subscribe names an instrument index rather than a
-// `(venue, symbol)` pair - both resolved through the catalogue, which is the only message
-// that spells either out.
+// Identity on this wire is numeric, with one exception. A `Level` carries the index of the
+// venue that quoted it rather than that venue's name, both resolved through the catalogue,
+// which is the only message that spells a venue index out. A subscribe, though, names its
+// instrument by index *and* by the pairs the catalogue listed under it - see
+// `SubscribeBookRequest` for why an index alone is not enough.
 
 service MarketData {
   // One book per stream. A refusal arrives as a Trailers-Only response whose
@@ -54,10 +55,28 @@ message Pair {
   string symbol    = 2;
 }
 
+// A pair as a subscribe names it, both halves spelled out.
+//
+// The venue by name rather than by its CatalogueResponse.venues index: that index is the
+// server's own numbering, fixed when it was built, so an index echoed at a differently-built
+// server could match while meaning another venue. The name is what identifies a venue.
+message SubscribePair {
+  // "binance_spot", "bitstamp" - as CatalogueResponse.venues spells it.
+  string venue  = 1;
+  // The venue's own spelling, case-sensitive: "BTCUSDT" on binance_spot, "btcusd" on bitstamp.
+  string symbol = 2;
+}
+
 message SubscribeBookRequest {
   // An idx from CatalogueResponse.instruments. Every pair under it is subscribed, and their
   // books are merged into the one book this stream carries.
   uint32 instrument_idx = 1;
+  // Every pair CatalogueResponse listed under `instrument_idx`, in the order it listed them.
+  // An index is a *position* in the server's catalogue file, so it means something different
+  // after that file gains or loses an entry; naming the pairs is what lets the server refuse
+  // a subscribe whose index no longer means what the client read. Required: a request that
+  // names none is refused.
+  repeated SubscribePair pairs = 2;
 }
 
 message Level {

@@ -1,9 +1,11 @@
 //! Which catalogue instruments are being broadcast, the two races around starting and
-//! stopping one, and resolving a catalogue index into the pairs a broadcaster subscribes.
+//! stopping one, and turning a catalogue index into the pairs a broadcaster subscribes - which
+//! is now two jobs rather than one: checking that the index still means what the client thinks
+//! it does, then resolving it against what the connectors have interned.
 
 use crate::broadcast::broadcaster::{Broadcaster, Join, VenueReader, VenueReaders};
 use crate::broadcast::queue::{BroadcasterRx, BroadcasterTx, make_broadcaster_channel};
-use crate::catalogue::CataloguePair;
+use crate::catalogue::{AskedPair, Instruments, pairs_match};
 use crate::client::ClientHandshake;
 use crate::registry::events::{
     Claim, RegistryEvent, RegistryRx, RegistryTx, RegistryWeakTx, create_event_channel,
@@ -119,16 +121,15 @@ impl<V: Connectors, C: ClientHandshake> RegistryHandle<V, C> {
     /// would be a lock acquisition per entry before the first client has asked for anything.
     /// The first subscribe is due a sweep immediately - `next_sweep` is now - so a cold start
     /// costs exactly one.
-    pub(crate) fn spawn(
-        connectors: V,
-        instruments: InternalHashMap<CatalogueIdx, Box<[CataloguePair]>>,
-    ) -> Self {
+    pub(crate) fn spawn(connectors: V, catalogue: Instruments) -> Self {
         let (rx, tx) = create_event_channel();
+        let unresolved = catalogue.iter().map(|(idx, _)| idx).collect();
         let registry = Registry {
             entries: new_internal_map(),
             connectors,
+            catalogue,
             resolved: new_internal_map(),
-            unresolved: instruments,
+            unresolved,
             resolve_backoff: Backoff::new(RESOLVE_SWEEP_MAX),
             next_sweep: Instant::now(),
             shutting_down: false,
@@ -198,15 +199,19 @@ struct Registry<V, C> {
     /// serves an instrument's whole pair list as one merged book.
     entries: InternalHashMap<CatalogueIdx, Entry<C>>,
     connectors: V,
+    /// Every slot the catalogue named. Immutable for the life of the process, and what a
+    /// subscribe's pair list is checked against - whether or not the entry has resolved yet.
+    catalogue: Instruments,
     /// Catalogue entries every one of whose venues has interned its symbol. Nothing ever
     /// leaves this map: an `Instrument` handle stays valid for the life of the process.
     ///
     /// The pair list is an `Arc` so a caller can be handed its own handle without keeping the
     /// map borrowed - one atomic, and only on the path that starts a broadcaster.
     resolved: InternalHashMap<CatalogueIdx, Pairs>,
-    /// Catalogue entries not interned as of the last sweep. Emptied into `resolved` as the
-    /// connectors catch up.
-    unresolved: InternalHashMap<CatalogueIdx, Box<[CataloguePair]>>,
+    /// Indices not interned as of the last sweep, drained as the connectors catch up. Only the
+    /// indices: the pairs live in `catalogue`. A `Vec` because a sweep is a `retain` over all of
+    /// it, never a lookup of one.
+    unresolved: Vec<CatalogueIdx>,
     /// One backoff for the whole sweep rather than one per entry: a sweep is a single pass of
     /// read-locked lookups over every unresolved name, so pacing it once is both cheaper and
     /// the thing that actually bounds how much traffic a hammering client can put on the
@@ -253,11 +258,11 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     fn handle(&mut self, event: RegistryEvent<C>) {
         match event {
             RegistryEvent::Subscribe(joining) => {
-                let (idx, sock, reply) = joining.into_parts();
+                let (idx, asked, sock, reply) = joining.into_parts();
                 // A dropped receiver just means the handshake gave up; the client in a
                 // `Refused` goes with it, which closes the connection - the same answer,
                 // unwritten.
-                let _ = reply.send(self.subscribe(idx, sock));
+                let _ = reply.send(self.subscribe(idx, &asked, sock));
             }
             RegistryEvent::RetireIfIdle(retiring) => {
                 let (claim, reply) = retiring.into_parts();
@@ -286,14 +291,46 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     /// Hands `client` to the broadcaster for catalogue instrument `idx`, starting one if this
     /// is the first client.
     ///
-    /// An index the catalogue does not carry, or one whose venue has not interned its symbol
-    /// yet, is refused here - before any broadcaster exists - which is what keeps an
-    /// unservable subscribe from costing a connector round trip.
-    fn subscribe(&mut self, idx: CatalogueIdx, client: C) -> Result<(), Refused<C>> {
-        match self.resolve(idx) {
+    /// Checked in this order, ahead of any broadcaster existing: an index the catalogue does
+    /// not carry at all; one whose pairs no longer match what `asked` names, because the
+    /// catalogue file was edited and the client's view of it is stale; and one whose venue has
+    /// not interned its symbol yet. The stale check comes before resolution rather than after
+    /// so a mismatch is reported as a mismatch whether or not the entry has resolved yet, and
+    /// so a stale client cannot join a broadcaster that is already running for a fresh one.
+    fn subscribe(&mut self, idx: CatalogueIdx, asked: &[AskedPair], client: C) -> Result<(), Refused<C>> {
+        match self.check(idx, asked).and_then(|()| self.resolve(idx)) {
             Ok(pairs) => self.subscribe_resolved(idx, pairs, client),
             Err(rejected) => Err(Refused { client, rejected }),
         }
+    }
+
+    /// Whether `asked` is still what the catalogue lists under `idx`.
+    ///
+    /// # Errors
+    ///
+    /// [`RejectCode::UnknownInstrument`] for an index this server does not carry at all -
+    /// permanent, since the catalogue is loaded once - and [`RejectCode::InstrumentChanged`]
+    /// for one that is carried, but under different pairs than `asked` names - also permanent
+    /// for this request, but for the opposite reason: the client's catalogue is stale, and
+    /// re-fetching it is what fixes the next one.
+    fn check(&self, idx: CatalogueIdx, asked: &[AskedPair]) -> Result<(), Rejected> {
+        let Some(carried) = self.catalogue.get(idx) else {
+            return Err(Rejected::new(
+                RejectCode::UnknownInstrument,
+                format!("this server does not carry instrument {}", idx.get()).into_boxed_str(),
+            ));
+        };
+        if pairs_match(asked, carried) {
+            return Ok(());
+        }
+        Err(Rejected::new(
+            RejectCode::InstrumentChanged,
+            format!(
+                "instrument {} is no longer the pairs this request named - re-fetch the catalogue",
+                idx.get()
+            )
+            .into_boxed_str(),
+        ))
     }
 
     /// The catalogue entry `idx` names, if it can be served right now.
@@ -305,18 +342,12 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     ///
     /// # Errors
     ///
-    /// [`RejectCode::UnknownInstrument`] for an index this server does not carry at all -
-    /// permanent, since the catalogue is loaded once - and [`RejectCode::UnlistedSymbol`] for
-    /// one whose venue has not interned its symbol yet, which is worth retrying.
+    /// [`RejectCode::UnlistedSymbol`] for an index whose venue has not interned its symbol yet,
+    /// which is worth retrying. [`Registry::check`] is what turns down an index this server
+    /// does not carry at all before this is ever called.
     fn resolve(&mut self, idx: CatalogueIdx) -> Result<Pairs, Rejected> {
         if let Some(resolved) = self.resolved.get(&idx) {
             return Ok(Arc::clone(resolved));
-        }
-        if !self.unresolved.contains_key(&idx) {
-            return Err(Rejected::new(
-                RejectCode::UnknownInstrument,
-                format!("this server does not carry instrument {}", idx.get()).into_boxed_str(),
-            ));
         }
 
         let unlisted = || {
@@ -352,7 +383,11 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     fn sweep(&mut self) {
         let before = self.unresolved.len();
         let resolved = &mut self.resolved;
-        self.unresolved.retain(|idx, pairs| {
+        let catalogue = &self.catalogue;
+        self.unresolved.retain(|idx| {
+            let pairs = catalogue
+                .get(*idx)
+                .expect("an unresolved index is always one the catalogue still carries");
             if pairs.is_empty() {
                 return true;
             }
@@ -609,6 +644,7 @@ fn opened<E>(
 mod test {
     use super::events::Claim;
     use crate::broadcast::broadcaster::SESSION_SWEEP;
+    use crate::catalogue::AskedPair;
     use crate::client::mock::{MockClient, MockPeer, connected};
     use crate::registry::harness::{
         FIRST, Harness, registry_for, registry_for_pairs, registry_unlisted,
@@ -616,6 +652,7 @@ mod test {
     };
     use crate::test_util::FakeSource;
     use crate::venue::Venue;
+    use core_lib::shared_string::SharedString;
     use core_lib::venue::test_util::test_instrument_for;
     use md_wire::grpc::{CatalogueIdx, RejectCode};
     use std::sync::Arc;
@@ -636,7 +673,7 @@ mod test {
         oneshot::Receiver<Result<(), super::Refused<MockClient>>>,
     ) {
         let (peer, client) = connected();
-        let queued = harness.registry.subscribe(FIRST, client);
+        let queued = harness.registry.subscribe(FIRST, harness.asked(FIRST), client);
         (peer, queued)
     }
 
@@ -841,7 +878,7 @@ mod test {
         let (_peer, client) = connected();
         let refused = harness
             .registry
-            .subscribe(FIRST, client)
+            .subscribe(FIRST, harness.asked(FIRST), client)
             .await
             .expect("the registry task is alive")
             .expect_err("nothing is spawned after shutdown");
@@ -887,7 +924,7 @@ mod test {
         let (_peer, client) = connected();
         let refused = harness
             .registry
-            .subscribe(CatalogueIdx::new(99), client)
+            .subscribe(CatalogueIdx::new(99), harness.asked(CatalogueIdx::new(99)), client)
             .await
             .expect("the registry task is alive")
             .expect_err("nothing is carried at that index");
@@ -897,6 +934,159 @@ mod test {
             source.subscribed().is_empty(),
             "an index this server does not carry must not reach a connector"
         );
+    }
+
+    /// A wrong symbol under an otherwise correct venue is a mismatch, not a connector problem:
+    /// the catalogue no longer lists what this request claims, so it is refused before the
+    /// pairs ever reach a connector, and no entry is left behind to shadow a later, honest
+    /// attempt.
+    #[tokio::test]
+    async fn a_wrong_symbol_is_refused_as_instrument_changed() {
+        let source = Arc::new(FakeSource::default());
+        let harness = registry_for(&source, &[SYMBOL]);
+
+        let (_peer, client) = connected();
+        let wrong_symbol: Box<[AskedPair]> = vec![AskedPair::new(
+            SharedString::from_static_str(Venue::BinanceSpot.as_str()),
+            SharedString::from_static_str("not-the-symbol"),
+        )]
+        .into_boxed_slice();
+        let refused = harness
+            .registry
+            .subscribe(FIRST, wrong_symbol, client)
+            .await
+            .expect("the registry task is alive")
+            .expect_err("the symbol no longer matches what the catalogue carries");
+
+        assert_eq!(refused.code(), RejectCode::InstrumentChanged);
+        assert!(
+            !is_registered(&harness).await,
+            "a stale subscribe must not leave an entry that shadows a later, honest attempt"
+        );
+        assert!(
+            source.subscribed().is_empty(),
+            "a stale subscribe must not reach a connector"
+        );
+    }
+
+    /// The same, for a wrong venue rather than a wrong symbol - either half of a pair failing
+    /// to match is the same answer.
+    #[tokio::test]
+    async fn a_wrong_venue_is_refused_as_instrument_changed() {
+        let source = Arc::new(FakeSource::default());
+        let harness = registry_for(&source, &[SYMBOL]);
+
+        let (_peer, client) = connected();
+        let wrong_venue: Box<[AskedPair]> = vec![AskedPair::new(
+            SharedString::from_static_str(Venue::Bitstamp.as_str()),
+            SharedString::from_static_str(SYMBOL),
+        )]
+        .into_boxed_slice();
+        let refused = harness
+            .registry
+            .subscribe(FIRST, wrong_venue, client)
+            .await
+            .expect("the registry task is alive")
+            .expect_err("the venue no longer matches what the catalogue carries");
+
+        assert_eq!(refused.code(), RejectCode::InstrumentChanged);
+    }
+
+    /// The stale check runs ahead of resolution, so a mismatch is reported as a mismatch even
+    /// when nothing has interned the (wrong) symbol yet - it must not be reported as
+    /// `UnlistedSymbol` instead, which would tell a stale client to keep retrying forever.
+    #[tokio::test]
+    async fn a_mismatched_pair_list_is_refused_even_before_the_index_resolves() {
+        let source = Arc::new(FakeSource::default());
+        let harness = registry_unlisted(&source, &[SYMBOL]);
+
+        let (_peer, client) = connected();
+        let wrong: Box<[AskedPair]> = vec![AskedPair::new(
+            SharedString::from_static_str(Venue::BinanceSpot.as_str()),
+            SharedString::from_static_str("not-the-symbol"),
+        )]
+        .into_boxed_slice();
+        let refused = harness
+            .registry
+            .subscribe(FIRST, wrong, client)
+            .await
+            .expect("the registry task is alive")
+            .expect_err("the pairs do not match, resolved or not");
+
+        assert_eq!(refused.code(), RejectCode::InstrumentChanged);
+        assert!(
+            source.subscribed().is_empty(),
+            "a stale subscribe must not reach a connector"
+        );
+    }
+
+    /// An empty pair list is a mismatch too: a carried instrument always lists at least one
+    /// pair, so naming none is never what the catalogue actually carries at that index.
+    #[tokio::test]
+    async fn an_empty_pair_list_against_a_carried_instrument_is_refused() {
+        let source = Arc::new(FakeSource::default());
+        let harness = registry_for(&source, &[SYMBOL]);
+
+        let (_peer, client) = connected();
+        let refused = harness
+            .registry
+            .subscribe(FIRST, Vec::new().into_boxed_slice(), client)
+            .await
+            .expect("the registry task is alive")
+            .expect_err("an empty pair list never matches a carried instrument");
+
+        assert_eq!(refused.code(), RejectCode::InstrumentChanged);
+    }
+
+    /// A venue name in a different case still matches: `Venue::parse` is case-insensitive, and
+    /// a correct client must not be told its catalogue changed just because it spelled the
+    /// venue differently than this build's own `as_str`.
+    #[tokio::test]
+    async fn a_venue_name_in_the_wrong_case_still_matches() {
+        let source = Arc::new(FakeSource::default());
+        let harness = registry_for(&source, &[SYMBOL]);
+
+        let (_peer, client) = connected();
+        let shouted: Box<[AskedPair]> = vec![AskedPair::new(
+            SharedString::from(Venue::BinanceSpot.as_str().to_uppercase()),
+            SharedString::from_static_str(SYMBOL),
+        )]
+        .into_boxed_slice();
+        harness
+            .registry
+            .subscribe(FIRST, shouted, client)
+            .await
+            .expect("the registry task is alive")
+            .expect("a different case is still the same venue");
+    }
+
+    /// A second client is checked the same as the first, even though a broadcaster is already
+    /// running for the key: a stale client must not be able to join a fresh broadcaster simply
+    /// by arriving after it started.
+    #[tokio::test]
+    async fn a_stale_client_is_refused_even_against_a_running_broadcaster() {
+        let source = Arc::new(FakeSource::default());
+        let harness = registry_for(&source, &[SYMBOL]);
+        let first = subscribed(&harness).await;
+        first
+            .accepted()
+            .await
+            .expect("the fake source accepts every symbol");
+
+        let (_peer, client) = connected();
+        let wrong: Box<[AskedPair]> = vec![AskedPair::new(
+            SharedString::from_static_str(Venue::BinanceSpot.as_str()),
+            SharedString::from_static_str("not-the-symbol"),
+        )]
+        .into_boxed_slice();
+        let refused = harness
+            .registry
+            .subscribe(FIRST, wrong, client)
+            .await
+            .expect("the registry task is alive")
+            .expect_err("the pairs do not match, even against a running broadcaster");
+
+        assert_eq!(refused.code(), RejectCode::InstrumentChanged);
     }
 
     /// The pacing that keeps a client retrying in a tight loop off the process-global
@@ -969,7 +1159,7 @@ mod test {
         let (_peer, unlisted) = connected();
         let refused = harness
             .registry
-            .subscribe(CatalogueIdx::new(1), unlisted)
+            .subscribe(CatalogueIdx::new(1), harness.asked(CatalogueIdx::new(1)), unlisted)
             .await
             .expect("the registry task is alive")
             .expect_err("nothing has interned the second symbol");
@@ -1029,7 +1219,7 @@ mod test {
         let (_peer, client) = connected();
         let refused = harness
             .registry
-            .subscribe(FIRST, client)
+            .subscribe(FIRST, harness.asked(FIRST), client)
             .await
             .expect("the registry task is alive")
             .expect_err("the second venue has not interned its spelling yet");
@@ -1114,7 +1304,7 @@ mod test {
     async fn listed_reply(harness: &Harness, client: MockClient, idx: CatalogueIdx) {
         harness
             .registry
-            .subscribe(idx, client)
+            .subscribe(idx, harness.asked(idx), client)
             .await
             .expect("the registry task is alive")
             .expect("the instrument resolves");
@@ -1173,10 +1363,11 @@ mod test {
 pub(crate) mod harness {
     use super::RegistryHandle;
     use super::events::RegistryTx;
-    use crate::catalogue::Catalogue;
+    use crate::catalogue::{AskedPair, Catalogue};
     use crate::client::mock::MockClient;
     use crate::test_util::{FakeConnectors, FakeSource};
     use crate::venue::Venue;
+    use core_lib::shared_string::SharedString;
     use core_lib::venue::test_util::test_instrument_for;
     use md_wire::grpc::CatalogueIdx;
     use std::sync::Arc;
@@ -1188,7 +1379,7 @@ pub(crate) mod harness {
     /// A registry over one Binance-side source, carrying `symbols` at their position in the
     /// slice - and with each of them interned, the way a connector's listing refresh would
     /// have, so every one resolves on the first sweep.
-    pub(crate) fn registry_for(source: &Arc<FakeSource>, symbols: &[&str]) -> Harness {
+    pub(crate) fn registry_for(source: &Arc<FakeSource>, symbols: &[&'static str]) -> Harness {
         for symbol in symbols {
             let _ = test_instrument_for(Venue::BinanceSpot, symbol);
         }
@@ -1197,13 +1388,15 @@ pub(crate) mod harness {
 
     /// The same, without interning anything: the catalogue names the symbols and whether
     /// their venue has listed them is the test's to arrange.
-    pub(crate) fn registry_unlisted(source: &Arc<FakeSource>, symbols: &[&str]) -> Harness {
-        let entries: Vec<[(Venue, &str); 1]> = symbols
+    pub(crate) fn registry_unlisted(source: &Arc<FakeSource>, symbols: &[&'static str]) -> Harness {
+        let entries: Vec<[(Venue, &'static str); 1]> = symbols
             .iter()
             .map(|symbol| [(Venue::BinanceSpot, *symbol)])
             .collect();
-        let instruments: Vec<&[(Venue, &str)]> =
-            entries.iter().map(<[(Venue, &str); 1]>::as_slice).collect();
+        let instruments: Vec<&[(Venue, &'static str)]> = entries
+            .iter()
+            .map(<[(Venue, &'static str); 1]>::as_slice)
+            .collect();
 
         build(source, &Arc::new(FakeSource::default()), &instruments)
     }
@@ -1217,7 +1410,7 @@ pub(crate) mod harness {
     pub(crate) fn registry_for_pairs(
         binance_spot: &Arc<FakeSource>,
         bitstamp: &Arc<FakeSource>,
-        instruments: &[&[(Venue, &str)]],
+        instruments: &[&[(Venue, &'static str)]],
     ) -> Harness {
         for pairs in instruments {
             for (venue, symbol) in *pairs {
@@ -1232,7 +1425,7 @@ pub(crate) mod harness {
     pub(crate) fn registry_unlisted_pairs(
         binance_spot: &Arc<FakeSource>,
         bitstamp: &Arc<FakeSource>,
-        instruments: &[&[(Venue, &str)]],
+        instruments: &[&[(Venue, &'static str)]],
     ) -> Harness {
         build(binance_spot, bitstamp, instruments)
     }
@@ -1242,7 +1435,7 @@ pub(crate) mod harness {
     fn build(
         binance_spot: &Arc<FakeSource>,
         bitstamp: &Arc<FakeSource>,
-        instruments: &[&[(Venue, &str)]],
+        instruments: &[&[(Venue, &'static str)]],
     ) -> Harness {
         let carried: Vec<(u32, &[(Venue, &str)])> = instruments
             .iter()
@@ -1259,6 +1452,7 @@ pub(crate) mod harness {
 
         Harness {
             registry: handle.tx(),
+            instruments: instruments.iter().map(|pairs| pairs.to_vec()).collect(),
         }
     }
 
@@ -1272,5 +1466,29 @@ pub(crate) mod harness {
     #[derive(Debug)]
     pub(crate) struct Harness {
         pub(crate) registry: RegistryTx<MockClient>,
+        /// Mirrors what `build` filed the catalogue as, so [`Harness::asked`] can hand back
+        /// exactly the pairs a well-behaved client would echo for an index without a test
+        /// re-deriving the catalogue's own shape.
+        instruments: Vec<Vec<(Venue, &'static str)>>,
+    }
+
+    impl Harness {
+        /// The pairs a well-behaved client would send back for `idx` - exactly what this
+        /// harness's catalogue lists there. What every test but the ones about a *mismatched*
+        /// pair list should pass to a subscribe.
+        pub(crate) fn asked(&self, idx: CatalogueIdx) -> Box<[AskedPair]> {
+            let position = usize::try_from(idx.get()).expect("a test index fits a usize");
+            self.instruments
+                .get(position)
+                .into_iter()
+                .flatten()
+                .map(|&(venue, symbol)| {
+                    AskedPair::new(
+                        SharedString::from_static_str(venue.as_str()),
+                        SharedString::from_static_str(symbol),
+                    )
+                })
+                .collect()
+        }
     }
 }

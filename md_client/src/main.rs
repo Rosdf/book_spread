@@ -12,12 +12,12 @@
 
 // The binary is a thin shell over the library, so these reach it only through `md_client`.
 // Naming them here is what keeps `unused_crate_dependencies` quiet for this target.
-use md_wire as _;
 use tonic as _;
 use tonic_prost as _;
 
 use md_client::{ADDR_VAR, DEFAULT_ADDR, VenueNames, catalogue, follow, reject_code};
 use md_proto::md::v1 as proto;
+use md_wire::grpc::RejectCode;
 use std::fmt::Write as _;
 
 #[tokio::main]
@@ -29,17 +29,32 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = std::env::var(ADDR_VAR).unwrap_or_else(|_| DEFAULT_ADDR.to_owned());
     let carried = catalogue(&addr).await?;
+    let venues = VenueNames::from_catalogue(&carried);
     let instrument = find(&carried, venue, symbol)
         .ok_or_else(|| anyhow::anyhow!("{}", not_carried(&carried, venue, symbol)))?;
 
-    let venues = VenueNames::from_catalogue(&carried);
+    let pairs = instrument
+        .pairs
+        .iter()
+        .map(|pair| proto::SubscribePair {
+            venue: venues.name(pair.venue_idx),
+            symbol: pair.symbol.clone(),
+        })
+        .collect();
     let label = format!("{venue}/{symbol}");
-    if let Err(status) = follow(&addr, instrument, &venues, &label).await {
+    if let Err(status) = follow(&addr, instrument.idx, pairs, &venues, &label).await {
         // The canonical status says what kind of problem it was; the metadata says which one
         // exactly, and therefore whether trying the same request again could ever work.
         match reject_code(&status) {
             Some(code) if code.retryable() => {
                 eprintln!("stream ended: {} ({code:?}, worth retrying)", status.message());
+            }
+            Some(RejectCode::InstrumentChanged) => {
+                eprintln!(
+                    "stream ended: {} (InstrumentChanged) - the catalogue changed since it was \
+                     read; re-run to fetch it again",
+                    status.message()
+                );
             }
             Some(code) => eprintln!("stream ended: {} ({code:?})", status.message()),
             None => eprintln!("stream ended: {status}"),
@@ -48,28 +63,28 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The index of the instrument carrying `(venue, symbol)`, if this server carries one.
+/// The instrument carrying `(venue, symbol)`, if this server carries one.
 ///
 /// The venue name is matched case-insensitively - it is this build's own spelling of a venue -
 /// while the symbol is not: a venue's symbol is whatever that venue calls it, and the
 /// catalogue carries it verbatim.
-fn find(catalogue: &proto::CatalogueResponse, venue: &str, symbol: &str) -> Option<u32> {
+fn find<'a>(
+    catalogue: &'a proto::CatalogueResponse,
+    venue: &str,
+    symbol: &str,
+) -> Option<&'a proto::InstrumentEntry> {
     let venue_idx = catalogue
         .venues
         .iter()
         .find(|entry| entry.name.eq_ignore_ascii_case(venue))?
         .idx;
 
-    catalogue
-        .instruments
-        .iter()
-        .find(|instrument| {
-            instrument
-                .pairs
-                .iter()
-                .any(|pair| pair.venue_idx == venue_idx && pair.symbol == symbol)
-        })
-        .map(|instrument| instrument.idx)
+    catalogue.instruments.iter().find(|instrument| {
+        instrument
+            .pairs
+            .iter()
+            .any(|pair| pair.venue_idx == venue_idx && pair.symbol == symbol)
+    })
 }
 
 /// What to print when the server does not carry what was asked for: the pair, and everything

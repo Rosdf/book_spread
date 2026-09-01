@@ -52,7 +52,11 @@ pub(crate) fn put_message(out: &mut impl BufMut, field: u32, body: &[u8]) {
 /// The server's own numbering rather than the catalogue file's: a catalogue names its venues
 /// by name, and this is the one place that turns a name into the number every `Level`,
 /// `Pair.venue_idx` and `VenueEntry.idx` is stamped with. Changing one of these renumbers
-/// every level already shipped, so they are a client-visible contract.
+/// every level already shipped, so they are a contract - but only within one build's lifetime:
+/// nothing on the wire says which build assigned a given number, so a differently-built server
+/// could number its venues differently and an echoed index would match while meaning another
+/// venue. That is exactly why `SubscribeBookRequest.pairs` names a venue by string rather than
+/// by the index `CatalogueResponse.venues` gave it - see `md_server::catalogue::AskedPair`.
 ///
 /// Numbered from one, not zero. Zero is a `uint32`'s proto3 default, which prost elides, so a
 /// venue holding it would encode to nothing at all - see [`put_venue_idx`], which is free to

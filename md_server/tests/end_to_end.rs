@@ -93,13 +93,23 @@ async fn connect(addr: SocketAddr) -> MarketDataClient<Channel> {
         .expect("the listener is accepting")
 }
 
-/// Opens a stream for the instrument the catalogue carries at `idx`.
+/// Opens a stream for the instrument the catalogue carries at `idx`, naming `pairs` as what
+/// the catalogue is expected to list under it - the honest client's shape, since a stale index
+/// is exactly what `md_wire::grpc::RejectCode::InstrumentChanged` exists to catch.
 async fn subscribe(
     addr: SocketAddr,
     idx: u32,
+    pairs: &[(Venue, &str)],
 ) -> Result<Streaming<proto::BookUpdate>, tonic::Status> {
     let request = proto::SubscribeBookRequest {
         instrument_idx: idx,
+        pairs: pairs
+            .iter()
+            .map(|&(venue, symbol)| proto::SubscribePair {
+                venue: venue.as_str().to_owned(),
+                symbol: symbol.to_owned(),
+            })
+            .collect(),
     };
     Ok(connect(addr).await.subscribe_book(request).await?.into_inner())
 }
@@ -151,7 +161,7 @@ async fn a_tonic_client_streams_a_book_over_the_wire() {
     .await;
 
     list(Venue::BinanceSpot, "WIREBTCUSDT");
-    let mut books = subscribe(server.addr, 0)
+    let mut books = subscribe(server.addr, 0, &[(Venue::BinanceSpot, "WIREBTCUSDT")])
         .await
         .expect("the fake source accepts every symbol");
     opening_snapshot(&mut books).await;
@@ -247,9 +257,13 @@ async fn a_client_resolves_a_pair_through_the_catalogue_and_streams_it() {
         })
         .expect("the server carries the pair this test asked about");
 
-    let mut books = subscribe(server.addr, wanted.idx)
-        .await
-        .expect("the fake source accepts every symbol");
+    let mut books = subscribe(
+        server.addr,
+        wanted.idx,
+        &[(Venue::BinanceSpot, "RESOLVEETHUSDT")],
+    )
+    .await
+    .expect("the fake source accepts every symbol");
     opening_snapshot(&mut books).await;
     source.publish("RESOLVEETHUSDT", &book(&[(3.5, 2.0)], &[]));
     assert_eq!(next_book(&mut books).await.asks[0].price, 3.5);
@@ -270,10 +284,10 @@ async fn one_book_reaches_two_tonic_clients_identically() {
     .await;
 
     list(Venue::BinanceSpot, "SHAREDBTCUSDT");
-    let mut first = subscribe(server.addr, 0)
+    let mut first = subscribe(server.addr, 0, &[(Venue::BinanceSpot, "SHAREDBTCUSDT")])
         .await
         .expect("the fake source accepts every symbol");
-    let mut second = subscribe(server.addr, 0)
+    let mut second = subscribe(server.addr, 0, &[(Venue::BinanceSpot, "SHAREDBTCUSDT")])
         .await
         .expect("the fake source accepts every symbol");
     opening_snapshot(&mut first).await;
@@ -318,9 +332,16 @@ async fn a_multi_pair_instrument_streams_one_merged_book() {
 
     list(Venue::BinanceSpot, "MULTIBTCUSDT");
     list(Venue::Bitstamp, "multibtcusd");
-    let mut books = subscribe(server.addr, 0)
-        .await
-        .expect("both venues accept the instrument's spelling");
+    let mut books = subscribe(
+        server.addr,
+        0,
+        &[
+            (Venue::BinanceSpot, "MULTIBTCUSDT"),
+            (Venue::Bitstamp, "multibtcusd"),
+        ],
+    )
+    .await
+    .expect("both venues accept the instrument's spelling");
     opening_snapshot(&mut books).await;
 
     binance_spot.publish("MULTIBTCUSDT", &book(&[(100.0, 1.0)], &[(99.0, 1.0)]));
@@ -383,7 +404,7 @@ async fn a_refused_request_is_a_status_with_a_reason() {
     )
     .await;
 
-    let status = subscribe(server.addr, 41)
+    let status = subscribe(server.addr, 41, &[])
         .await
         .expect_err("an index this server does not carry is refused");
 
@@ -397,6 +418,42 @@ async fn a_refused_request_is_a_status_with_a_reason() {
     assert!(
         !RejectCode::UnknownInstrument.retryable(),
         "the catalogue is loaded once, so an index it does not carry never will be"
+    );
+
+    stop(server).await;
+}
+
+/// The honest path, end to end: fetch the catalogue, subscribe with exactly the pairs it gave,
+/// and the stream opens. Then subscribe to the same index with a mutated symbol - the shape a
+/// client sees after the catalogue file was edited and the server restarted on it - and the
+/// stream is refused rather than silently opened on whatever the index means now.
+///
+/// The only place the proto change, the prost decode, the registry's pair check, the reject
+/// code and the gRPC status are all exercised together over a real socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_pair_list_is_refused_as_instrument_changed() {
+    let source = Arc::new(FakeSource::default());
+    let server = start(
+        &source,
+        TestCatalogue::new().with(0, Venue::BinanceSpot, "STALEBTCUSDT"),
+    )
+    .await;
+    list(Venue::BinanceSpot, "STALEBTCUSDT");
+
+    let mut books = subscribe(server.addr, 0, &[(Venue::BinanceSpot, "STALEBTCUSDT")])
+        .await
+        .expect("the pairs named are exactly what the catalogue carries");
+    opening_snapshot(&mut books).await;
+    drop(books);
+
+    let status = subscribe(server.addr, 0, &[(Venue::BinanceSpot, "WRONGSYMBOL")])
+        .await
+        .expect_err("the pair list no longer matches what the catalogue carries at this index");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(reject_code(&status), Some(RejectCode::InstrumentChanged));
+    assert!(
+        !RejectCode::InstrumentChanged.retryable(),
+        "retrying the same stale pairs cannot help - only re-fetching the catalogue can"
     );
 
     stop(server).await;
@@ -416,7 +473,7 @@ async fn an_unlisted_symbol_is_retryable_and_succeeds_once_its_venue_lists_it() 
     )
     .await;
 
-    let status = subscribe(server.addr, 0)
+    let status = subscribe(server.addr, 0, &[(Venue::BinanceSpot, "NOTLISTEDYETBTC")])
         .await
         .expect_err("nothing has interned the symbol yet");
     assert_eq!(status.code(), tonic::Code::NotFound);
@@ -434,7 +491,7 @@ async fn an_unlisted_symbol_is_retryable_and_succeeds_once_its_venue_lists_it() 
     list(Venue::BinanceSpot, "NOTLISTEDYETBTC");
     tokio::time::sleep(AFTER_A_SWEEP).await;
 
-    let mut books = subscribe(server.addr, 0)
+    let mut books = subscribe(server.addr, 0, &[(Venue::BinanceSpot, "NOTLISTEDYETBTC")])
         .await
         .expect("the symbol is listed now");
     opening_snapshot(&mut books).await;
@@ -455,7 +512,7 @@ async fn a_connector_refusal_reaches_the_client_as_retryable() {
     .await;
 
     list(Venue::BinanceSpot, "CONNREFUSEDBTC");
-    let status = subscribe(server.addr, 0)
+    let status = subscribe(server.addr, 0, &[(Venue::BinanceSpot, "CONNREFUSEDBTC")])
         .await
         .expect_err("the source rejects every symbol");
 
@@ -483,10 +540,10 @@ async fn two_symbols_are_two_connections() {
 
     list(Venue::BinanceSpot, "twobtcusdt");
     list(Venue::BinanceSpot, "twoethusdt");
-    let mut btc = subscribe(server.addr, 0)
+    let mut btc = subscribe(server.addr, 0, &[(Venue::BinanceSpot, "twobtcusdt")])
         .await
         .expect("the fake source accepts every symbol");
-    let mut eth = subscribe(server.addr, 1)
+    let mut eth = subscribe(server.addr, 1, &[(Venue::BinanceSpot, "twoethusdt")])
         .await
         .expect("the fake source accepts every symbol");
     opening_snapshot(&mut btc).await;
@@ -515,7 +572,7 @@ async fn shutdown_ends_an_attached_client_with_a_status() {
     .await;
 
     list(Venue::BinanceSpot, "shutdownbtcusdt");
-    let mut books = subscribe(server.addr, 0)
+    let mut books = subscribe(server.addr, 0, &[(Venue::BinanceSpot, "shutdownbtcusdt")])
         .await
         .expect("the fake source accepts every symbol");
     opening_snapshot(&mut books).await;
@@ -566,7 +623,10 @@ async fn an_unknown_method_is_unimplemented() {
     let path = http::uri::PathAndQuery::from_static("/md.v1.MarketData/NoSuchMethod");
     let status = grpc
         .server_streaming::<_, proto::BookUpdate, _>(
-            tonic::Request::new(proto::SubscribeBookRequest { instrument_idx: 0 }),
+            tonic::Request::new(proto::SubscribeBookRequest {
+                instrument_idx: 0,
+                pairs: Vec::new(),
+            }),
             path,
             tonic_prost::ProstCodec::default(),
         )

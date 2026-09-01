@@ -669,7 +669,7 @@ mod test {
     async fn hand_over(harness: &Harness, client: MockClient) {
         harness
             .registry
-            .subscribe(FIRST, client)
+            .subscribe(FIRST, harness.asked(FIRST), client)
             .await
             .expect("the registry task is alive")
             .expect("the registry is still spawning");

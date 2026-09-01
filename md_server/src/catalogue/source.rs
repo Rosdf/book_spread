@@ -117,7 +117,7 @@ mod test {
             .await
             .expect("the fixture is a valid catalogue");
         assert!(
-            loaded.instruments().contains_key(&CatalogueIdx::new(1)),
+            loaded.instruments().get(CatalogueIdx::new(1)).is_some(),
             "an entry's position in the file is what a client will name"
         );
 

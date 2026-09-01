@@ -419,7 +419,13 @@ mod test {
     const TINY_WINDOW: u32 = 40;
 
     fn request() -> SubscribeBookRequest {
-        SubscribeBookRequest { instrument_idx: 7 }
+        SubscribeBookRequest {
+            instrument_idx: 7,
+            pairs: vec![md_proto::md::v1::SubscribePair {
+                venue: "binance_spot".to_owned(),
+                symbol: "BTCUSDT".to_owned(),
+            }],
+        }
     }
 
     /// One gRPC length-prefixed message, the way the encoder produces one.

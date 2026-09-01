@@ -7,9 +7,9 @@
 //! in exactly one place in this crate. [`test::the_hand_encoder_agrees_with_prost`] is what
 //! keeps it honest.
 //!
-//! Instruments are written in index order. A hash map iterates in whatever order it likes, and
-//! a response that reshuffles itself between runs of the same binary is a needless thing to
-//! debug.
+//! Instruments are written in index order, which is simply [`crate::catalogue::Instruments`]'s
+//! own order: it is a slice indexed by position, so there is no iteration order to defend
+//! against the way a hash map would need.
 
 use crate::catalogue::Catalogue;
 use crate::encode::{put_message, put_string, put_uint32, put_venue_idx};
@@ -45,9 +45,7 @@ pub(crate) fn encode(catalogue: &Catalogue) -> Bytes {
         put_message(&mut message, VENUES_FIELD, &entries);
     }
 
-    let mut instruments: Vec<_> = catalogue.instruments().iter().collect();
-    instruments.sort_unstable_by_key(|(idx, _)| **idx);
-    for (idx, pairs) in instruments {
+    for (idx, pairs) in catalogue.instruments().iter() {
         entries.clear();
         put_uint32(&mut entries, IDX_FIELD, idx.get());
         for pair in pairs {

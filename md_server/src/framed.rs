@@ -10,6 +10,7 @@
 //! accept loop nor anything below it names HTTP/2 - see [`crate::grpc`] for the one place that
 //! does.
 
+use crate::catalogue::AskedPair;
 use crate::client::{ClientHandshake as _, HandshakeError, Handshaker, Route};
 use crate::registry::events::RegistryTx;
 use crate::transport::{self, Listener};
@@ -137,8 +138,13 @@ async fn handshake<S: Send + 'static, H: Handshaker<S>, P: Debug>(
     // having panicked - with this client in hand. There is nothing to answer on, because
     // there is nothing left to answer *with*; it went with the reply, and dropping it is what
     // closes the connection.
+    let asked: Box<[AskedPair]> = request
+        .pairs
+        .into_iter()
+        .map(|pair| AskedPair::new(pair.venue.into(), pair.symbol.into()))
+        .collect();
     match registry
-        .subscribe(CatalogueIdx::new(request.instrument_idx), client)
+        .subscribe(CatalogueIdx::new(request.instrument_idx), asked, client)
         .await
     {
         Ok(Ok(())) => {}
@@ -191,7 +197,10 @@ mod test {
         ));
 
         for idx in 0..2 {
-            script.asks_for(CatalogueIdx::new(idx));
+            script.asks_for(
+                CatalogueIdx::new(idx),
+                &[("binance_spot", SYMBOLS[idx as usize])],
+            );
             let _connection = connector.connect();
             let peer = script.next_peer().await;
             peer.accepted()
@@ -269,7 +278,7 @@ mod test {
         ));
 
         script.says_nothing();
-        script.asks_for(CatalogueIdx::new(0));
+        script.asks_for(CatalogueIdx::new(0), &[("binance_spot", "STILLINFLIGHTBTCUSDT")]);
         let _silent = connector.connect();
         let _talkative = connector.connect();
 

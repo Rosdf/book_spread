@@ -7,6 +7,7 @@
 //! an answer carry an `oneshot::Sender` for it; the ones that do not are fire-and-forget,
 //! and are still ordered against everything else by the queue.
 
+use crate::catalogue::AskedPair;
 use crate::registry::Refused;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -57,20 +58,44 @@ impl Claim {
 #[derive(Debug)]
 pub(super) struct Subscribe<C> {
     idx: CatalogueIdx,
+    /// Every pair the client claims the catalogue listed under `idx`, checked against what the
+    /// registry actually carries before anything else happens for this request.
+    asked: Box<[AskedPair]>,
     client: C,
     reply: oneshot::Sender<Result<(), Refused<C>>>,
 }
 
 impl<C> Subscribe<C> {
-    fn new(idx: CatalogueIdx, client: C) -> (Self, oneshot::Receiver<Result<(), Refused<C>>>) {
+    fn new(
+        idx: CatalogueIdx,
+        asked: Box<[AskedPair]>,
+        client: C,
+    ) -> (Self, oneshot::Receiver<Result<(), Refused<C>>>) {
         let (reply, rx) = oneshot::channel();
-        (Self { idx, client, reply }, rx)
+        (
+            Self {
+                idx,
+                asked,
+                client,
+                reply,
+            },
+            rx,
+        )
     }
 
-    pub(super) fn into_parts(self) -> (CatalogueIdx, C, oneshot::Sender<Result<(), Refused<C>>>) {
-        (self.idx, self.client, self.reply)
+    pub(super) fn into_parts(self) -> SubscribeParts<C> {
+        (self.idx, self.asked, self.client, self.reply)
     }
 }
+
+/// What [`Subscribe::into_parts`] hands back: the index, the pairs claimed under it, the
+/// client, and where the answer goes.
+type SubscribeParts<C> = (
+    CatalogueIdx,
+    Box<[AskedPair]>,
+    C,
+    oneshot::Sender<Result<(), Refused<C>>>,
+);
 
 /// A broadcaster whose session list has just emptied, asking whether it may stop.
 #[derive(Debug)]
@@ -152,17 +177,22 @@ impl<C> RegistryTx<C> {
     /// Hands `client` to the broadcaster for catalogue instrument `idx`, starting one if this
     /// is the first client.
     ///
+    /// `asked` is every pair the client claims the catalogue listed under `idx` - checked
+    /// against what the registry actually carries before anything else, since an index alone
+    /// can outlive the catalogue file it was read from.
+    ///
     /// The reply carries the client back only when the registry declined to take it at all -
-    /// which now includes an index the catalogue does not carry, and one whose venue has not
-    /// interned its symbol yet. A reply of `Err` - the task gone, or a handler that panicked
-    /// on the way - means the same thing to a caller as a refusal it could not write: drop the
-    /// connection.
+    /// which now includes an index the catalogue does not carry, one it carries under
+    /// different pairs than `asked` names, and one whose venue has not interned its symbol
+    /// yet. A reply of `Err` - the task gone, or a handler that panicked on the way - means the
+    /// same thing to a caller as a refusal it could not write: drop the connection.
     pub(crate) fn subscribe(
         &self,
         idx: CatalogueIdx,
+        asked: Box<[AskedPair]>,
         client: C,
     ) -> oneshot::Receiver<Result<(), Refused<C>>> {
-        let (event, rx) = Subscribe::new(idx, client);
+        let (event, rx) = Subscribe::new(idx, asked, client);
         self.send(RegistryEvent::Subscribe(event));
         rx
     }

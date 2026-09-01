@@ -522,12 +522,20 @@ pub(crate) mod mock {
     }
 
     impl ScriptControl {
-        /// The next connection accepted subscribes to this catalogue index.
-        pub(crate) fn asks_for(&self, instrument: CatalogueIdx) {
+        /// The next connection accepted subscribes to this catalogue index, naming `pairs` as
+        /// what it read the catalogue listing under it.
+        pub(crate) fn asks_for(&self, instrument: CatalogueIdx, pairs: &[(&str, &str)]) {
             self.lock()
                 .answers
                 .push_back(Some(Asked::Subscribe(SubscribeBookRequest {
                     instrument_idx: instrument.get(),
+                    pairs: pairs
+                        .iter()
+                        .map(|&(venue, symbol)| md_proto::md::v1::SubscribePair {
+                            venue: venue.to_owned(),
+                            symbol: symbol.to_owned(),
+                        })
+                        .collect(),
                 })));
         }
 
