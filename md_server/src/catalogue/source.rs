@@ -121,6 +121,23 @@ mod test {
             "an entry's position in the file is what a client will name"
         );
 
+        std::fs::write(
+            &path,
+            r#"
+            [[instruments]]
+            pairs = [{ venue = "kraken", symbol = "XBTUSD" }]
+            "#,
+        )
+        .expect("the temp file is writable");
+        assert!(
+            matches!(
+                FileCatalogue::new(&path).load().await,
+                Err(LoadCatalogueError::Build { .. })
+            ),
+            "a venue this build does not carry must fail startup rather than serve less than \
+             the file names"
+        );
+
         std::fs::write(&path, "this is not toml = = =").expect("the temp file is writable");
         assert!(matches!(
             FileCatalogue::new(&path).load().await,
@@ -136,5 +153,17 @@ mod test {
             "a missing catalogue must fail startup rather than serve nobody"
         );
         std::fs::remove_dir_all(&dir).expect("the temp dir exists");
+    }
+
+    /// The catalogue this build actually ships loads, since a refusal here is now fatal at
+    /// startup rather than a dropped entry.
+    #[tokio::test]
+    async fn the_shipped_catalogue_loads() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../catalogue.toml");
+        let loaded = FileCatalogue::new(path)
+            .load()
+            .await
+            .expect("catalogue.toml names only venues this build carries");
+        assert_eq!(loaded.instruments().len(), 20);
     }
 }

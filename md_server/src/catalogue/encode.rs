@@ -77,15 +77,12 @@ mod test {
     #[test]
     fn the_hand_encoder_agrees_with_prost() {
         let catalogue = Catalogue::for_test(&[
-            (0, &[(Venue::BinanceSpot, "BTCUSDT")]),
-            (
-                9,
-                &[(Venue::BinanceSpot, "ETHUSDT"), (Venue::Bitstamp, "ethusd")],
-            ),
+            &[(Venue::BinanceSpot, "BTCUSDT")],
+            &[(Venue::BinanceSpot, "ETHUSDT"), (Venue::Bitstamp, "ethusd")],
             // An entry with no pairs at all, and one whose symbol is the empty string: both
             // are elision cases, and both are reachable from a hand-written catalogue file.
-            (11, &[]),
-            (12, &[(Venue::Bitstamp, "")]),
+            &[],
+            &[(Venue::Bitstamp, "")],
         ]);
 
         let expected = proto::CatalogueResponse {
@@ -108,7 +105,7 @@ mod test {
                     }],
                 },
                 proto::InstrumentEntry {
-                    idx: 9,
+                    idx: 1,
                     pairs: vec![
                         proto::Pair {
                             venue_idx: 1,
@@ -121,11 +118,11 @@ mod test {
                     ],
                 },
                 proto::InstrumentEntry {
-                    idx: 11,
+                    idx: 2,
                     pairs: Vec::new(),
                 },
                 proto::InstrumentEntry {
-                    idx: 12,
+                    idx: 3,
                     pairs: vec![proto::Pair {
                         venue_idx: 2,
                         symbol: String::new(),
@@ -155,13 +152,13 @@ mod test {
     /// round trip lands the indices it will subscribe by.
     #[test]
     fn a_client_decodes_the_indices_it_will_subscribe_by() {
-        let catalogue = Catalogue::for_test(&[(4, &[(Venue::Bitstamp, "btcusd")])]);
+        let catalogue = Catalogue::for_test(&[&[(Venue::Bitstamp, "btcusd")]]);
         let encoded = super::encode(&catalogue);
 
         let decoded = proto::CatalogueResponse::decode(&encoded[MESSAGE_PREFIX..])
             .expect("the message is a CatalogueResponse");
         assert_eq!(decoded.instruments.len(), 1);
-        assert_eq!(decoded.instruments[0].idx, 4);
+        assert_eq!(decoded.instruments[0].idx, 0);
         assert_eq!(decoded.instruments[0].pairs[0].symbol, "btcusd");
         let venue_idx = decoded.instruments[0].pairs[0].venue_idx;
         assert_eq!(

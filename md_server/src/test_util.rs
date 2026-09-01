@@ -195,7 +195,7 @@ fn positive(value: f64) -> PositiveF64 {
 /// either side spelling the numbering out.
 #[derive(Debug, Default)]
 pub struct TestCatalogue {
-    instruments: Vec<(u32, Vec<(Venue, String)>)>,
+    instruments: Vec<Vec<(Venue, String)>>,
 }
 
 impl TestCatalogue {
@@ -204,53 +204,46 @@ impl TestCatalogue {
         Self::default()
     }
 
-    /// Carries `symbol` on `venue` at instrument index `idx`.
+    /// Appends an instrument carrying `symbol` on `venue`, at the next index.
     #[must_use]
-    pub fn with(mut self, idx: u32, venue: Venue, symbol: &str) -> Self {
-        self.instruments
-            .push((idx, vec![(venue, symbol.to_owned())]));
+    pub fn with(mut self, venue: Venue, symbol: &str) -> Self {
+        self.instruments.push(vec![(venue, symbol.to_owned())]);
         self
     }
 
-    /// Carries one instrument spelled differently on each of `pairs`. Every one of them is
-    /// subscribed, and their books are merged into the one book this instrument streams.
+    /// Appends one instrument spelled differently on each of `pairs`, at the next index. Every
+    /// one of them is subscribed, and their books are merged into the one book this instrument
+    /// streams.
     #[must_use]
-    pub fn with_pairs(mut self, idx: u32, pairs: &[(Venue, &str)]) -> Self {
-        self.instruments.push((
-            idx,
+    pub fn with_pairs(mut self, pairs: &[(Venue, &str)]) -> Self {
+        self.instruments.push(
             pairs
                 .iter()
                 .map(|&(venue, symbol)| (venue, symbol.to_owned()))
                 .collect(),
-        ));
+        );
         self
     }
 
-    /// The index a subscribe names for the instrument at `idx`. Trivial today - it is `idx` -
-    /// and here so a test says what it means rather than casting.
+    /// The index of the `idx`th entry added. Trivial today - it is `idx` - and here so a test
+    /// says what it means rather than casting.
     #[must_use]
     pub fn instrument_idx(idx: u32) -> CatalogueIdx {
         CatalogueIdx::new(idx)
     }
 
     fn build(&self) -> Catalogue {
-        let borrowed: Vec<(u32, Vec<(Venue, &str)>)> = self
+        let borrowed: Vec<Vec<(Venue, &str)>> = self
             .instruments
             .iter()
-            .map(|(idx, pairs)| {
-                (
-                    *idx,
-                    pairs
-                        .iter()
-                        .map(|(venue, symbol)| (*venue, symbol.as_str()))
-                        .collect(),
-                )
+            .map(|pairs| {
+                pairs
+                    .iter()
+                    .map(|(venue, symbol)| (*venue, symbol.as_str()))
+                    .collect()
             })
             .collect();
-        let entries: Vec<(u32, &[(Venue, &str)])> = borrowed
-            .iter()
-            .map(|(idx, pairs)| (*idx, pairs.as_slice()))
-            .collect();
+        let entries: Vec<&[(Venue, &str)]> = borrowed.iter().map(Vec::as_slice).collect();
         Catalogue::for_test(&entries)
     }
 }

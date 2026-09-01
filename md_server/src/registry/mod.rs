@@ -1437,17 +1437,8 @@ pub(crate) mod harness {
         bitstamp: &Arc<FakeSource>,
         instruments: &[&[(Venue, &'static str)]],
     ) -> Harness {
-        let carried: Vec<(u32, &[(Venue, &str)])> = instruments
-            .iter()
-            .enumerate()
-            .map(|(position, pairs)| {
-                let idx = u32::try_from(position).expect("a test carries a handful of symbols");
-                (idx, *pairs)
-            })
-            .collect();
-
         let connectors = FakeConnectors::new(Arc::clone(binance_spot), Arc::clone(bitstamp));
-        let catalogue = Catalogue::for_test(&carried);
+        let catalogue = Catalogue::for_test(instruments);
         let handle = RegistryHandle::spawn(connectors, catalogue.into_instruments());
 
         Harness {

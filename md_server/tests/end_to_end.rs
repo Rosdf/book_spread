@@ -156,7 +156,7 @@ async fn a_tonic_client_streams_a_book_over_the_wire() {
     // The catalogue is what spells a symbol; the venue's own casing travels verbatim.
     let server = start(
         &source,
-        TestCatalogue::new().with(0, Venue::BinanceSpot, "WIREBTCUSDT"),
+        TestCatalogue::new().with(Venue::BinanceSpot, "WIREBTCUSDT"),
     )
     .await;
 
@@ -187,11 +187,8 @@ async fn the_catalogue_says_what_the_server_carries() {
     let server = start(
         &source,
         TestCatalogue::new()
-            .with(0, Venue::BinanceSpot, "CATBTCUSDT")
-            .with_pairs(
-                4,
-                &[(Venue::BinanceSpot, "CATETHUSDT"), (Venue::Bitstamp, "catethusd")],
-            ),
+            .with(Venue::BinanceSpot, "CATBTCUSDT")
+            .with_pairs(&[(Venue::BinanceSpot, "CATETHUSDT"), (Venue::Bitstamp, "catethusd")]),
     )
     .await;
 
@@ -211,13 +208,13 @@ async fn the_catalogue_says_what_the_server_carries() {
     let indices: Vec<u32> = carried.instruments.iter().map(|entry| entry.idx).collect();
     assert_eq!(
         indices,
-        vec![0, 4],
-        "the catalogue's own indices travel, sparse and in order"
+        vec![0, 1],
+        "the catalogue's own indices travel, in order"
     );
     let multi = carried
         .instruments
         .iter()
-        .find(|entry| entry.idx == 4)
+        .find(|entry| entry.idx == 1)
         .expect("the instrument is carried");
     assert_eq!(multi.pairs.len(), 2, "every spelling is advertised");
     assert_eq!(multi.pairs[0].symbol, "CATETHUSDT");
@@ -240,8 +237,8 @@ async fn a_client_resolves_a_pair_through_the_catalogue_and_streams_it() {
     let server = start(
         &source,
         TestCatalogue::new()
-            .with(2, Venue::BinanceSpot, "RESOLVEBTCUSDT")
-            .with(3, Venue::BinanceSpot, "RESOLVEETHUSDT"),
+            .with(Venue::BinanceSpot, "RESOLVEBTCUSDT")
+            .with(Venue::BinanceSpot, "RESOLVEETHUSDT"),
     )
     .await;
     list(Venue::BinanceSpot, "RESOLVEETHUSDT");
@@ -279,7 +276,7 @@ async fn one_book_reaches_two_tonic_clients_identically() {
     let source = Arc::new(FakeSource::default());
     let server = start(
         &source,
-        TestCatalogue::new().with(0, Venue::BinanceSpot, "SHAREDBTCUSDT"),
+        TestCatalogue::new().with(Venue::BinanceSpot, "SHAREDBTCUSDT"),
     )
     .await;
 
@@ -323,10 +320,10 @@ async fn a_multi_pair_instrument_streams_one_merged_book() {
     let server = start_on(
         &binance_spot,
         &bitstamp,
-        TestCatalogue::new().with_pairs(
-            0,
-            &[(Venue::BinanceSpot, "MULTIBTCUSDT"), (Venue::Bitstamp, "multibtcusd")],
-        ),
+        TestCatalogue::new().with_pairs(&[
+            (Venue::BinanceSpot, "MULTIBTCUSDT"),
+            (Venue::Bitstamp, "multibtcusd"),
+        ]),
     )
     .await;
 
@@ -400,7 +397,7 @@ async fn a_refused_request_is_a_status_with_a_reason() {
     let source = Arc::new(FakeSource::default());
     let server = start(
         &source,
-        TestCatalogue::new().with(0, Venue::BinanceSpot, "REFUSEDBTCUSDT"),
+        TestCatalogue::new().with(Venue::BinanceSpot, "REFUSEDBTCUSDT"),
     )
     .await;
 
@@ -435,7 +432,7 @@ async fn a_stale_pair_list_is_refused_as_instrument_changed() {
     let source = Arc::new(FakeSource::default());
     let server = start(
         &source,
-        TestCatalogue::new().with(0, Venue::BinanceSpot, "STALEBTCUSDT"),
+        TestCatalogue::new().with(Venue::BinanceSpot, "STALEBTCUSDT"),
     )
     .await;
     list(Venue::BinanceSpot, "STALEBTCUSDT");
@@ -469,7 +466,7 @@ async fn an_unlisted_symbol_is_retryable_and_succeeds_once_its_venue_lists_it() 
     let source = Arc::new(FakeSource::default());
     let server = start(
         &source,
-        TestCatalogue::new().with(0, Venue::BinanceSpot, "NOTLISTEDYETBTC"),
+        TestCatalogue::new().with(Venue::BinanceSpot, "NOTLISTEDYETBTC"),
     )
     .await;
 
@@ -507,7 +504,7 @@ async fn a_connector_refusal_reaches_the_client_as_retryable() {
     let source = Arc::new(FakeSource::rejecting("the venue is not ready"));
     let server = start(
         &source,
-        TestCatalogue::new().with(0, Venue::BinanceSpot, "CONNREFUSEDBTC"),
+        TestCatalogue::new().with(Venue::BinanceSpot, "CONNREFUSEDBTC"),
     )
     .await;
 
@@ -533,8 +530,8 @@ async fn two_symbols_are_two_connections() {
     let server = start(
         &source,
         TestCatalogue::new()
-            .with(0, Venue::BinanceSpot, "twobtcusdt")
-            .with(1, Venue::BinanceSpot, "twoethusdt"),
+            .with(Venue::BinanceSpot, "twobtcusdt")
+            .with(Venue::BinanceSpot, "twoethusdt"),
     )
     .await;
 
@@ -567,7 +564,7 @@ async fn shutdown_ends_an_attached_client_with_a_status() {
     let source = Arc::new(FakeSource::default());
     let server = start(
         &source,
-        TestCatalogue::new().with(0, Venue::BinanceSpot, "shutdownbtcusdt"),
+        TestCatalogue::new().with(Venue::BinanceSpot, "shutdownbtcusdt"),
     )
     .await;
 
