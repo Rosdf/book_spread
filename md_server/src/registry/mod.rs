@@ -2,6 +2,10 @@
 //! stopping one, and turning a catalogue index into the pairs a broadcaster subscribes - which
 //! is now two jobs rather than one: checking that the index still means what the client thinks
 //! it does, then resolving it against what the connectors have interned.
+//!
+//! The registry's own index space is the catalogue's: a `CatalogueIdx` is a position in the
+//! catalogue, so every state it tracks per instrument is a slice indexed by that position
+//! rather than a map keyed by it.
 
 use crate::broadcast::broadcaster::{Broadcaster, Join, VenueReader, VenueReaders};
 use crate::broadcast::queue::{BroadcasterRx, BroadcasterTx, make_broadcaster_channel};
@@ -14,7 +18,6 @@ use crate::venue::{BookSource as _, Connectors};
 use core_lib::Venue;
 use core_lib::connector::book_publisher::BookReader;
 use core_lib::instrument::Instrument;
-use core_lib::map::{InternalHashMap, new_internal_map};
 use core_lib::panic::panic_message;
 use core_lib::venue::backoff::Backoff;
 use md_wire::grpc::{CatalogueIdx, RejectCode, Rejected};
@@ -123,13 +126,12 @@ impl<V: Connectors, C: ClientHandshake> RegistryHandle<V, C> {
     /// costs exactly one.
     pub(crate) fn spawn(connectors: V, catalogue: Instruments) -> Self {
         let (rx, tx) = create_event_channel();
-        let unresolved = catalogue.iter().map(|(idx, _)| idx).collect();
+        let len = catalogue.len();
         let registry = Registry {
-            entries: new_internal_map(),
+            entries: std::iter::repeat_with(|| None).take(len).collect(),
             connectors,
             catalogue,
-            resolved: new_internal_map(),
-            unresolved,
+            resolved: std::iter::repeat_with(|| None).take(len).collect(),
             resolve_backoff: Backoff::new(RESOLVE_SWEEP_MAX),
             next_sweep: Instant::now(),
             shutting_down: false,
@@ -195,23 +197,23 @@ impl<V: Connectors, C: ClientHandshake> RegistryHandle<V, C> {
 /// it on the spawned task instead.
 #[derive(Debug)]
 struct Registry<V, C> {
-    /// One entry per *catalogue instrument* being broadcast, not per symbol: a broadcaster
-    /// serves an instrument's whole pair list as one merged book.
-    entries: InternalHashMap<CatalogueIdx, Entry<C>>,
+    /// One slot per catalogue instrument, `Some` while a broadcaster is serving it. Indexed by
+    /// `CatalogueIdx`, which is a position in the catalogue and therefore a position here - not
+    /// per symbol: a broadcaster serves an instrument's whole pair list as one merged book.
+    entries: Box<[Option<Entry<C>>]>,
     connectors: V,
     /// Every slot the catalogue named. Immutable for the life of the process, and what a
     /// subscribe's pair list is checked against - whether or not the entry has resolved yet.
     catalogue: Instruments,
-    /// Catalogue entries every one of whose venues has interned its symbol. Nothing ever
-    /// leaves this map: an `Instrument` handle stays valid for the life of the process.
+    /// One slot per catalogue instrument, `Some` once every venue in it has interned its symbol.
+    ///
+    /// A slot only ever goes `None` -> `Some`: an `Instrument` handle stays valid for the life
+    /// of the process, so nothing is ever un-resolved. Being `None` is what "unresolved" means,
+    /// so there is no second list of which those are.
     ///
     /// The pair list is an `Arc` so a caller can be handed its own handle without keeping the
-    /// map borrowed - one atomic, and only on the path that starts a broadcaster.
-    resolved: InternalHashMap<CatalogueIdx, Pairs>,
-    /// Indices not interned as of the last sweep, drained as the connectors catch up. Only the
-    /// indices: the pairs live in `catalogue`. A `Vec` because a sweep is a `retain` over all of
-    /// it, never a lookup of one.
-    unresolved: Vec<CatalogueIdx>,
+    /// slice borrowed - one atomic, and only on the path that starts a broadcaster.
+    resolved: Box<[Option<Pairs>]>,
     /// One backoff for the whole sweep rather than one per entry: a sweep is a single pass of
     /// read-locked lookups over every unresolved name, so pacing it once is both cheaper and
     /// the thing that actually bounds how much traffic a hammering client can put on the
@@ -271,19 +273,25 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
             RegistryEvent::Retire(claim) => self.retire(&claim),
             RegistryEvent::ShutDown => {
                 self.shutting_down = true;
-                self.entries.clear();
+                // Assigning `None` drops the old value, which is what drops the sending half
+                // of every running broadcaster's join channel - its only stop signal - the
+                // same as the `clear` this replaces.
+                self.entries.fill_with(|| None);
             }
             #[cfg(test)]
             RegistryEvent::IsRegistered(key, reply) => {
-                let _ = reply.send(self.entries.contains_key(&key));
+                let _ = reply.send(
+                    self.slot(key)
+                        .is_some_and(|slot| self.entries[slot].is_some()),
+                );
             }
             #[cfg(test)]
             RegistryEvent::EntryToken(key, reply) => {
-                let _ = reply.send(
-                    self.entries
-                        .get(&key)
-                        .map(|entry| Arc::clone(&entry.pending_joins)),
-                );
+                let _ = reply.send(self.slot(key).and_then(|slot| {
+                    self.entries[slot]
+                        .as_ref()
+                        .map(|entry| Arc::clone(&entry.pending_joins))
+                }));
             }
         }
     }
@@ -298,13 +306,26 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     /// so a mismatch is reported as a mismatch whether or not the entry has resolved yet, and
     /// so a stale client cannot join a broadcaster that is already running for a fresh one.
     fn subscribe(&mut self, idx: CatalogueIdx, asked: &[AskedPair], client: C) -> Result<(), Refused<C>> {
-        match self.check(idx, asked).and_then(|()| self.resolve(idx)) {
-            Ok(pairs) => self.subscribe_resolved(idx, pairs, client),
+        match self
+            .check(idx, asked)
+            .and_then(|slot| self.resolve(idx, slot).map(|pairs| (slot, pairs)))
+        {
+            Ok((slot, pairs)) => self.subscribe_resolved(slot, idx, pairs, client),
             Err(rejected) => Err(Refused { client, rejected }),
         }
     }
 
-    /// Whether `asked` is still what the catalogue lists under `idx`.
+    /// The slot `idx` occupies, or `None` for an index this catalogue does not carry.
+    ///
+    /// `entries` and `resolved` are both one slot per catalogue instrument, so one bounds check
+    /// against the catalogue answers for both.
+    fn slot(&self, idx: CatalogueIdx) -> Option<usize> {
+        let position = usize::try_from(idx.get()).ok()?;
+        (position < self.catalogue.len()).then_some(position)
+    }
+
+    /// Whether `asked` is still what the catalogue lists under `idx`, and if so, the slot it
+    /// occupies.
     ///
     /// # Errors
     ///
@@ -313,15 +334,15 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     /// for one that is carried, but under different pairs than `asked` names - also permanent
     /// for this request, but for the opposite reason: the client's catalogue is stale, and
     /// re-fetching it is what fixes the next one.
-    fn check(&self, idx: CatalogueIdx, asked: &[AskedPair]) -> Result<(), Rejected> {
-        let Some(carried) = self.catalogue.get(idx) else {
+    fn check(&self, idx: CatalogueIdx, asked: &[AskedPair]) -> Result<usize, Rejected> {
+        let (Some(slot), Some(carried)) = (self.slot(idx), self.catalogue.get(idx)) else {
             return Err(Rejected::new(
                 RejectCode::UnknownInstrument,
                 format!("this server does not carry instrument {}", idx.get()).into_boxed_str(),
             ));
         };
         if pairs_match(asked, carried) {
-            return Ok(());
+            return Ok(slot);
         }
         Err(Rejected::new(
             RejectCode::InstrumentChanged,
@@ -343,10 +364,10 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     /// # Errors
     ///
     /// [`RejectCode::UnlistedSymbol`] for an index whose venue has not interned its symbol yet,
-    /// which is worth retrying. [`Registry::check`] is what turns down an index this server
-    /// does not carry at all before this is ever called.
-    fn resolve(&mut self, idx: CatalogueIdx) -> Result<Pairs, Rejected> {
-        if let Some(resolved) = self.resolved.get(&idx) {
+    /// which is worth retrying. `slot` is [`Registry::check`]'s bounds check, already done -
+    /// there is no unknown-index error to report here.
+    fn resolve(&mut self, idx: CatalogueIdx, slot: usize) -> Result<Pairs, Rejected> {
+        if let Some(resolved) = self.resolved[slot].as_ref() {
             return Ok(Arc::clone(resolved));
         }
 
@@ -365,7 +386,7 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
         }
 
         self.sweep();
-        self.resolved.get(&idx).map(Arc::clone).ok_or_else(unlisted)
+        self.resolved[slot].as_ref().map(Arc::clone).ok_or_else(unlisted)
     }
 
     /// Moves every catalogue entry whose venue has now interned its symbol into `resolved`.
@@ -381,23 +402,21 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     /// book and then has to grow. An entry with no pairs at all never resolves either: it
     /// names nothing to subscribe to.
     fn sweep(&mut self) {
-        let before = self.unresolved.len();
-        let resolved = &mut self.resolved;
-        let catalogue = &self.catalogue;
-        self.unresolved.retain(|idx| {
-            let pairs = catalogue
-                .get(*idx)
-                .expect("an unresolved index is always one the catalogue still carries");
-            if pairs.is_empty() {
-                return true;
+        let Self {
+            resolved, catalogue, ..
+        } = self;
+        let mut progressed = false;
+        'entries: for (slot, (_, pairs)) in resolved.iter_mut().zip(catalogue.iter()) {
+            if slot.is_some() || pairs.is_empty() {
+                continue;
             }
             let mut interned = heapless::Vec::<Instrument, { Venue::COUNT }>::new();
             for pair in pairs {
-                // `true` keeps the entry here: it is still unresolved, and every pair
-                // already looked up is discarded rather than remembered - the lookup is a
-                // read-locked hash probe, and half an entry is not servable.
+                // Skips this entry entirely, on to the next: it is still unresolved, and
+                // every pair already looked up is discarded rather than remembered - the
+                // lookup is a read-locked hash probe, and half an entry is not servable.
                 let Some(instrument) = Instrument::lookup(pair.venue(), pair.symbol()) else {
-                    return true;
+                    continue 'entries;
                 };
                 interned
                     .push(instrument)
@@ -405,13 +424,13 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
                     .expect("one pair per venue, which the catalogue enforces");
             }
             // The one place a `Pairs` is built. Everything downstream shares this handle.
-            resolved.insert(*idx, Pairs::from(&*interned));
-            false
-        });
+            *slot = Some(Pairs::from(&*interned));
+            progressed = true;
+        }
 
         // Progress means the connectors are still catching up, so the next sweep is worth
         // making soon; no progress lets the interval grow towards `RESOLVE_SWEEP_MAX`.
-        if self.unresolved.len() < before {
+        if progressed {
             self.resolve_backoff.reset();
         }
         self.next_sweep = Instant::now() + self.resolve_backoff.next_delay();
@@ -432,11 +451,12 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     /// the catalogue itself, which refuses to carry one `(venue, symbol)` under two of them.
     fn subscribe_resolved(
         &mut self,
+        slot: usize,
         idx: CatalogueIdx,
         pairs: Pairs,
         client: C,
     ) -> Result<(), Refused<C>> {
-        let join = match self.join_running(idx, Join::new(client)) {
+        let join = match self.join_running(slot, Join::new(client)) {
             Ok(()) => return Ok(()),
             Err(returned) => returned,
         };
@@ -461,14 +481,11 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
             .send(join)
             .map_err(|_| ())
             .expect("the receiving half is still in scope");
-        self.entries.insert(
-            idx,
-            Entry {
-                joins,
-                pairs: Arc::clone(&pairs),
-                pending_joins: Arc::clone(&pending_joins),
-            },
-        );
+        self.entries[slot] = Some(Entry {
+            joins,
+            pairs: Arc::clone(&pairs),
+            pending_joins: Arc::clone(&pending_joins),
+        });
 
         let replies = self.issue_subscribes(&pairs);
         tokio::spawn(serve(tx, idx, pairs, replies, queued, pending_joins));
@@ -481,8 +498,8 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     /// was filed under it, or what was is a broadcaster that has already stopped and whose
     /// [`RegistryEvent::Retire`] is still queued behind this event - in which case the stale
     /// entry is dropped here so the caller's fresh one replaces it.
-    fn join_running(&mut self, idx: CatalogueIdx, join: Join<C>) -> Result<(), Join<C>> {
-        let Some(entry) = self.entries.get(&idx) else {
+    fn join_running(&mut self, slot: usize, join: Join<C>) -> Result<(), Join<C>> {
+        let Some(entry) = self.entries[slot].as_ref() else {
             return Err(join);
         };
 
@@ -490,7 +507,7 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
         // this event sees the join and stays alive for it.
         entry.pending_joins.fetch_add(1, Ordering::Relaxed);
         entry.joins.send(join).inspect_err(|_| {
-            self.entries.remove(&idx);
+            self.entries[slot] = None;
         })
     }
 
@@ -511,7 +528,10 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     /// Called for a broadcaster whose session list has just emptied. `true` means the entry
     /// is gone and the task should stop.
     fn retire_if_idle(&mut self, claim: &Claim) -> bool {
-        let Some(entry) = self.entries.get(&claim.idx()) else {
+        let Some(entry) = self
+            .slot(claim.idx())
+            .and_then(|slot| self.entries[slot].as_ref())
+        else {
             return true;
         };
         if !Arc::ptr_eq(&entry.pending_joins, claim.pending_joins()) {
@@ -545,12 +565,13 @@ impl<V: Connectors, C: ClientHandshake> Registry<V, C> {
     /// already gone - [`RegistryEvent::ShutDown`] cleared it, say - or belongs to a newer
     /// broadcaster for the same key, which must not have its entry taken out from under it.
     fn take_entry(&mut self, claim: &Claim) -> Option<Entry<C>> {
-        let entry = self.entries.get(&claim.idx())?;
+        let slot = self.slot(claim.idx())?;
+        let entry = self.entries[slot].as_ref()?;
         if !Arc::ptr_eq(&entry.pending_joins, claim.pending_joins()) {
             return None;
         }
 
-        self.entries.remove(&claim.idx())
+        self.entries[slot].take()
     }
 }
 
@@ -934,6 +955,26 @@ mod test {
             source.subscribed().is_empty(),
             "an index this server does not carry must not reach a connector"
         );
+    }
+
+    /// The same, but far enough past the end that a naive slot lookup would panic rather than
+    /// refuse: `entries` and `resolved` are catalogue-length slices now, so an index this far
+    /// out has to be turned away by the bounds check rather than reaching one.
+    #[tokio::test]
+    async fn an_index_far_past_the_end_is_refused_as_unknown_rather_than_panicking() {
+        let source = Arc::new(FakeSource::default());
+        let harness = registry_for(&source, &[SYMBOL]);
+
+        let far = CatalogueIdx::new(u32::MAX);
+        let (_peer, client) = connected();
+        let refused = harness
+            .registry
+            .subscribe(far, harness.asked(far), client)
+            .await
+            .expect("the registry task is alive")
+            .expect_err("nothing is carried anywhere near that index");
+
+        assert_eq!(refused.code(), RejectCode::UnknownInstrument);
     }
 
     /// A wrong symbol under an otherwise correct venue is a mismatch, not a connector problem:
