@@ -6,15 +6,15 @@
 //! venue on every level, and once two venues' books are interleaved the levels on one side no
 //! longer share one.
 //!
-//! Only one venue is served per book today - the registry resolves a catalogue instrument's
-//! first pair and a broadcaster owns one reader - so [`MergedBook::refill`] is called with a
-//! single book and takes its fast path. The k-way merge below is what the second pair will
-//! need, and is written and tested now so that stage is additive.
+//! Both the one-venue and the many-venue paths are live: a catalogue instrument names one pair
+//! per venue, and the registry resolves every one of them. The one-venue case ([`tagged`]) is a
+//! specialisation of the k-way merge below, not a separate story - with nothing to interleave
+//! there is nothing to compare, so it is a straight walk instead of a merge.
 
 use core_lib::Venue;
 use core_lib::positive_f64::PositiveF64;
 use std::cmp::Ordering;
-
+use std::ops::Deref;
 use core_lib::incremental_book::Level as BookLevel;
 use core_lib::small_book::SmallBook;
 
@@ -44,120 +44,110 @@ impl MergedLevel {
     }
 }
 
-/// One side of a merged book, bounded by what a single venue's book can hold.
-///
-/// The merged book is no deeper than one venue's: a client asked for the top of the book, and
-/// interleaving venues makes those ten levels better, not more numerous.
-type MergedSide = heapless::Vec<MergedLevel, { SmallBook::LEVELS }>;
-
 /// The head of each venue's remaining levels on one side, in the order the caller gave them.
 type Heads<'a> = heapless::Vec<(Venue, &'a [BookLevel]), { Venue::COUNT }>;
 
-/// Both merged sides, reused across publishes.
+/// The books to merge, and the source of one iterator per side.
 ///
-/// Owned by the broadcaster and refilled in place rather than returned by value: a side is
-/// ten levels of 24 bytes, and the point of the encoder's buffer pool is that a book costs no
-/// allocation at all.
-#[derive(Debug, Default)]
-pub(super) struct MergedBook {
-    asks: MergedSide,
-    bids: MergedSide,
+/// Holds nothing but the borrow: a side is produced level by level as the encoder asks for it,
+/// so no merged side ever exists as a value. There is nothing to allocate or reuse across
+/// publishes - a level goes straight from the reader's slot to the frame.
+pub(super) struct BookMerger<'a, T> {
+    books: &'a [(Venue, T)],
 }
 
-impl MergedBook {
-    pub(super) fn new() -> Self {
-        Self::default()
+impl<'a, T: Deref<Target=SmallBook>> BookMerger<'a, T> {
+    pub(super) fn new(books: &'a [(Venue, T)]) -> Self {
+        Self { books }
     }
 
-    /// Best first, as [`SmallBook`] hands them over.
-    pub(super) fn asks(&self) -> &[MergedLevel] {
-        &self.asks
+    /// Best first: the ascending merge across every venue's asks.
+    pub(super) fn asks(&self) -> MergedSide<'a> {
+        MergedSide::new(self.books, SmallBook::asks, Ordering::Less)
     }
 
-    pub(super) fn bids(&self) -> &[MergedLevel] {
-        &self.bids
+    /// Best first: the descending merge across every venue's bids.
+    pub(super) fn bids(&self) -> MergedSide<'a> {
+        MergedSide::new(self.books, SmallBook::bids, Ordering::Greater)
     }
+}
 
-    /// Overwrites both sides with the best levels across `books`, best first.
-    ///
-    /// Each input side must already be best first, which is what a [`SmallBook`] is:
-    /// `IncrementalBook` keeps its shallow levels sorted in side order - ascending for asks,
-    /// descending for bids - and `SmallBook::refill` copies the top of that out. This walks
-    /// those runs rather than sorting, so a merged side costs one comparison per venue per
-    /// level.
-    ///
-    /// Two things fall out of the walk and are relied on above:
-    ///
-    /// * A venue with no levels contributes none. An empty book is a connector's resync
-    ///   signal, so a resyncing venue simply drops out of the merge while the others keep
-    ///   quoting, and both merged sides come out empty only when every venue's book is empty -
-    ///   which is what keeps `SmallBook::is_empty`'s meaning intact on the wire.
-    /// * Two venues quoting the same price stay two levels, each tagged with its own venue,
-    ///   the earlier entry in `books` first. Both count against the depth.
-    ///
-    /// More than [`SmallBook::LEVELS`] levels available across the venues means the best ten
-    /// overall, not ten per venue.
-    pub(super) fn refill(&mut self, books: &[(Venue, &SmallBook)]) {
-        self.asks.clear();
-        self.bids.clear();
+/// One side's k-way merge, best level first.
+///
+/// Bounded by what a single venue's book can hold: the merged book is no deeper than one
+/// venue's, because a client asked for the top of the book and interleaving venues makes those
+/// ten levels better, not more numerous.
+///
+/// Two things fall out of the walk and are relied on elsewhere:
+///
+/// * A venue with no levels contributes none. An empty book is a connector's resync signal, so
+///   a resyncing venue simply drops out of the merge while the others keep quoting, and both
+///   merged sides come out empty only when every venue's book is empty - which is what keeps
+///   `SmallBook::is_empty`'s meaning intact on the wire.
+/// * Two venues quoting the same price stay two levels, each tagged with its own venue, the
+///   earlier entry in `books` first. Both count against the depth.
+///
+/// More than [`SmallBook::LEVELS`] levels available across the venues means the best ten
+/// overall, not ten per venue.
+pub(super) struct MergedSide<'a> {
+    heads: Heads<'a>,
+    better: Ordering,
+    /// Exactly what `next` will still yield.
+    remaining: usize,
+}
 
-        // The only case reachable today, and worth its own path: with nothing to interleave
-        // there is nothing to compare, so this is a straight copy of at most ten levels.
-        if let [(venue, book)] = books {
-            copy_side(&mut self.asks, *venue, book.asks());
-            copy_side(&mut self.bids, *venue, book.bids());
-            return;
+impl<'a> MergedSide<'a> {
+    fn new<T: Deref<Target=SmallBook>>(
+        books: &'a [(Venue, T)],
+        side: fn(&SmallBook) -> &[BookLevel],
+        better: Ordering,
+    ) -> Self {
+        let mut heads = Heads::new();
+        for (venue, book) in books {
+            // A catalogue instrument names at most one pair per venue, so `books` is never
+            // longer than the venue table; a caller that broke that would silently lose a
+            // venue here, which is worth an assertion rather than a truncation.
+            heads
+                .push((*venue, side(book)))
+                .expect("a book carries at most one pair per venue");
         }
 
-        merge_side(&mut self.asks, books, SmallBook::asks, Ordering::Less);
-        merge_side(&mut self.bids, books, SmallBook::bids, Ordering::Greater);
+        let remaining = usize::min(
+            SmallBook::LEVELS,
+            heads.iter().map(|(_, levels)| levels.len()).sum(),
+        );
+
+        Self {
+            heads,
+            better,
+            remaining,
+        }
     }
 }
 
-/// The single-venue path: `levels` is already the answer, minus the venue tag.
-fn copy_side(out: &mut MergedSide, venue: Venue, levels: &[BookLevel]) {
-    out.extend(
-        levels
-            .iter()
-            .take(out.capacity())
-            .map(|level| MergedLevel::new(level.price(), level.size(), venue)),
-    );
-}
+impl Iterator for MergedSide<'_> {
+    type Item = MergedLevel;
 
-/// Walks every venue's run of `side` at once, taking the best head each time round.
-///
-/// `better` is the [`Ordering`] a head's price must have against the best so far to displace
-/// it: `Less` for asks, `Greater` for bids. It is a strict comparison, which is what makes a
-/// tie go to the earlier venue in `books`.
-fn merge_side(
-    out: &mut MergedSide,
-    books: &[(Venue, &SmallBook)],
-    side: fn(&SmallBook) -> &[BookLevel],
-    better: Ordering,
-) {
-    let mut heads = Heads::new();
-    for (venue, book) in books {
-        // A catalogue instrument names at most one pair per venue, so `books` is never longer
-        // than the venue table; a caller that broke that would silently lose a venue here,
-        // which is worth an assertion rather than a truncation.
-        heads
-            .push((*venue, side(book)))
-            .expect("a book carries at most one pair per venue");
-    }
+    fn next(&mut self) -> Option<MergedLevel> {
+        if self.remaining == 0 {
+            return None;
+        }
 
-    while !out.is_full() {
-        let Some(best) = best_head(&heads, better) else {
-            break;
-        };
-
-        let (venue, levels) = &mut heads[best];
+        let best = best_head(&self.heads, self.better)
+            .expect("`remaining` counts levels the heads still hold, so one of them has a head");
+        let (venue, levels) = &mut self.heads[best];
         let level = levels[0];
         *levels = &levels[1..];
-        out.push(MergedLevel::new(level.price(), level.size(), *venue))
-            .map_err(|_| ())
-            .expect("the loop guard checked there is room for one more");
+        self.remaining -= 1;
+        Some(MergedLevel::new(level.price(), level.size(), *venue))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
     }
 }
+
+impl ExactSizeIterator for MergedSide<'_> {}
 
 /// The index of the run whose head is best, or `None` once every run is spent.
 fn best_head(heads: &Heads<'_>, better: Ordering) -> Option<usize> {
@@ -175,9 +165,24 @@ fn best_head(heads: &Heads<'_>, better: Ordering) -> Option<usize> {
     best.map(|(idx, _)| idx)
 }
 
+/// The single-venue path: with nothing to interleave there is nothing to compare, so this is a
+/// straight walk of levels the `SmallBook` already ordered, tagged with the one venue that
+/// quoted them.
+///
+/// No cap is needed here: `SmallBook::refill` already bounds each side at `SmallBook::LEVELS`,
+/// so `levels` is never longer than that to begin with.
+pub(super) fn tagged(
+    venue: Venue,
+    levels: &[BookLevel],
+) -> impl ExactSizeIterator<Item = MergedLevel> + '_ {
+    levels
+        .iter()
+        .map(move |level| MergedLevel::new(level.price(), level.size(), venue))
+}
+
 #[cfg(test)]
 mod test {
-    use super::{MergedBook, MergedLevel};
+    use super::{BookMerger, MergedLevel};
     use crate::test_util::book;
     use crate::venue::Venue;
     use core_lib::small_book::SmallBook;
@@ -208,9 +213,8 @@ mod test {
     }
 
     /// `(price, size, venue)` for each level, which is everything a level carries.
-    fn seen(levels: &[MergedLevel]) -> Vec<(f64, f64, Venue)> {
+    fn seen(levels: impl Iterator<Item = MergedLevel>) -> Vec<(f64, f64, Venue)> {
         levels
-            .iter()
             .map(|level| (level.price().get(), level.size().get(), level.venue()))
             .collect()
     }
@@ -218,17 +222,16 @@ mod test {
     #[test]
     fn one_venue_passes_through_best_first() {
         let only = small(&[(100.5, 1.25), (101.0, 2.0)], &[(99.5, 2.0), (99.0, 4.0)]);
-        let mut merged = MergedBook::new();
-
-        merged.refill(&[(SECOND, &only)]);
+        let books = [(SECOND, &only)];
+        let merger = BookMerger::new(&books);
 
         assert_eq!(
-            seen(merged.asks()),
+            seen(merger.asks()),
             vec![(100.5, 1.25, SECOND), (101.0, 2.0, SECOND)],
             "asks stay ascending and carry the venue they were merged under"
         );
         assert_eq!(
-            seen(merged.bids()),
+            seen(merger.bids()),
             vec![(99.5, 2.0, SECOND), (99.0, 4.0, SECOND)],
             "bids stay descending"
         );
@@ -238,12 +241,11 @@ mod test {
     fn two_venues_interleave_by_price() {
         let left = small(&[(100.0, 1.0), (102.0, 1.0)], &[(99.0, 1.0), (97.0, 1.0)]);
         let right = small(&[(101.0, 2.0), (103.0, 2.0)], &[(98.0, 2.0), (96.0, 2.0)]);
-        let mut merged = MergedBook::new();
-
-        merged.refill(&[(FIRST, &left), (SECOND, &right)]);
+        let books = [(FIRST, &left), (SECOND, &right)];
+        let merger = BookMerger::new(&books);
 
         assert_eq!(
-            seen(merged.asks()),
+            seen(merger.asks()),
             vec![
                 (100.0, 1.0, FIRST),
                 (101.0, 2.0, SECOND),
@@ -253,7 +255,7 @@ mod test {
             "the merged asks ascend across both venues"
         );
         assert_eq!(
-            seen(merged.bids()),
+            seen(merger.bids()),
             vec![
                 (99.0, 1.0, FIRST),
                 (98.0, 2.0, SECOND),
@@ -270,17 +272,16 @@ mod test {
     fn an_equal_price_from_two_venues_stays_two_levels() {
         let left = small(&[(100.0, 1.0)], &[(99.0, 1.0)]);
         let right = small(&[(100.0, 2.0)], &[(99.0, 2.0)]);
-        let mut merged = MergedBook::new();
-
-        merged.refill(&[(FIRST, &left), (SECOND, &right)]);
+        let books = [(FIRST, &left), (SECOND, &right)];
+        let merger = BookMerger::new(&books);
 
         assert_eq!(
-            seen(merged.asks()),
+            seen(merger.asks()),
             vec![(100.0, 1.0, FIRST), (100.0, 2.0, SECOND)],
             "a tie goes to the earlier venue, so the bytes are the same on every run"
         );
         assert_eq!(
-            seen(merged.bids()),
+            seen(merger.bids()),
             vec![(99.0, 1.0, FIRST), (99.0, 2.0, SECOND)],
         );
     }
@@ -290,22 +291,23 @@ mod test {
     #[test]
     fn a_resyncing_venue_contributes_nothing() {
         let quoting = small(&[(100.0, 1.0)], &[(99.0, 1.0)]);
-        let mut merged = MergedBook::new();
+        let empty_book = empty();
+        let books = [(FIRST, &empty_book), (SECOND, &quoting)];
+        let merger = BookMerger::new(&books);
 
-        merged.refill(&[(FIRST, &empty()), (SECOND, &quoting)]);
-
-        assert_eq!(seen(merged.asks()), vec![(100.0, 1.0, SECOND)]);
-        assert_eq!(seen(merged.bids()), vec![(99.0, 1.0, SECOND)]);
+        assert_eq!(seen(merger.asks()), vec![(100.0, 1.0, SECOND)]);
+        assert_eq!(seen(merger.bids()), vec![(99.0, 1.0, SECOND)]);
     }
 
     #[test]
     fn every_venue_empty_leaves_both_sides_empty() {
-        let mut merged = MergedBook::new();
-
-        merged.refill(&[(FIRST, &empty()), (SECOND, &empty())]);
+        let left = empty();
+        let right = empty();
+        let books = [(FIRST, &left), (SECOND, &right)];
+        let merger = BookMerger::new(&books);
 
         assert!(
-            merged.asks().is_empty() && merged.bids().is_empty(),
+            seen(merger.asks()).is_empty() && seen(merger.bids()).is_empty(),
             "no venue has a book, so the merged book is the resync signal too"
         );
     }
@@ -318,41 +320,52 @@ mod test {
         let odds: Vec<(f64, f64)> = ladder(101.0);
         let left = small(&evens, &[]);
         let right = small(&odds, &[]);
-        let mut merged = MergedBook::new();
+        let books = [(FIRST, &left), (SECOND, &right)];
+        let merger = BookMerger::new(&books);
 
-        merged.refill(&[(FIRST, &left), (SECOND, &right)]);
-
+        let asks = seen(merger.asks());
         assert_eq!(
-            merged.asks().len(),
+            asks.len(),
             SmallBook::LEVELS,
             "twenty levels in, ten out - the best ten overall, not ten per venue"
         );
         assert_eq!(
-            seen(merged.asks()).first().copied(),
+            asks.first().copied(),
             Some((100.0, 1.0, FIRST)),
             "and they are the best ten"
         );
-        assert_eq!(
-            seen(merged.asks()).last().copied(),
-            Some((109.0, 1.0, SECOND)),
-        );
+        assert_eq!(asks.last().copied(), Some((109.0, 1.0, SECOND)));
     }
 
-    /// `refill` is called on the same buffer for every book a broadcaster publishes, so a
-    /// shallower book must not leave the previous one's tail behind.
+    /// `MergedSide::len` is what `BookEncoder` sizes its buffer from, so it must equal exactly
+    /// what `next` goes on to yield - not an estimate.
     #[test]
-    fn refilling_fully_overwrites_the_previous_book() {
-        let deep = small(&[(100.0, 1.0), (101.0, 1.0), (102.0, 1.0)], &[(99.0, 1.0)]);
-        let shallow = small(&[(200.0, 5.0)], &[]);
-        let mut merged = MergedBook::new();
+    fn len_matches_what_the_iterator_actually_yields() {
+        let shallow = small(&[(100.0, 1.0)], &[]);
+        let deep = small(&ladder(200.0), &[]);
+        let other_deep = small(&ladder(201.0), &[]);
 
-        merged.refill(&[(FIRST, &deep)]);
-        merged.refill(&[(SECOND, &shallow)]);
+        let shallow_books = [(FIRST, &shallow)];
+        let shallow_merger = BookMerger::new(&shallow_books);
+        let mut asks = shallow_merger.asks();
+        assert_eq!(asks.len(), 1);
+        let yielded = asks.by_ref().count();
+        assert_eq!(yielded, 1);
 
-        assert_eq!(seen(merged.asks()), vec![(200.0, 5.0, SECOND)]);
-        assert!(
-            merged.bids().is_empty(),
-            "the previous book's bids must not survive a refill"
-        );
+        let deep_books = [(FIRST, &deep)];
+        let deep_merger = BookMerger::new(&deep_books);
+        let mut asks = deep_merger.asks();
+        assert_eq!(asks.len(), SmallBook::LEVELS);
+        let yielded = asks.by_ref().count();
+        assert_eq!(yielded, SmallBook::LEVELS);
+
+        // Capped: twenty levels available across the two venues, but never more than
+        // `SmallBook::LEVELS` reported or yielded.
+        let capped_books = [(FIRST, &deep), (SECOND, &other_deep)];
+        let capped_merger = BookMerger::new(&capped_books);
+        let mut asks = capped_merger.asks();
+        assert_eq!(asks.len(), SmallBook::LEVELS);
+        let yielded = asks.by_ref().count();
+        assert_eq!(yielded, SmallBook::LEVELS);
     }
 }

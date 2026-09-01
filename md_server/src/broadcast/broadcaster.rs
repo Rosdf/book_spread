@@ -9,7 +9,7 @@
 
 use super::session::{Session, SessionCtx};
 use crate::broadcast::book_encoder::{BookEncoder, BufferProvider};
-use crate::broadcast::book_merger::MergedBook;
+use crate::broadcast::book_merger::{BookMerger, tagged};
 use crate::broadcast::queue::BroadcasterRx;
 use crate::client::{ClientHandshake, ClientSink};
 use crate::registry::events::{Claim, RegistryTx};
@@ -261,9 +261,6 @@ pub(crate) struct Broadcaster<C: ClientHandshake> {
     /// Joins the registry has queued but this task has not taken yet. Also this
     /// broadcaster's identity to the registry - see [`Claim`].
     pending_joins: Arc<AtomicUsize>,
-    /// The scratch both merged sides are built in, reused on every publish so a book still
-    /// costs no allocation of its own.
-    merged: MergedBook,
     ctx: Ctx,
     registry: RegistryTx<C>,
 }
@@ -288,11 +285,9 @@ impl<C: ClientHandshake> Broadcaster<C> {
     ) {
         let mut pool = BufferPool::new();
 
-        let mut merged = MergedBook::new();
-        let latest = encode_book(&mut merged, &mut readers, &mut pool);
+        let latest = encode_book(&mut readers, &mut pool);
 
         Self {
-            merged,
             idx,
             readers,
             sessions: Vec::new(),
@@ -384,11 +379,7 @@ impl<C: ClientHandshake> Broadcaster<C> {
     /// Returns whether any session ended on the way, so the caller prunes only when there is
     /// something to prune.
     fn publish(&mut self, cx: &mut Context<'_>) -> bool {
-        let frame = encode_book(
-            &mut self.merged,
-            &mut self.readers,
-            &mut self.ctx.pool,
-        );
+        let frame = encode_book(&mut self.readers, &mut self.ctx.pool);
 
         self.ctx.new_framed(frame);
 
@@ -436,21 +427,18 @@ impl<C: ClientHandshake> Broadcaster<C> {
     }
 }
 
-/// Merges every venue's current book into `merged` and encodes the result as one whole frame.
+/// Merges every venue's current book and encodes the result as one whole frame.
 ///
 /// A free function rather than a method because [`Broadcaster::start`] has these as locals
 /// while [`Broadcaster::publish`] has them as fields - and because taking them apart is what
-/// keeps the reader borrow disjoint from the scratch and the pool.
+/// keeps the reader borrow disjoint from the pool.
 ///
-/// Encoded out of the slots through the merge, which copies the levels it keeps - there is no
-/// intermediate `BookUpdate`. Each guard pins a slot in its venue's shared buffer, so all of
-/// them are dropped at the end of this call, before anything is offered to a client, and none
-/// may ever be held across an await.
-fn encode_book(
-    merged: &mut MergedBook,
-    readers: &mut [VenueReader],
-    buffers: &mut impl BufferProvider,
-) -> Bytes {
+/// Streamed out of the slots through the merge, straight into the buffer the encoder writes:
+/// there is no intermediate `BookUpdate`, and no merged side ever exists as a value either -
+/// each level goes from the reader's slot to the frame once. Each guard pins a slot in its
+/// venue's shared buffer, so all of them are dropped at the end of this call, before anything
+/// is offered to a client, and none may ever be held across an await.
+fn encode_book(readers: &mut [VenueReader], buffers: &mut impl BufferProvider) -> Bytes {
     // Two passes because the guards have to outlive the borrows taken from them: `iter_mut`
     // is what makes the `&mut` on each reader disjoint.
     let mut books = heapless::Vec::<(Venue, ReaderGuard<'_, SmallBook>), { Venue::COUNT }>::new();
@@ -460,20 +448,20 @@ fn encode_book(
             .map_err(|_| ())
             .expect("one reader per venue, which the catalogue enforces");
     }
-    let sides: heapless::Vec<(Venue, &SmallBook), { Venue::COUNT }> = books
-        .iter()
-        .map(|(venue, guard)| (*venue, &**guard))
-        .collect();
 
     // The only case reachable today, and worth its own path: with one venue there is nothing
-    // to merge, so this writes straight out of the reader's own book and skips `MergedBook`
-    // (and the per-level venue lookup it costs) entirely.
-    if let [(venue, book)] = sides.as_slice() {
-        return BookEncoder::encode_single(*venue, book.asks(), book.bids(), buffers);
+    // to merge, so this walks the reader's own book straight and skips the k-way merge (and
+    // the per-level comparison it costs) entirely.
+    if let [(venue, book)] = books.as_slice() {
+        return BookEncoder::encode(
+            tagged(*venue, book.asks()),
+            tagged(*venue, book.bids()),
+            buffers,
+        );
     }
 
-    merged.refill(&sides);
-    BookEncoder::encode(merged.asks(), merged.bids(), buffers)
+    let merger = BookMerger::new(&books);
+    BookEncoder::encode(merger.asks(), merger.bids(), buffers)
 }
 
 /// Polls every venue that is still publishing, and resolves once any of them has moved.
@@ -895,7 +883,11 @@ mod test {
         source.publish(SYMBOL, &book(&[(100.5, 1.25)], &[]));
         let frame = client.next_frame().await;
 
-        let expected = BookEncoder::encode(&[level(100.5, 1.25)], &[], &mut TestBufferProvider);
+        let expected = BookEncoder::encode(
+            [level(100.5, 1.25)].into_iter(),
+            std::iter::empty(),
+            &mut TestBufferProvider,
+        );
         assert_eq!(
             frame, expected,
             "what a client is given is exactly the buffer the encoder produced, header included"
@@ -1174,12 +1166,13 @@ mod test {
         let bids = [level(99.5, 2.0)];
 
         let mut pool = super::BufferPool::new();
-        let first = BookEncoder::encode(&asks, &bids, &mut pool);
+        let first = BookEncoder::encode(asks.iter().copied(), bids.iter().copied(), &mut pool);
         let mut ctx = super::Ctx::new(first, pool);
 
         let mut allocations = std::collections::HashSet::new();
         for _ in 0..1_000 {
-            let frame = BookEncoder::encode(&asks, &bids, &mut ctx.pool);
+            let frame =
+                BookEncoder::encode(asks.iter().copied(), bids.iter().copied(), &mut ctx.pool);
             allocations.insert(frame.as_ptr());
             ctx.new_framed(frame);
         }

@@ -4,7 +4,7 @@
 //! The obvious way to produce an `md.v1.BookUpdate` is to fill a [`BookUpdate`] and
 //! call `encode_to_vec`. That costs a malloc/free pair per book, two traversals (one for
 //! `encoded_len`, one for the encode) and a copy of every level out of the reader's slot into
-//! the scratch.
+//! an intermediate.
 //!
 //! None of that is necessary, because the message is completely deterministic. Every field
 //! tag is `<= 15`, so every key is a single byte; a book carries at most [`MAX_DEPTH`] levels
@@ -41,8 +41,7 @@
 use super::book_merger::MergedLevel;
 use crate::encode::MAX_VENUE_IDX_ENCODED_LEN;
 use bytes::{BufMut as _, Bytes, BytesMut};
-use core_lib::Venue;
-use core_lib::incremental_book::Level as BookLevel;
+use core_lib::positive_f64::PositiveF64;
 use core_lib::small_book::SmallBook;
 use md_wire::grpc::{MESSAGE_PREFIX, put_message_prefix};
 
@@ -107,13 +106,15 @@ impl BookEncoder {
     /// `NaN` spread - which is exactly what prost produces for a `BookUpdate` with two empty
     /// `repeated` fields and `spread` computed the same way, so the signal survives as "no
     /// levels" rather than as a short read.
-    pub(super) fn encode(
-        asks: &[MergedLevel],
-        bids: &[MergedLevel],
-        buffers: &mut impl BufferProvider,
-    ) -> Bytes {
+    pub(super) fn encode<A, B>(asks: A, bids: B, buffers: &mut impl BufferProvider) -> Bytes
+    where
+        A: ExactSizeIterator<Item = MergedLevel>,
+        B: ExactSizeIterator<Item = MergedLevel>,
+    {
+        let asks_len = asks.len();
+        let bids_len = bids.len();
         debug_assert!(
-            asks.len() <= MAX_DEPTH && bids.len() <= MAX_DEPTH,
+            asks_len <= MAX_DEPTH && bids_len <= MAX_DEPTH,
             "a book is at most MAX_DEPTH levels a side"
         );
 
@@ -122,7 +123,7 @@ impl BookEncoder {
         // is cheaper than a traversal to find out. The exact length is known once the body is
         // written, and patched in below.
         let needed = MESSAGE_PREFIX
-            + (2 + usize::from(Self::LEVEL_BODY)) * (asks.len() + bids.len())
+            + (2 + usize::from(Self::LEVEL_BODY)) * (asks_len + bids_len)
             + SPREAD_LEN;
         let mut buf = buffers.get_buffer(needed);
         debug_assert!(
@@ -131,13 +132,12 @@ impl BookEncoder {
         );
 
         buf.put_bytes(0, MESSAGE_PREFIX);
-        Self::put_side(&mut buf, ASKS_KEY, asks);
-        Self::put_side(&mut buf, BIDS_KEY, bids);
+        let best_ask = Self::put_side(&mut buf, ASKS_KEY, asks);
+        let best_bid = Self::put_side(&mut buf, BIDS_KEY, bids);
 
-        let spread = asks
-            .first()
-            .zip(bids.first())
-            .map_or(f64::NAN, |(ask, bid)| ask.price().get() - bid.price().get());
+        let spread = best_ask
+            .zip(best_bid)
+            .map_or(f64::NAN, |(ask, bid)| ask.get() - bid.get());
         // proto3 default elision: `0.0 != 0.0` is false, so this only ever fires on a locked
         // book. `NaN != 0.0` is true, so an empty-sided book's spread is always written.
         if spread != 0.0 {
@@ -152,14 +152,24 @@ impl BookEncoder {
         buf.freeze()
     }
 
-    /// Appends one `repeated Level` field, one entry per level.
+    /// Appends one `repeated Level` field, one entry per level, and reports the best (first)
+    /// level it saw - the only thing `encode` still needs off a side once the levels
+    /// themselves are consumed on the way through, which is what lets the spread survive a
+    /// consuming iterator instead of being read back off a slice.
     ///
     /// The body length is [`Self::LEVEL_BODY`] minus 9 for each of `price`/`size` prost would
     /// elide. That subtraction never fires on a real book - a venue does not quote a zero
     /// price or a zero size - so it predicts perfectly, and it is what keeps these bytes equal
     /// to prost's.
-    fn put_side(buf: &mut BytesMut, key: u8, levels: &[MergedLevel]) {
+    fn put_side(
+        buf: &mut BytesMut,
+        key: u8,
+        levels: impl Iterator<Item = MergedLevel>,
+    ) -> Option<PositiveF64> {
+        let mut best = None;
         for level in levels {
+            best.get_or_insert_with(|| level.price());
+
             let price = level.price().get();
             let size = level.size().get();
 
@@ -176,78 +186,7 @@ impl BookEncoder {
 
             crate::encode::put_venue_idx(buf, LEVEL_VENUE_FIELD, level.venue());
         }
-    }
-
-    /// The single-venue fast path: `asks`/`bids` are [`BookLevel`]s straight out of a
-    /// `SmallBook`, all quoted by `venue`, so there is no [`MergedLevel`] to copy the levels
-    /// into first.
-    ///
-    /// Otherwise identical to [`Self::encode`]; see its doc for the buffer sizing, the
-    /// elision rules and why the resync signal survives as "no levels".
-    pub(super) fn encode_single(
-        venue: Venue,
-        asks: &[BookLevel],
-        bids: &[BookLevel],
-        buffers: &mut impl BufferProvider,
-    ) -> Bytes {
-        debug_assert!(
-            asks.len() <= MAX_DEPTH && bids.len() <= MAX_DEPTH,
-            "a book is at most MAX_DEPTH levels a side"
-        );
-
-        let needed = MESSAGE_PREFIX
-            + (2 + usize::from(Self::LEVEL_BODY)) * (asks.len() + bids.len())
-            + SPREAD_LEN;
-
-        let mut buf = buffers.get_buffer(needed);
-
-        debug_assert!(
-            buf.is_empty(),
-            "a pooled buffer must be cleared before it is handed back, so a frame always starts at offset 0"
-        );
-
-        buf.put_bytes(0, MESSAGE_PREFIX);
-        Self::put_side_single(&mut buf, ASKS_KEY, asks, venue);
-        Self::put_side_single(&mut buf, BIDS_KEY, bids, venue);
-
-        let spread = asks
-            .first()
-            .zip(bids.first())
-            .map_or(f64::NAN, |(ask, bid)| ask.price().get() - bid.price().get());
-
-        if spread != 0.0 {
-            buf.put_u8(SPREAD_KEY);
-            buf.put_f64_le(spread);
-        }
-
-        let body_len = u32::try_from(buf.len() - MESSAGE_PREFIX)
-            .expect("a book is at most 20 levels, so a message never approaches 4 GiB");
-
-        put_message_prefix(&mut buf[..MESSAGE_PREFIX], body_len);
-
-        buf.freeze()
-    }
-
-    /// [`Self::put_side`]'s single-venue twin: every level on `levels` is quoted by `venue`,
-    /// so there is no per-level [`MergedLevel`] to read it off.
-    fn put_side_single(buf: &mut BytesMut, key: u8, levels: &[BookLevel], venue: Venue) {
-        for level in levels {
-            let price = level.price().get();
-            let size = level.size().get();
-
-            buf.put_u8(key);
-            // A one-byte varint: `LEVEL_BODY` is asserted under the 0x80 continuation
-            // threshold, and this is no larger.
-            buf.put_u8(Self::LEVEL_BODY);
-
-            buf.put_u8(PRICE_KEY);
-            buf.put_f64_le(price);
-
-            buf.put_u8(SIZE_KEY);
-            buf.put_f64_le(size);
-
-            crate::encode::put_venue_idx(buf, LEVEL_VENUE_FIELD, venue);
-        }
+        best
     }
 
     /// The largest frame this encoder can produce. Only the tests ask; nothing on the write
@@ -261,7 +200,7 @@ impl BookEncoder {
 #[cfg(test)]
 mod test {
     use super::{BookEncoder, BufferProvider};
-    use crate::broadcast::book_merger::MergedLevel;
+    use crate::broadcast::book_merger::{MergedLevel, tagged};
     use crate::encode::venue_idx;
     use bytes::BytesMut;
     use core_lib::Venue;
@@ -386,7 +325,11 @@ mod test {
             }
             .encode_to_vec();
 
-            let frame = BookEncoder::encode(&asks, &bids, &mut TestBufferProvider);
+            let frame = BookEncoder::encode(
+                asks.iter().copied(),
+                bids.iter().copied(),
+                &mut TestBufferProvider,
+            );
 
             let header = frame[..MESSAGE_PREFIX]
                 .try_into()
@@ -405,12 +348,12 @@ mod test {
         }
     }
 
-    /// `encode_single` is a second implementation of the single-venue case `encode` already
-    /// covers - a per-level suffix lookup replaced by one shared across the whole call - so it
-    /// needs its own guard that the two produce identical bytes, on the same shapes
-    /// [`the_hand_encoder_agrees_with_prost`] already checks against prost.
+    /// `tagged` is a second way to produce the levels a single-venue book encodes to - a
+    /// straight walk instead of a one-run merge - so it needs its own guard that the two
+    /// produce identical bytes, on the same shapes [`the_hand_encoder_agrees_with_prost`]
+    /// already checks against prost.
     #[test]
-    fn encode_single_agrees_with_encode() {
+    fn the_single_venue_fast_path_agrees_with_the_merge() {
         let deep: Vec<BookLevel> = (1..=10)
             .map(|i| book_level(f64::from(i) * 1.5, f64::from(i) / 8.0))
             .collect();
@@ -451,14 +394,21 @@ mod test {
                 .map(|l| MergedLevel::new(l.price(), l.size(), venue))
                 .collect();
 
-            let via_merge =
-                BookEncoder::encode(&merged_asks, &merged_bids, &mut TestBufferProvider);
-            let via_single =
-                BookEncoder::encode_single(venue, &asks, &bids, &mut TestBufferProvider);
+            let via_merge = BookEncoder::encode(
+                merged_asks.iter().copied(),
+                merged_bids.iter().copied(),
+                &mut TestBufferProvider,
+            );
+            let via_tagged = BookEncoder::encode(
+                tagged(venue, &asks),
+                tagged(venue, &bids),
+                &mut TestBufferProvider,
+            );
 
             assert_eq!(
-                via_single, via_merge,
-                "the single-venue path must produce the same bytes as the merged path ({case})"
+                via_tagged, via_merge,
+                "the single-venue fast path must produce the same bytes as the merged path \
+                 ({case})"
             );
         }
     }
@@ -470,12 +420,20 @@ mod test {
         let asks = [level(100.5, 1.25, Venue::Bitstamp)];
         let bids = [level(99.5, 2.0, Venue::Bitstamp)];
 
-        let first = BookEncoder::encode(&asks, &bids, &mut TestBufferProvider);
+        let first = BookEncoder::encode(
+            asks.iter().copied(),
+            bids.iter().copied(),
+            &mut TestBufferProvider,
+        );
         // Held on to on purpose: a live frame is what keeps the buffer from being reclaimed
         // in place, which is the case where `reserve` has to allocate a fresh chunk.
         let mut held = vec![first.clone()];
         for _ in 0..2_000 {
-            held.push(BookEncoder::encode(&asks, &bids, &mut TestBufferProvider));
+            held.push(BookEncoder::encode(
+                asks.iter().copied(),
+                bids.iter().copied(),
+                &mut TestBufferProvider,
+            ));
         }
 
         assert!(
