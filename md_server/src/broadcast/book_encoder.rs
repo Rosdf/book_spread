@@ -163,21 +163,17 @@ impl BookEncoder {
             let price = level.price().get();
             let size = level.size().get();
 
-            let body_len =
-                Self::LEVEL_BODY - 9 * u8::from(price == 0.0) - 9 * u8::from(size == 0.0);
-
             buf.put_u8(key);
             // A one-byte varint: `LEVEL_BODY` is asserted under the 0x80 continuation
             // threshold, and this is no larger.
-            buf.put_u8(body_len);
-            if price != 0.0 {
-                buf.put_u8(PRICE_KEY);
-                buf.put_f64_le(price);
-            }
-            if size != 0.0 {
-                buf.put_u8(SIZE_KEY);
-                buf.put_f64_le(size);
-            }
+            buf.put_u8(Self::LEVEL_BODY);
+
+            buf.put_u8(PRICE_KEY);
+            buf.put_f64_le(price);
+
+            buf.put_u8(SIZE_KEY);
+            buf.put_f64_le(size);
+
             crate::encode::put_venue_idx(buf, LEVEL_VENUE_FIELD, level.venue());
         }
     }
@@ -202,7 +198,9 @@ impl BookEncoder {
         let needed = MESSAGE_PREFIX
             + (2 + usize::from(Self::LEVEL_BODY)) * (asks.len() + bids.len())
             + SPREAD_LEN;
+
         let mut buf = buffers.get_buffer(needed);
+
         debug_assert!(
             buf.is_empty(),
             "a pooled buffer must be cleared before it is handed back, so a frame always starts at offset 0"
@@ -216,6 +214,7 @@ impl BookEncoder {
             .first()
             .zip(bids.first())
             .map_or(f64::NAN, |(ask, bid)| ask.price().get() - bid.price().get());
+
         if spread != 0.0 {
             buf.put_u8(SPREAD_KEY);
             buf.put_f64_le(spread);
@@ -223,6 +222,7 @@ impl BookEncoder {
 
         let body_len = u32::try_from(buf.len() - MESSAGE_PREFIX)
             .expect("a book is at most 20 levels, so a message never approaches 4 GiB");
+
         put_message_prefix(&mut buf[..MESSAGE_PREFIX], body_len);
 
         buf.freeze()
@@ -235,21 +235,17 @@ impl BookEncoder {
             let price = level.price().get();
             let size = level.size().get();
 
-            let body_len =
-                Self::LEVEL_BODY - 9 * u8::from(price == 0.0) - 9 * u8::from(size == 0.0);
-
             buf.put_u8(key);
             // A one-byte varint: `LEVEL_BODY` is asserted under the 0x80 continuation
             // threshold, and this is no larger.
-            buf.put_u8(body_len);
-            if price != 0.0 {
-                buf.put_u8(PRICE_KEY);
-                buf.put_f64_le(price);
-            }
-            if size != 0.0 {
-                buf.put_u8(SIZE_KEY);
-                buf.put_f64_le(size);
-            }
+            buf.put_u8(Self::LEVEL_BODY);
+
+            buf.put_u8(PRICE_KEY);
+            buf.put_f64_le(price);
+
+            buf.put_u8(SIZE_KEY);
+            buf.put_f64_le(size);
+
             crate::encode::put_venue_idx(buf, LEVEL_VENUE_FIELD, venue);
         }
     }
@@ -364,12 +360,8 @@ mod test {
             ),
             // `PositiveF64` permits `+0.0`, so prost's default elision is reachable.
             (
-                "zero price and size",
-                vec![
-                    level(0.0, 1.0, Venue::Bitstamp),
-                    level(1.0, 0.0, Venue::BinanceSpot),
-                    level(0.0, 0.0, Venue::BinanceSpot),
-                ],
+                "bound price and size",
+                vec![],
                 vec![level(f64::MIN_POSITIVE, f64::MAX, Venue::BinanceSpot)],
             ),
             // A locked book: best ask equals best bid, so the spread is 0.0 and prost elides it.
@@ -433,12 +425,8 @@ mod test {
             ),
             ("full depth", deep.clone(), deep),
             (
-                "zero price and size",
-                vec![
-                    book_level(0.0, 1.0),
-                    book_level(1.0, 0.0),
-                    book_level(0.0, 0.0),
-                ],
+                "inf and max",
+                vec![],
                 vec![book_level(f64::MIN_POSITIVE, f64::MAX)],
             ),
             (

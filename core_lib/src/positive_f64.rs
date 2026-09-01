@@ -24,7 +24,7 @@ impl Ord for PositiveF64 {
 
 impl PositiveF64 {
     const fn is_valid(value: f64) -> bool {
-        value.is_sign_positive() && !value.is_nan()
+        !value.is_nan() && value > 0.0
     }
 
     pub const fn new(value: f64) -> Option<Self> {
@@ -45,6 +45,10 @@ impl PositiveF64 {
     }
 
     pub const fn get(self) -> f64 {
+        debug_assert!(Self::is_valid(self.0), "value should be valid");
+        // SAFETY:
+        // it is checked at construction
+        unsafe {std::hint::assert_unchecked(Self::is_valid(self.0))}
         self.0
     }
 }
@@ -54,18 +58,18 @@ mod test {
     use super::*;
 
     #[test]
-    fn new_rejects_negative_and_nan() {
+    fn new_rejects_non_positive_and_nan() {
         assert!(PositiveF64::new(-1.0).is_none());
         assert!(PositiveF64::new(-0.0).is_none());
         assert!(PositiveF64::new(f64::NAN).is_none());
-        assert!(PositiveF64::new(0.0).is_some());
+        assert!(PositiveF64::new(0.0).is_none());
         assert!(PositiveF64::new(1.0).is_some());
+        assert!(PositiveF64::new(f64::INFINITY).is_some());
     }
 
     #[test]
     fn ordering_matches_value_ordering() {
         let values = [
-            0.0,
             f64::MIN_POSITIVE,
             1e-300,
             0.5,
@@ -98,14 +102,14 @@ mod test {
 
     #[test]
     fn sorts_a_shuffled_list() {
-        let mut sorted: Vec<PositiveF64> = [3.0, 1.0, 0.0, 2.5, 100.0, 0.001]
+        let mut sorted: Vec<PositiveF64> = [3.0, 1.0, 2.5, 100.0, 0.001]
             .into_iter()
             .map(|v| PositiveF64::new(v).unwrap())
             .collect();
         sorted.sort();
 
         let values: Vec<f64> = sorted.into_iter().map(PositiveF64::get).collect();
-        assert_eq!(values, [0.0, 0.001, 1.0, 2.5, 3.0, 100.0]);
+        assert_eq!(values, [0.001, 1.0, 2.5, 3.0, 100.0]);
     }
 
     #[test]
