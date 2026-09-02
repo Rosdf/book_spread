@@ -1037,6 +1037,7 @@ dependencies = [
  "md_proto",
  "md_wire",
  "protoc-bin-vendored",
+ "thiserror",
  "tokio",
  "tonic",
  "tonic-prost",

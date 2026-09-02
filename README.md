@@ -34,7 +34,7 @@ instrument's clients, so a book crosses no channel between the encoder and the w
 | [`md_wire`](md_wire) | The gRPC wire contract - constants, paths, reject codes - shared by server and clients |
 | [`md_proto`](md_proto) | Generated `md.v1` message types, from `proto/md.proto` |
 | [`md_server`](md_server) | The server: catalogue, registry, broadcaster, gRPC transport |
-| `md_client` | A generated tonic client, used by `md_server`'s end-to-end tests. Being reworked - no README yet. |
+| [`md_client`](md_client) | An interactive client: `catalogue`, `sub`, `unsub` at a prompt, the subscribed book redrawn in place |
 
 ## Running the server
 

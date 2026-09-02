@@ -16,7 +16,9 @@ use tonic_prost as _;
 use md_proto::md::v1 as proto;
 use md_wire::grpc::{REJECT_CODE_HEADER, RejectCode};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+pub mod command;
+pub mod render;
 
 pub mod pb {
     //! The generated `MarketDataClient`.
@@ -34,10 +36,7 @@ pub mod pb {
 
 pub use pb::market_data_client::MarketDataClient;
 
-/// Where this client looks for the server. The server itself is told where to listen by its
-/// own config file (`MD_SERVER_CONFIG`), so this is the client's variable alone.
-pub const ADDR_VAR: &str = "MD_SERVER_ADDR";
-/// Where this client looks unless told otherwise.
+/// Where this client looks for the server unless `--addr` names another one.
 pub const DEFAULT_ADDR: &str = "127.0.0.1:50051";
 
 /// The exact reason a subscription was refused, when the server said one.
@@ -81,8 +80,8 @@ pub async fn catalogue(addr: &str) -> Result<proto::CatalogueResponse, tonic::St
 ///
 /// A level says *which* venue quoted it, not what that venue is called, so printing one takes
 /// this alongside it.
-#[derive(Debug, Default)]
-pub struct VenueNames(HashMap<u32, String>);
+#[derive(Debug, Default, Clone)]
+pub struct VenueNames(HashMap<u32, Box<str>>);
 
 impl VenueNames {
     #[must_use]
@@ -91,7 +90,7 @@ impl VenueNames {
             catalogue
                 .venues
                 .iter()
-                .map(|venue| (venue.idx, venue.name.clone()))
+                .map(|venue| (venue.idx, Box::from(venue.name.as_str())))
                 .collect(),
         )
     }
@@ -100,20 +99,22 @@ impl VenueNames {
     /// for it - a server that streams an index it did not advertise is a server bug, not
     /// something worth failing a print over.
     #[must_use]
-    pub fn name(&self, idx: u32) -> String {
+    pub fn name(&self, idx: u32) -> Box<str> {
         self.0
             .get(&idx)
             .cloned()
-            .unwrap_or_else(|| format!("venue#{idx}"))
+            .unwrap_or_else(|| format!("venue#{idx}").into_boxed_str())
     }
 }
 
-/// Streams `instrument`'s book until the server ends the stream.
+/// Streams `instrument`'s book until the server ends the stream, handing each update to
+/// `on_update` as it arrives.
 ///
 /// `instrument` is an index from [`catalogue`] and `pairs` is exactly what that catalogue
 /// listed under it - echoed back so the server can tell a stale index from a current one, see
-/// `md_wire::grpc::RejectCode::InstrumentChanged`. `label` is only what an empty book is
-/// printed against, since no level is available to name a venue in that case.
+/// `md_wire::grpc::RejectCode::InstrumentChanged`. A callback rather than a fixed print: the
+/// binary renders straight to the terminal, a test collects into a `Vec` - one follow loop,
+/// one place the stream is driven, for both.
 ///
 /// # Errors
 ///
@@ -121,9 +122,8 @@ impl VenueNames {
 pub async fn follow(
     addr: &str,
     instrument: u32,
-    pairs: Vec<proto::SubscribePair>,
-    venues: &VenueNames,
-    label: &str,
+    pairs: Box<[proto::SubscribePair]>,
+    on_update: &mut (dyn FnMut(&proto::BookUpdate) + Send),
 ) -> Result<(), tonic::Status> {
     let mut client = MarketDataClient::connect(format!("http://{addr}"))
         .await
@@ -132,7 +132,7 @@ pub async fn follow(
     let mut books = client
         .subscribe_book(proto::SubscribeBookRequest {
             instrument_idx: instrument,
-            pairs,
+            pairs: pairs.into_vec(),
         })
         .await?
         .into_inner();
@@ -140,34 +140,7 @@ pub async fn follow(
     // The one place a client pays for parsing: the message arrived as bytes and would have
     // stayed that way if all it did was forward it.
     while let Some(book) = books.message().await? {
-        println!("{}", line(&book, venues, label));
+        on_update(&book);
     }
     Ok(())
-}
-
-/// One line of output, stamped with the local microsecond it was received - so a run of these
-/// is something latency can be measured out of.
-#[must_use]
-pub fn line(book: &proto::BookUpdate, venues: &VenueNames, label: &str) -> String {
-    let at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros();
-
-    let Some((bid, ask)) = book.bids.first().zip(book.asks.first()) else {
-        // Both sides empty is the connector saying it has no book - bootstrapping, or
-        // resyncing. Whatever was on screen a moment ago is not the market any more. No
-        // level is available to name a venue, so the requested instrument stands in for it.
-        return format!("{at} {label:<24} no book");
-    };
-    format!(
-        "{at} spread {:.8}\n  bid {:<13} {:>14.8} x {:<12.8}\n  ask {:<13} {:>14.8} x {:<12.8}",
-        book.spread,
-        venues.name(bid.venue_idx),
-        bid.price,
-        bid.size,
-        venues.name(ask.venue_idx),
-        ask.price,
-        ask.size
-    )
 }
